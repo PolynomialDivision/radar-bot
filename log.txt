@@ -1,0 +1,209 @@
+[2m2026-05-20T16:02:32.508505Z[0m [32m INFO[0m [2mradar_bot[0m[2m:[0m Session restored as @radar-bot:matrix.org
+[2m2026-05-20T16:02:34.114443Z[0m [33m WARN[0m [2mradar_bot[0m[2m:[0m Cross-signing bootstrap failed: the server returned an error: [400 / M_UNKNOWN] One time key signed_curve25519:AAAAAAAAAA0 already exists. Old key: {"key":"ARJUYAAmNb9TFgWAh+WJsrJ3CzgsUXV8Vx9KoQrywiQ","signatures":{"@radar-bot:matrix.org":{"ed25519:3Pr3hK4H6Y":"xlsRVCXl+DqJ1biSFro2eUtudmEoh623ObTz5OcXRslhtdjo/bvMs5QFohVb7HhN68xPqNYAWbSwLKXH5ZM4CQ"}}}; new key: {'key': 'wCuaFOGxq9J7Jz8hSL0Jp9V//DiyRBHLWKONKr9jlHY', 'signatures': {'@radar-bot:matrix.org': {'ed25519:3Pr3hK4H6Y': 'bqtsBY5Kf/Zw1hFBaG+/lVuUkyZA5i2ngAXpB7CdU/SDERs0NMCkiF5NHzwJCFgD7W6wpHgAu3L9uhg9q0meAA'}}}
+[2m2026-05-20T16:02:34.114525Z[0m [32m INFO[0m [2mradar_bot[0m[2m:[0m Allowed inviters: {"@schnick:matrix.org"}
+[2m2026-05-20T16:02:34.114543Z[0m [32m INFO[0m [2mradar_bot[0m[2m:[0m Admin users: {"@schnick:matrix.org"}
+[2m2026-05-20T16:02:34.114563Z[0m [32m INFO[0m [2mradar_bot[0m[2m:[0m Performing initial sync...
+[2m2026-05-20T16:02:36.515228Z[0m [32m INFO[0m [2mradar_bot[0m[2m:[0m Initial sync complete. 11 source(s) configured.
+[2m2026-05-20T16:02:36.515751Z[0m [32m INFO[0m [2mradar_bot[0m[2m:[0m Loaded 302 seen GUIDs
+[2m2026-05-20T16:02:36.515889Z[0m [32m INFO[0m [2mradar_bot[0m[2m:[0m Loaded 0 geocode cache entries
+[2m2026-05-20T16:02:36.531586Z[0m [32m INFO[0m [2mradar_bot[0m[2m:[0m Geocoding reference address: Scharnweberstraße 38, 10247 Berlin
+[2m2026-05-20T16:02:36.594441Z[0m [32m INFO[0m [2mradar_bot[0m[2m:[0m Reference point: 52.51285, 13.46411
+[2m2026-05-20T16:02:36.594506Z[0m [32m INFO[0m [2mradar_bot[0m[2m:[0m Test mode: polling all sources once and posting immediately
+[2m2026-05-20T16:02:39.429737Z[0m [34mDEBUG[0m [2mradar_bot[0m[2m:[0m geocode FETCH: "S-Bahnhof Alexanderplatz"
+[2m2026-05-20T16:02:39.437858Z[0m [34mDEBUG[0m [2mradar_bot[0m[2m:[0m DROP [nd Berlin] "Museen | Freier Eintritt zum Gedenken an Nazi-Opfer" score=1 below threshold
+[2m2026-05-20T16:02:39.441636Z[0m [34mDEBUG[0m [2mradar_bot[0m[2m:[0m DROP [rbb Berlin] "Mutmaßliche China-Spione gefasst: Einsätze auch in Berlin und Brandenburg" score=1 below threshold
+[2m2026-05-20T16:02:39.468418Z[0m [34mDEBUG[0m [2mradar_bot[0m[2m:[0m DROP [Tagesschau] "Hohe Inflation - das neue Normal?"
+[2m2026-05-20T16:02:39.472239Z[0m [34mDEBUG[0m [2mradar_bot[0m[2m:[0m DROP [rbb Berlin] "Neue Gebühren ab Juli: Bewohnerparkausweise in Oberhavel werden deutlich teurer" score=1 below threshold
+[2m2026-05-20T16:02:39.472482Z[0m [34mDEBUG[0m [2mradar_bot[0m[2m:[0m DROP [rbb Berlin] "Interview über KI-Sucht: \"Den Partner für ChatGPT verlassen\"" score=1 below threshold
+[2m2026-05-20T16:02:39.482057Z[0m [34mDEBUG[0m [2mradar_bot[0m[2m:[0m DROP [rbb Berlin] "Musen am Staatstheater Cottbus bekommen Gliedmaßen zurück" score=1 below threshold
+[2m2026-05-20T16:02:39.493310Z[0m [34mDEBUG[0m [2mradar_bot[0m[2m:[0m DROP [rbb Berlin] "Berliner Charité nimmt fünf Ebola-Kontaktpersonen auf" score=1 below threshold
+[2m2026-05-20T16:02:39.495916Z[0m [34mDEBUG[0m [2mradar_bot[0m[2m:[0m DROP [nd Berlin] "Wissenschaft | Brandenburgs Hochschulreform mies für Frauen und Arbeiterkinder" score=1 below threshold
+[2m2026-05-20T16:02:39.496137Z[0m [34mDEBUG[0m [2mradar_bot[0m[2m:[0m DROP [nd Berlin] "Ableismus | Behinderte Arbeitgeber in Berlin wollen mehr zahlen" score=1 below threshold
+[2m2026-05-20T16:02:39.512485Z[0m [34mDEBUG[0m [2mradar_bot[0m[2m:[0m DROP [Berliner Morgenpost] "Messerangriff in Spandauer Geflüchtetenunterkunft – 15-Jähriger schwer verletzt" score=0 below threshold
+[2m2026-05-20T16:02:39.528303Z[0m [34mDEBUG[0m [2mradar_bot[0m[2m:[0m DROP [rbb Berlin] "43-Jähriger bei Streit in Berlin-Hellersdorf tödlich verletzt - Angreifer festgenommen" score=1 below threshold
+[2m2026-05-20T16:02:39.529909Z[0m [34mDEBUG[0m [2mradar_bot[0m[2m:[0m DROP [Kontrapolis] "Angesichts der Kriege zwischen Staaten: Verweigerung und Sabotage!" score=1 below threshold
+[2m2026-05-20T16:02:39.550115Z[0m [34mDEBUG[0m [2mradar_bot[0m[2m:[0m DROP [nd Berlin] "Fördermittelaffäre | Formfehler rettet Joe Chialo vor Ausschuss-Aussage" score=1 below threshold
+[2m2026-05-20T16:02:39.551130Z[0m [34mDEBUG[0m [2mradar_bot[0m[2m:[0m DROP [rbb Berlin] "Bombe in Oranienburg gefunden - Schutzwand aus Containern wird aufgebaut" score=1 below threshold
+[2m2026-05-20T16:02:39.551513Z[0m [34mDEBUG[0m [2mradar_bot[0m[2m:[0m DROP [rbb Berlin] "RE1-Strecke ab 2029 für neun Monate geperrt: Heftige Kritik" score=1 below threshold
+[2m2026-05-20T16:02:39.557502Z[0m [34mDEBUG[0m [2mradar_bot[0m[2m:[0m DROP [Tagesschau] "Das Prinzip \"Kayfabe\": Wenn Politik zur Wrestling-Show wird"
+[2m2026-05-20T16:02:39.568745Z[0m [34mDEBUG[0m [2mradar_bot[0m[2m:[0m DROP [nd Berlin] "S-Bahn Berlin | Berliner S-Bahn will sauberer werden" score=1 below threshold
+[2m2026-05-20T16:02:39.574244Z[0m [34mDEBUG[0m [2mradar_bot[0m[2m:[0m DROP [rbb Berlin] "Berliner Charité nimmt fünf Ebola-Kontaktpersonen auf" score=1 below threshold
+[2m2026-05-20T16:02:39.576568Z[0m [34mDEBUG[0m [2mradar_bot[0m[2m:[0m DROP [nd Berlin] "Gesundheit | Legionellen-Ausbruch in Berlin-Lichtenrade" score=1 below threshold
+[2m2026-05-20T16:02:39.583188Z[0m [34mDEBUG[0m [2mradar_bot[0m[2m:[0m DROP [Berliner Morgenpost] "An der Uni für China spioniert? Zwei Verdächtige in München gefasst" score=0 below threshold
+[2m2026-05-20T16:02:39.585821Z[0m [34mDEBUG[0m [2mradar_bot[0m[2m:[0m DROP [nd Berlin] "Freiheitsrechte | Berlin: Studie empfiehlt Liberalisierung des Versammlungsgesetzes" score=1 below threshold
+[2m2026-05-20T16:02:39.587516Z[0m [34mDEBUG[0m [2mradar_bot[0m[2m:[0m DROP [nd Berlin] "Nahverkehr in Berlin und Brandenburg | Viel\u{ad}leicht irgend\u{ad}wann weniger Chaos bei der Berliner U-Bahn" score=1 below threshold
+[2m2026-05-20T16:02:39.588633Z[0m [34mDEBUG[0m [2mradar_bot[0m[2m:[0m DROP [nd Berlin] "Arbeitsrecht | Urteil zum Kita-Streik 2024: Verdi erwartet Rücknahme des Verbots" score=1 below threshold
+[2m2026-05-20T16:02:39.597178Z[0m [34mDEBUG[0m [2mradar_bot[0m[2m:[0m DROP [nd Berlin] "Militär | Bundeswehr macht Kinder kriegstüchtig" score=1 below threshold
+[2m2026-05-20T16:02:39.597696Z[0m [32m INFO[0m [2mradar_bot[0m[2m:[0m PASS [nd Berlin] "Queerfeindlichkeit | Gewalt im Regenbogenkiez" keyword_implied=Some(1500)m terms=["Friedrichshain" (1500m)]
+[2m2026-05-20T16:02:39.600894Z[0m [32m INFO[0m [2mradar_bot[0m[2m:[0m PASS [nd Berlin] "BVG in Berlin | Chaos in Friedrichshain: Ampel verursacht Traminfarkt" keyword_implied=Some(1500)m terms=["Friedrichshain" (1500m)]
+[2m2026-05-20T16:02:39.606392Z[0m [34mDEBUG[0m [2mradar_bot[0m[2m:[0m DROP [Presseportal Blaulicht] "POL-HRO: PKW fährt gegen Wismarer Stadthaus - Polizei sucht Zeugen"
+[2m2026-05-20T16:02:39.614589Z[0m [34mDEBUG[0m [2mradar_bot[0m[2m:[0m DROP [Presseportal Blaulicht] "POL-PDLU: Alkoholfahrt endet im Krankenhaus"
+[2m2026-05-20T16:02:39.615348Z[0m [34mDEBUG[0m [2mradar_bot[0m[2m:[0m DROP [rbb Berlin] "Zingler im Interview: \"Haben uns mit drei Trainern getroffen\"" score=1 below threshold
+[2m2026-05-20T16:02:39.622981Z[0m [34mDEBUG[0m [2mradar_bot[0m[2m:[0m DROP [Berliner Morgenpost] "Langes Pfingstwochenende: An diesen Stellen droht in Berlin & Brandenburg Stau" score=0 below threshold
+[2m2026-05-20T16:02:39.633363Z[0m [34mDEBUG[0m [2mradar_bot[0m[2m:[0m DROP [Presseportal Blaulicht] "LPI-NDH: Seitenscheibe an Fahrzeug beschädigt"
+[2m2026-05-20T16:02:39.635777Z[0m [34mDEBUG[0m [2mradar_bot[0m[2m:[0m DROP [Presseportal Blaulicht] "POL-OS: Osnabrück: Unbekanntes Trio schlägt und tritt auf 45-Jährigen ein - Polizei sucht Zeugen"
+[2m2026-05-20T16:02:39.637990Z[0m [34mDEBUG[0m [2mradar_bot[0m[2m:[0m DROP [rbb Berlin] "Tatverdächtiger nach Messerangriff in Spandau festgenommen" score=1 below threshold
+[2m2026-05-20T16:02:39.638341Z[0m [34mDEBUG[0m [2mradar_bot[0m[2m:[0m DROP [rbb Berlin] "Havelland: Feuerwehr löscht Brand auf Gelände einer Recyclingfirma in Döberitz" score=1 below threshold
+[2m2026-05-20T16:02:39.639256Z[0m [34mDEBUG[0m [2mradar_bot[0m[2m:[0m DROP [rbb Berlin] "Drei Trainer für einen Job: Union Berlin sucht Etas Nachfolger" score=1 below threshold
+[2m2026-05-20T16:02:39.641564Z[0m [34mDEBUG[0m [2mradar_bot[0m[2m:[0m DROP [Tagesschau] "Honig aus Deutschland: Was junge Menschen für die Imkerei begeistert"
+[2m2026-05-20T16:02:39.645540Z[0m [34mDEBUG[0m [2mradar_bot[0m[2m:[0m DROP [Kontrapolis] "Intervention – Für die Interventionistische Linke" score=1 below threshold
+[2m2026-05-20T16:02:39.648753Z[0m [34mDEBUG[0m [2mradar_bot[0m[2m:[0m DROP [rbb Berlin] "Zwei Männer in Berliner Hasenheide nach Streit schwer verletzt" score=1 below threshold
+[2m2026-05-20T16:02:39.650000Z[0m [34mDEBUG[0m [2mradar_bot[0m[2m:[0m DROP [rbb Berlin] "Nach Ryanair-Rückzug: Eurowings bietet künftig mehr Flüge am BER an" score=1 below threshold
+[2m2026-05-20T16:02:39.650088Z[0m [34mDEBUG[0m [2mradar_bot[0m[2m:[0m DROP [Presseportal Blaulicht] "LPI-NDH: Frauenhandtasche mit kristalliner Substanz in Straßenbahn zurückgelassen"
+[2m2026-05-20T16:02:39.650349Z[0m [34mDEBUG[0m [2mradar_bot[0m[2m:[0m DROP [Presseportal Blaulicht] "POL-LM: +++ Tödlicher Verkehrsunfall im Begegnungsverkehr +++"
+[2m2026-05-20T16:02:39.650408Z[0m [34mDEBUG[0m [2mradar_bot[0m[2m:[0m DROP [Presseportal Blaulicht] "LPI-NDH: Nachbarschaftsstreitigkeiten auf dem Balkon"
+[2m2026-05-20T16:02:39.652661Z[0m [34mDEBUG[0m [2mradar_bot[0m[2m:[0m DROP [Berliner Morgenpost] "Tumor bei Bushido entdeckt – geplante OP offenbar komplizierter als gedacht" score=0 below threshold
+[2m2026-05-20T16:02:39.658286Z[0m [34mDEBUG[0m [2mradar_bot[0m[2m:[0m DROP [Presseportal Blaulicht] "LPI-NDH: Pedelec am Bahnhof entwendet"
+[2m2026-05-20T16:02:39.659825Z[0m [34mDEBUG[0m [2mradar_bot[0m[2m:[0m DROP [Presseportal Blaulicht] "POL-PDTR: Graffiti auf Sprinter"
+[2m2026-05-20T16:02:39.666138Z[0m [34mDEBUG[0m [2mradar_bot[0m[2m:[0m DROP [Kontrapolis] "Müssen die Maschinen zerschlagen werden?" score=1 below threshold
+[2m2026-05-20T16:02:39.668325Z[0m [34mDEBUG[0m [2mradar_bot[0m[2m:[0m DROP [Tagesschau] "So soll der Führerschein günstiger werden"
+[2m2026-05-20T16:02:39.668704Z[0m [34mDEBUG[0m [2mradar_bot[0m[2m:[0m DROP [Tagesschau] "Wie die Commerzbank-Aktionäre zu einer Übernahme durch UniCredit stehen"
+[2m2026-05-20T16:02:39.679881Z[0m [34mDEBUG[0m [2mradar_bot[0m[2m:[0m DROP [Berliner Morgenpost] "Mäc-Geiz-Filialen sollen schließen: Insider nennt konkrete Zahl" score=0 below threshold
+[2m2026-05-20T16:02:39.681117Z[0m [34mDEBUG[0m [2mradar_bot[0m[2m:[0m DROP [rbb Berlin] "Bombenfund in Lehnitz: Splitterschutzwand errichtet" score=1 below threshold
+[2m2026-05-20T16:02:39.681438Z[0m [34mDEBUG[0m [2mradar_bot[0m[2m:[0m DROP [rbb Berlin] "Tennis-Elite um Sabalenka und Gauff bei WTA-Turnier in Berlin dabei" score=1 below threshold
+[2m2026-05-20T16:02:39.690766Z[0m [34mDEBUG[0m [2mradar_bot[0m[2m:[0m DROP [Presseportal Blaulicht] "POL-K: 260520-4-K Millionengewinne mit Fakeshops im Internet - Durchsuchung bei Verdächtigem"
+[2m2026-05-20T16:02:39.690959Z[0m [34mDEBUG[0m [2mradar_bot[0m[2m:[0m DROP [Presseportal Blaulicht] "POL-Pforzheim: (CW) Oberreichenbach - Beladener Lkw verunfallt auf B296 - Bergung andauernd"
+[2m2026-05-20T16:02:39.691067Z[0m [34mDEBUG[0m [2mradar_bot[0m[2m:[0m DROP [rbb Berlin] "\"Nächster Schritt\": Union Berlin holt Nationalspielerin Gräwe" score=1 below threshold
+[2m2026-05-20T16:02:39.692330Z[0m [34mDEBUG[0m [2mradar_bot[0m[2m:[0m DROP [Presseportal Blaulicht] "POL-PDLU: Verkehrsunfallflucht unter dem Einfluss von Alkohol"
+[2m2026-05-20T16:02:39.692493Z[0m [34mDEBUG[0m [2mradar_bot[0m[2m:[0m DROP [Presseportal Blaulicht] "POL-KA: (KA) Waldbronn - Gefährliche Körperverletzung bei Sportfest - Zeugen gesucht"
+[2m2026-05-20T16:02:39.697328Z[0m [34mDEBUG[0m [2mradar_bot[0m[2m:[0m DROP [Berliner Morgenpost] "Verkehrskontrolle der Polizei in Neukölln: Das fanden die Ermittler" score=0 below threshold
+[2m2026-05-20T16:02:39.710991Z[0m [32m INFO[0m [2mradar_bot[0m[2m:[0m PASS [Indymedia RSS] "Filmvorführung Exodus" keyword_implied=Some(1500)m terms=["Samariterstr" (1500m)]
+[2m2026-05-20T16:02:39.712372Z[0m [34mDEBUG[0m [2mradar_bot[0m[2m:[0m DROP [rbb Berlin] "Polizei stoppt nächtlichen Schmuggel per Drohne in JVA Wulkow" score=1 below threshold
+[2m2026-05-20T16:02:39.715773Z[0m [34mDEBUG[0m [2mradar_bot[0m[2m:[0m DROP [rbb Berlin] "Stiftung für das sorbische Volk bekommt mehr Geld" score=1 below threshold
+[2m2026-05-20T16:02:39.776740Z[0m [34mDEBUG[0m [2mradar_bot[0m[2m:[0m DROP [rbb Berlin] "Brand auf Gewerbehof in Berlin - Polizei geht von Brandstiftung aus" score=1 below threshold
+[2m2026-05-20T16:02:39.777429Z[0m [34mDEBUG[0m [2mradar_bot[0m[2m:[0m DROP [Presseportal Blaulicht] "POL-UN: 12-Jähriger bei Verkehrsunfall verletzt - Polizei sucht Zeugen und flüchtigen Fahrzeugführer"
+[2m2026-05-20T16:02:39.780502Z[0m [34mDEBUG[0m [2mradar_bot[0m[2m:[0m DROP [Tagesschau] "Mutmaßliche chinesische Spione in München festgenommen" score=0 below threshold
+[2m2026-05-20T16:02:39.782202Z[0m [34mDEBUG[0m [2mradar_bot[0m[2m:[0m DROP [rbb Berlin] "Harte Pyro-Strafe für Hertha nach Ausschreitungen in Dresden" score=1 below threshold
+[2m2026-05-20T16:02:39.783463Z[0m [34mDEBUG[0m [2mradar_bot[0m[2m:[0m DROP [rbb Berlin] "Spree-Bad-Aktivisten rufen erneut zu Mitschwimm-Demo an Berliner Museumsinsel auf" score=1 below threshold
+[2m2026-05-20T16:02:39.783660Z[0m [32m INFO[0m [2mradar_bot[0m[2m:[0m PASS [Kontrapolis] "Bericht Versammlung 8. Mai" keyword_implied=Some(1500)m terms=["Warschauer" (1500m)]
+[2m2026-05-20T16:02:39.785966Z[0m [34mDEBUG[0m [2mradar_bot[0m[2m:[0m DROP [rbb Berlin] "Führerschein-Reform stößt auf Skepsis in Brandenburg" score=1 below threshold
+[2m2026-05-20T16:02:39.790854Z[0m [32m INFO[0m [2mradar_bot[0m[2m:[0m PASS [Kontrapolis] "KI-Videoüberwachung im Kiez?! Wie geht es weiter?" keyword_implied=Some(1500)m terms=["Friedrichshain" (1500m)]
+[2m2026-05-20T16:02:39.791538Z[0m [34mDEBUG[0m [2mradar_bot[0m[2m:[0m DROP [Berliner Morgenpost] "„The Com“ und „764“: Das Sadisten-Netzwerk, das deutsche Ermittler schockiert" score=0 below threshold
+[2m2026-05-20T16:02:39.796038Z[0m [34mDEBUG[0m [2mradar_bot[0m[2m:[0m DROP [rbb Berlin] "Fördergeld-Affäre: Chialo sagt vorerst nicht vor U-Ausschuss aus" score=1 below threshold
+[2m2026-05-20T16:02:39.804235Z[0m [34mDEBUG[0m [2mradar_bot[0m[2m:[0m DROP [Kontrapolis] "Podiumsdiskussion: WIE WEITER MIT DEM KAMPF GEGEN DEN KLIMAWANDEL?" score=1 below threshold
+[2m2026-05-20T16:02:39.806751Z[0m [34mDEBUG[0m [2mradar_bot[0m[2m:[0m DROP [rbb Berlin] "Nach Verzögerungen öffnet Hindu-Tempel an der Hasenheide im Juni" score=1 below threshold
+[2m2026-05-20T16:02:39.808086Z[0m [32m INFO[0m [2mradar_bot[0m[2m:[0m PASS [Polizei Berlin] "Mann rassistisch beleidigt und angegriffen" keyword_implied=Some(1500)m terms=["Friedrichshain" (1500m)]
+[2m2026-05-20T16:02:39.810603Z[0m [34mDEBUG[0m [2mradar_bot[0m[2m:[0m DROP [rbb Berlin] "Enhanced Games: \"Das sind Menschenversuche\"" score=1 below threshold
+[2m2026-05-20T16:02:39.813188Z[0m [34mDEBUG[0m [2mradar_bot[0m[2m:[0m DROP [rbb Berlin] "Weiter viele antisemitische Vorfälle in Berlin" score=1 below threshold
+[2m2026-05-20T16:02:39.820232Z[0m [34mDEBUG[0m [2mradar_bot[0m[2m:[0m DROP [Tagesschau] "WHO warnt vor noch mehr Ebola-Fällen in DR Kongo" score=0 below threshold
+[2m2026-05-20T16:02:39.822786Z[0m [32m INFO[0m [2mradar_bot[0m[2m:[0m PASS [Polizei Berlin] "Randalierer leistet Widerstand und bespuckt Polizisten" keyword_implied=Some(1500)m terms=["Friedrichshain" (1500m)]
+[2m2026-05-20T16:02:39.828674Z[0m [32m INFO[0m [2mradar_bot[0m[2m:[0m PASS [Polizei Berlin] "Mehrere Verletzte nach Verkehrsunfall" keyword_implied=Some(1500)m terms=["Friedrichshain" (1500m)]
+[2m2026-05-20T16:02:39.829294Z[0m [32m INFO[0m [2mradar_bot[0m[2m:[0m PASS [Polizei Berlin] "Schwere Körperverletzung und versuchte räuberische Erpressung – Tatverdächtiger festgenommen" keyword_implied=Some(1500)m terms=["Friedrichshain" (1500m)]
+[2m2026-05-20T16:02:39.830933Z[0m [32m INFO[0m [2mradar_bot[0m[2m:[0m PASS [Polizei Berlin] "Stein- und Flaschenwürfe auf Einsatzkräfte" keyword_implied=Some(1500)m terms=["Friedrichshain" (1500m)]
+[2m2026-05-20T16:02:39.834495Z[0m [34mDEBUG[0m [2mradar_bot[0m[2m:[0m DROP [Berliner Morgenpost] "Tauchunglück auf den Malediven: Neue Details machen Ermittler stutzig"
+[2m2026-05-20T16:02:39.836846Z[0m [34mDEBUG[0m [2mradar_bot[0m[2m:[0m DROP [rbb Berlin] "BBL-Playoffs: Alba gleicht in Viertelfinal-Serie gegen Vechta aus" score=1 below threshold
+[2m2026-05-20T16:02:39.838423Z[0m [34mDEBUG[0m [2mradar_bot[0m[2m:[0m DROP [rbb Berlin] "Zehdenick (Oberhavel): Erste Ladesäule für Elektroboote im Norden Brandenburgs in Betrieb genommen" score=1 below threshold
+[2m2026-05-20T16:02:39.842399Z[0m [32m INFO[0m [2mradar_bot[0m[2m:[0m PASS [Polizei Berlin] "Maßnahmen der BAO Ferrum und EG Telum - Schusswaffe bei Wohnungsdurchsuchung gefunden" keyword_implied=Some(1500)m terms=["Friedrichshain" (1500m)]
+[2m2026-05-20T16:02:39.843052Z[0m [34mDEBUG[0m [2mradar_bot[0m[2m:[0m DROP [Berliner Morgenpost] "Pompeji: Gipsabdruck verrät Geheimnis eines Vulkanopfers – 60 Jahre nach Fund"
+[2m2026-05-20T16:02:39.844158Z[0m [34mDEBUG[0m [2mradar_bot[0m[2m:[0m DROP [Tagesschau] "Warum Samsung ein historischer Generalstreik bevorsteht"
+[2m2026-05-20T16:02:39.844422Z[0m [32m INFO[0m [2mradar_bot[0m[2m:[0m PASS [rbb Berlin] "Senat beschließt Schutzmaßnahmen für kritische Infrastruktur" keyword_implied=Some(1500)m terms=["Friedrichshain" (1500m)]
+[2m2026-05-20T16:02:39.861369Z[0m [34mDEBUG[0m [2mradar_bot[0m[2m:[0m DROP [Tagesschau] "DAX geht mit der Konjunktur"
+[2m2026-05-20T16:02:39.869451Z[0m [34mDEBUG[0m [2mradar_bot[0m[2m:[0m DROP [rbb Berlin] "Tausende Bachmuscheln in mehreren Brandenburger Fließgewässen ausgesetzt" score=1 below threshold
+[2m2026-05-20T16:02:39.871441Z[0m [32m INFO[0m [2mradar_bot[0m[2m:[0m PASS [Kontrapolis] "Fotos: Nakba Mobi Street Art in Friedrichshain" keyword_implied=Some(1500)m terms=["Friedrichshain" (1500m)]
+[2m2026-05-20T16:02:39.872303Z[0m [34mDEBUG[0m [2mradar_bot[0m[2m:[0m DROP [rbb Berlin] "Spree-Neiße: Döberns Bürgermeister Jörg Rakete plötzlich gestorben" score=1 below threshold
+[2m2026-05-20T16:02:39.873597Z[0m [34mDEBUG[0m [2mradar_bot[0m[2m:[0m DROP [Berliner Morgenpost] "Initiative präsentiert Pläne für 21.400 Wohnungen am Tempelhofer Feld" score=0 below threshold
+[2m2026-05-20T16:02:39.875851Z[0m [34mDEBUG[0m [2mradar_bot[0m[2m:[0m DROP [rbb Berlin] "Haftbefehl: Gesuchter Tatverdächtiger nach Unfall in Cottbus festgenommen" score=1 below threshold
+[2m2026-05-20T16:02:39.876465Z[0m [32m INFO[0m [2mradar_bot[0m[2m:[0m PASS [Kontrapolis] "Filmvorführung: Wer hat Angst vor Braunau?" keyword_implied=Some(1500)m terms=["Samariterstr" (1500m)]
+[2m2026-05-20T16:02:39.882284Z[0m [34mDEBUG[0m [2mradar_bot[0m[2m:[0m DROP [rbb Berlin] "Pfingst-Wochenende in Berlin und Brandenburg warm und sonnig" score=1 below threshold
+[2m2026-05-20T16:02:39.907865Z[0m [34mDEBUG[0m [2mradar_bot[0m[2m:[0m DROP [rbb Berlin] "Brandenburger Regierung möchte Bauordnung vereinfachen" score=1 below threshold
+[2m2026-05-20T16:02:39.908635Z[0m [34mDEBUG[0m [2mradar_bot[0m[2m:[0m DROP [rbb Berlin] "Berliner Südosten: Nach einem Kabeldiebstahl fahren S-Bahnen wieder planmäßig" score=1 below threshold
+[2m2026-05-20T16:02:39.910711Z[0m [34mDEBUG[0m [2mradar_bot[0m[2m:[0m DROP [rbb Berlin] "Oranienburg: Bombensprengung im Juni - Lehnitz und Süd betroffen" score=1 below threshold
+[2m2026-05-20T16:02:39.917643Z[0m [34mDEBUG[0m [2mradar_bot[0m[2m:[0m DROP [Tagesschau] "Mindestens 19 Tote bei israelischen Angriffen im Libanon"
+[2m2026-05-20T16:02:39.917769Z[0m [34mDEBUG[0m [2mradar_bot[0m[2m:[0m DROP [Berliner Morgenpost] "Ebola-Behandlung sollte uns nicht in Panik versetzen – im Gegenteil" score=0 below threshold
+[2m2026-05-20T16:02:39.945984Z[0m [34mDEBUG[0m [2mradar_bot[0m[2m:[0m DROP [Berliner Morgenpost] "Berliner Polizei setzt auf Hightech gegen Drohnen – so hoch sind die Kosten" score=0 below threshold
+[2m2026-05-20T16:02:39.969460Z[0m [34mDEBUG[0m [2mradar_bot[0m[2m:[0m DROP [Tagesschau] "US-Senatoren stimmen für mehr Mitsprache im Iran-Krieg"
+[2m2026-05-20T16:02:40.011118Z[0m [34mDEBUG[0m [2mradar_bot[0m[2m:[0m DROP [Tagesschau] "Vergleich mit US-Behörde: Trumps Steuern bleiben für immer ungeprüft"
+[2m2026-05-20T16:02:40.047327Z[0m [34mDEBUG[0m [2mradar_bot[0m[2m:[0m DROP [Tagesschau] "Bundesregierung will Hersteller zur Reparatur verpflichten" score=0 below threshold
+[2m2026-05-20T16:02:40.050600Z[0m [34mDEBUG[0m [2mradar_bot[0m[2m:[0m DROP [Tagesschau] "Hauseinsturz in Görlitz: Suche nach Vermissten wieder angelaufen"
+[2m2026-05-20T16:02:40.067056Z[0m [34mDEBUG[0m [2mradar_bot[0m[2m:[0m DROP [Tagesschau] "Katastrophenschutzkonzept im Kabinett: Wie gut ist Deutschland beim Zivilschutz aufgestellt?" score=0 below threshold
+[2m2026-05-20T16:02:40.082548Z[0m [34mDEBUG[0m [2mradar_bot[0m[2m:[0m DROP [Berliner Morgenpost] "Sonntagsfrage: So würden die Deutschen jetzt wählen" score=0 below threshold
+[2m2026-05-20T16:02:40.085452Z[0m [34mDEBUG[0m [2mradar_bot[0m[2m:[0m DROP [Berliner Morgenpost] "Zecken-Atlas 2026: Wo sich Zecken in Deutschland festsaugen"
+[2m2026-05-20T16:02:40.105434Z[0m [34mDEBUG[0m [2mradar_bot[0m[2m:[0m DROP [Tagesschau] "Xi empfängt Putin in Peking: Demonstrative Harmonie"
+[2m2026-05-20T16:02:40.130690Z[0m [34mDEBUG[0m [2mradar_bot[0m[2m:[0m DROP [Tagesschau] "EU mit Aktionsplan gegen hohe Düngemittelpreise" score=0 below threshold
+[2m2026-05-20T16:02:40.135918Z[0m [34mDEBUG[0m [2mradar_bot[0m[2m:[0m DROP [Berliner Morgenpost] "Rentenrechner: So viel Rente können Sie erwarten" score=0 below threshold
+[2m2026-05-20T16:02:40.145107Z[0m [34mDEBUG[0m [2mradar_bot[0m[2m:[0m DROP [Berliner Morgenpost] "Ist das Wetter noch normal? Der tägliche Check" score=0 below threshold
+[2m2026-05-20T16:02:40.160283Z[0m [34mDEBUG[0m [2mradar_bot[0m[2m:[0m DROP [Tagesschau] "Einigung in der EU: US-Zollabkommen soll umgesetzt werden"
+[2m2026-05-20T16:02:40.167136Z[0m [34mDEBUG[0m [2mradar_bot[0m[2m:[0m DROP [Berliner Morgenpost] "Wie voll sind die Gasspeicher? Wie hoch ist der Preis?" score=0 below threshold
+[2m2026-05-20T16:02:40.189997Z[0m [34mDEBUG[0m [2mradar_bot[0m[2m:[0m DROP [Tagesschau] "Erste Auslandsreise: Ungarns Ministerpräsident Magyar sucht Nähe zu Polen"
+[2m2026-05-20T16:02:40.205858Z[0m [34mDEBUG[0m [2mradar_bot[0m[2m:[0m DROP [Tagesschau] "Bundeskabinett befasst sich mit Führerscheinreform" score=0 below threshold
+[2m2026-05-20T16:02:40.251734Z[0m [34mDEBUG[0m [2mradar_bot[0m[2m:[0m DROP [Tagesschau] "Russischer Präsident in China: Nach Trump nun Putin bei Xi"
+[2m2026-05-20T16:02:40.265710Z[0m [34mDEBUG[0m [2mradar_bot[0m[2m:[0m DROP [Indymedia RSS] "Veilchen gegen Nazis!"
+[2m2026-05-20T16:02:40.268926Z[0m [34mDEBUG[0m [2mradar_bot[0m[2m:[0m DROP [Tagesschau] "Moschee-Angreifer von San Diego laut Polizei von Hass getrieben"
+[2m2026-05-20T16:02:40.293177Z[0m [34mDEBUG[0m [2mradar_bot[0m[2m:[0m DROP [Indymedia RSS] "Karl-Lueger-Statue Angegriffen"
+[2m2026-05-20T16:02:40.321640Z[0m [34mDEBUG[0m [2mradar_bot[0m[2m:[0m DROP [Tagesschau] "Waldzustandserhebung: Der Wald der Zukunft braucht Vielfalt"
+[2m2026-05-20T16:02:40.366785Z[0m [34mDEBUG[0m [2mradar_bot[0m[2m:[0m DROP [Tagesschau] "Marktbericht: Zwischen Hoffnung und Eskalationsangst"
+[2m2026-05-20T16:02:40.396346Z[0m [34mDEBUG[0m [2mradar_bot[0m[2m:[0m DROP [Tagesschau] "Trump-Beauftragter in Grönland: Ein Besuch nicht ohne Absichten"
+[2m2026-05-20T16:02:40.427146Z[0m [34mDEBUG[0m [2mradar_bot[0m[2m:[0m DROP [Tagesschau] "Neues Selbstbewusstsein und alte Korruptionsprobleme"
+[2m2026-05-20T16:02:40.467072Z[0m [34mDEBUG[0m [2mradar_bot[0m[2m:[0m DROP [Indymedia RSS] "Milliarden für den Katastrophenschutz"
+[2m2026-05-20T16:02:40.467438Z[0m [34mDEBUG[0m [2mradar_bot[0m[2m:[0m DROP [Indymedia RSS] "Debattenblog der Interventionistischen Linken"
+[2m2026-05-20T16:02:40.476665Z[0m [34mDEBUG[0m [2mradar_bot[0m[2m:[0m DROP [Tagesschau] "Spahn will Verzicht auf Diätenerhöhung an Krankenkassen-Reform koppeln"
+[2m2026-05-20T16:02:40.477969Z[0m [34mDEBUG[0m [2mradar_bot[0m[2m:[0m DROP [Indymedia RSS] "Familienministerin: Karin Prien will Social-Media-Verbot nicht „Verbot“ nennen" score=0 below threshold
+[2m2026-05-20T16:02:40.511042Z[0m [34mDEBUG[0m [2mradar_bot[0m[2m:[0m DROP [Tagesschau] "Wie ist der aktuelle Stand im Zollstreit zwischen EU und USA?"
+[2m2026-05-20T16:02:40.565230Z[0m [34mDEBUG[0m [2mradar_bot[0m[2m:[0m DROP [Tagesschau] "Polen suchen nach Angriff richtigen Umgang mit \"Problembären\""
+[2m2026-05-20T16:02:40.606772Z[0m [34mDEBUG[0m [2mradar_bot[0m[2m:[0m DROP [Tagesschau] "Pflege: Mehr Bedürftige, höhere Ausgaben, großer Reformbedarf" score=0 below threshold
+[2m2026-05-20T16:02:40.630061Z[0m [34mDEBUG[0m [2mradar_bot[0m[2m:[0m DROP [Berliner Morgenpost] "Kolumbiens Kindersoldaten – wer flieht, wird mit dem Tod bestraft"
+[2m2026-05-20T16:02:40.637689Z[0m [34mDEBUG[0m [2mradar_bot[0m[2m:[0m DROP [Tagesschau] "Gesetzentwurf: Kabinett beschließt Reform des Führerscheins"
+[2m2026-05-20T16:02:40.637699Z[0m [34mDEBUG[0m [2mradar_bot[0m[2m:[0m DROP [Indymedia RSS] "Gekapptes \"Demokratie leben\"-Programm: Wie sich Priens Kahlschlag auswirkt"
+[2m2026-05-20T16:02:40.638099Z[0m [34mDEBUG[0m [2mradar_bot[0m[2m:[0m DROP [Tagesschau] "Durch Inflationssorgen: Umsatz im Gastgewerbe auf Corona-Niveau"
+[2m2026-05-20T16:02:40.647029Z[0m [34mDEBUG[0m [2mradar_bot[0m[2m:[0m DROP [Berliner Morgenpost] "„Automatisch und unverzüglich“: In diesem Fall will Nordkorea Atomschlag einleiten"
+[2m2026-05-20T16:02:40.650274Z[0m [34mDEBUG[0m [2mradar_bot[0m[2m:[0m DROP [Berliner Morgenpost] "Berlins Finanzsenator: „Umgang mit Berufsbeamtentum wird sich bundesweit ändern“" score=0 below threshold
+[2m2026-05-20T16:02:40.659711Z[0m [34mDEBUG[0m [2mradar_bot[0m[2m:[0m DROP [Tagesschau] "Ebola-Patient wird in Berliner Charité behandelt" score=0 below threshold
+[2m2026-05-20T16:02:40.666156Z[0m [34mDEBUG[0m [2mradar_bot[0m[2m:[0m DROP [Berliner Morgenpost] "Wie die Berliner zur Randbebauung des Tempelhofer Feldes stehen" score=0 below threshold
+[2m2026-05-20T16:02:40.671191Z[0m [34mDEBUG[0m [2mradar_bot[0m[2m:[0m DROP [Berliner Morgenpost] "Nach Tod von Schauspieler Alexander Held: ZDF kündigt Programmänderung an" score=0 below threshold
+[2m2026-05-20T16:02:40.681434Z[0m [34mDEBUG[0m [2mradar_bot[0m[2m:[0m DROP [Tagesschau] "Marktbericht: DAX-Plus schmilzt zusammen"
+[2m2026-05-20T16:02:40.696091Z[0m [32m INFO[0m [2mradar_bot[0m[2m:[0m PASS [Berliner Morgenpost] "Luna Jordan stirbt mit 25 Jahren – „Ab dem Punkt hat sich alles verändert“" keyword_implied=Some(1500)m terms=["Ostkreuz" (1500m)]
+[2m2026-05-20T16:02:40.706764Z[0m [34mDEBUG[0m [2mradar_bot[0m[2m:[0m DROP [Berliner Morgenpost] "Bericht über brisanten Pakt: Russische Soldaten in China ausgebildet?" score=0 below threshold
+[2m2026-05-20T16:02:40.709773Z[0m [34mDEBUG[0m [2mradar_bot[0m[2m:[0m DROP [Tagesschau] "EU und USA: Ja zum Zoll-Deal - aber die Konflikte bleiben"
+[2m2026-05-20T16:02:40.719149Z[0m [34mDEBUG[0m [2mradar_bot[0m[2m:[0m DROP [Tagesschau] "Nach zehn Jahren Haft - NSU-Unterstützer Wohlleben entlassen"
+[2m2026-05-20T16:02:40.726335Z[0m [34mDEBUG[0m [2mradar_bot[0m[2m:[0m DROP [Berliner Morgenpost] "Immer Hertha – Mit Vollbruch in den Umbruch" score=0 below threshold
+[2m2026-05-20T16:02:40.736170Z[0m [34mDEBUG[0m [2mradar_bot[0m[2m:[0m DROP [Berliner Morgenpost] "Putin bei Xi in Peking: Strategische Partnerschaft und Energie-Poker"
+[2m2026-05-20T16:02:40.779824Z[0m [34mDEBUG[0m [2mradar_bot[0m[2m:[0m DROP [Berliner Morgenpost] "Trump triumphiert: Kein Steuerverfahren gegen US-Präsidenten – „Auf ewig“" score=0 below threshold
+[2m2026-05-20T16:02:40.827887Z[0m [34mDEBUG[0m [2mradar_bot[0m[2m:[0m DROP [Berliner Morgenpost] "#18 Lasst uns Freunde sein! (Oder besser doch nicht?)"
+[2m2026-05-20T16:02:40.830361Z[0m [34mDEBUG[0m [2mradar_bot[0m[2m:[0m DROP [Berliner Morgenpost] "Eisbären: Nach der Titellust kommt der große WM-Frust" score=0 below threshold
+[2m2026-05-20T16:02:40.831081Z[0m [34mDEBUG[0m [2mradar_bot[0m[2m:[0m DROP [Berliner Morgenpost] "Radikales Wasserfasten: Das ist mit meinem Körper passiert" score=0 below threshold
+[2m2026-05-20T16:02:40.831124Z[0m [34mDEBUG[0m [2mradar_bot[0m[2m:[0m DROP [Berliner Morgenpost] "„Tatsächlich bietet die Traumhausverlosung deutlich bessere Chancen“"
+[2m2026-05-20T16:02:40.832013Z[0m [34mDEBUG[0m [2mradar_bot[0m[2m:[0m DROP [Berliner Morgenpost] "Zwischen den Generation: Mehr Verständnis statt Vorurteile" score=0 below threshold
+[2m2026-05-20T16:02:40.832525Z[0m [34mDEBUG[0m [2mradar_bot[0m[2m:[0m DROP [Berliner Morgenpost] "Von SEO zu GEO: So rettest du deine Sichtbarkeit in der KI-Suche"
+[2m2026-05-20T16:02:40.832626Z[0m [34mDEBUG[0m [2mradar_bot[0m[2m:[0m DROP [Berliner Morgenpost] "Alba: Wenn der einstige Held zum Dieb werden will" score=0 below threshold
+[2m2026-05-20T16:02:40.834654Z[0m [34mDEBUG[0m [2mradar_bot[0m[2m:[0m DROP [Berliner Morgenpost] "Heidi Klum spricht über ihre Wechseljahre: „Auf einmal war mir immer heiß“" score=0 below threshold
+[2m2026-05-20T16:02:40.835017Z[0m [34mDEBUG[0m [2mradar_bot[0m[2m:[0m DROP [Berliner Morgenpost] "#72 Koopman/ Schalanksy/ Hustvedt" score=0 below threshold
+[2m2026-05-20T16:02:40.835097Z[0m [34mDEBUG[0m [2mradar_bot[0m[2m:[0m DROP [Berliner Morgenpost] "Sudoku"
+[2m2026-05-20T16:02:40.835324Z[0m [34mDEBUG[0m [2mradar_bot[0m[2m:[0m DROP [Berliner Morgenpost] "Rambo Zambo – Der Merz-Podcast"
+[2m2026-05-20T16:02:40.836636Z[0m [34mDEBUG[0m [2mradar_bot[0m[2m:[0m DROP [Berliner Morgenpost] "Trailer – \"Gespräche, die den Rahmen sprengen\""
+[2m2026-05-20T16:02:40.837439Z[0m [34mDEBUG[0m [2mradar_bot[0m[2m:[0m DROP [Berliner Morgenpost] "Wordle"
+[2m2026-05-20T16:02:40.840937Z[0m [34mDEBUG[0m [2mradar_bot[0m[2m:[0m DROP [Berliner Morgenpost] "Kriegt der Kanzler die Kurve?"
+[2m2026-05-20T16:02:40.841078Z[0m [34mDEBUG[0m [2mradar_bot[0m[2m:[0m DROP [Berliner Morgenpost] "#58 Die Unbestechliche"
+[2m2026-05-20T16:02:40.841110Z[0m [34mDEBUG[0m [2mradar_bot[0m[2m:[0m DROP [Berliner Morgenpost] "Heuschnupfen: Faszien-Übungen können laut Expertin „Allergien im Keim ersticken“" score=0 below threshold
+[2m2026-05-20T16:02:40.842134Z[0m [34mDEBUG[0m [2mradar_bot[0m[2m:[0m DROP [Berliner Morgenpost] "„Absolut ungesundes Verhältnis“: Betroffener über Autismus in der Beziehung" score=0 below threshold
+[2m2026-05-20T16:02:40.842430Z[0m [34mDEBUG[0m [2mradar_bot[0m[2m:[0m DROP [Berliner Morgenpost] "Zensur oder Schutz? Wie frei ist Journalismus wirklich?" score=0 below threshold
+[2m2026-05-20T16:02:40.845339Z[0m [34mDEBUG[0m [2mradar_bot[0m[2m:[0m DROP [Berliner Morgenpost] "Spezialstation der Charité versorgt Ebola-Patienten: „Ist ein wirklicher Vorteil“" score=0 below threshold
+[2m2026-05-20T16:02:40.845578Z[0m [34mDEBUG[0m [2mradar_bot[0m[2m:[0m DROP [Berliner Morgenpost] "Alba erhöht die Intensität und schlägt zurück" score=0 below threshold
+[2m2026-05-20T16:02:40.845822Z[0m [34mDEBUG[0m [2mradar_bot[0m[2m:[0m DROP [Berliner Morgenpost] "Berlin-Wahl 2026: Aktuelle Sonntagsfrage und mögliche Koalitionen" score=0 below threshold
+[2m2026-05-20T16:02:40.846265Z[0m [34mDEBUG[0m [2mradar_bot[0m[2m:[0m DROP [Berliner Morgenpost] "XXL-Grafik: Alle Berlinale-Gewinner in den letzten 50 Jahren" score=0 below threshold
+[2m2026-05-20T16:02:40.847270Z[0m [34mDEBUG[0m [2mradar_bot[0m[2m:[0m DROP [Berliner Morgenpost] "Amann Unframed"
+[2m2026-05-20T16:02:40.847555Z[0m [34mDEBUG[0m [2mradar_bot[0m[2m:[0m DROP [Berliner Morgenpost] "Länger Leben"
+[2m2026-05-20T16:02:40.850319Z[0m [34mDEBUG[0m [2mradar_bot[0m[2m:[0m DROP [Berliner Morgenpost] "Mikas Matrix"
+[2m2026-05-20T16:02:40.850584Z[0m [34mDEBUG[0m [2mradar_bot[0m[2m:[0m DROP [Berliner Morgenpost] "Schiffe versenken"
+[2m2026-05-20T16:02:40.851969Z[0m [34mDEBUG[0m [2mradar_bot[0m[2m:[0m DROP [Berliner Morgenpost] "Ab wann soll das Altersvorsorgedepot kommen? Aktueller Stand der Pläne"
+[2m2026-05-20T16:02:40.852099Z[0m [34mDEBUG[0m [2mradar_bot[0m[2m:[0m DROP [Berliner Morgenpost] "Mitschwimm-Demo in der Spree – Aktion fällt wegen Regen ins Wasser" score=0 below threshold
+[2m2026-05-20T16:02:40.852447Z[0m [34mDEBUG[0m [2mradar_bot[0m[2m:[0m DROP [Berliner Morgenpost] "Mit Schockfrisur schweigt es sich schlecht: „fünf minuten stille“" score=0 below threshold
+[2m2026-05-20T16:02:40.853056Z[0m [34mDEBUG[0m [2mradar_bot[0m[2m:[0m DROP [Berliner Morgenpost] "Sparkassen-Studie: Jeder vierte Berliner kann kein Geld zurücklegen" score=0 below threshold
+[2m2026-05-20T16:02:40.854425Z[0m [34mDEBUG[0m [2mradar_bot[0m[2m:[0m DROP [Berliner Morgenpost] "Hochverarbeitete Lebensmittel: Fertig. Günstig. Ungesund." score=0 below threshold
+[2m2026-05-20T16:02:40.855286Z[0m [34mDEBUG[0m [2mradar_bot[0m[2m:[0m DROP [Berliner Morgenpost] "Grippe: Wie viele Fälle werden gerade gemeldet?"
+[2m2026-05-20T16:02:40.855664Z[0m [34mDEBUG[0m [2mradar_bot[0m[2m:[0m DROP [Berliner Morgenpost] "Daily Kreuzworträtsel"
+[2m2026-05-20T16:02:40.858479Z[0m [34mDEBUG[0m [2mradar_bot[0m[2m:[0m DROP [Berliner Morgenpost] "Frühstart-Rente: Rechner zeigt, was die 10 Euro bringen"
+[2m2026-05-20T16:02:40.859758Z[0m [34mDEBUG[0m [2mradar_bot[0m[2m:[0m DROP [Berliner Morgenpost] "Interaktiver Warenkorb zeigt Preisanstieg im Supermarkt"
+[2m2026-05-20T16:02:40.860185Z[0m [34mDEBUG[0m [2mradar_bot[0m[2m:[0m DROP [Berliner Morgenpost] "Dr. Riedl verrät einen einfachen Wasser-Trick: So hilft Trinken beim Abnehmen" score=0 below threshold
+[2m2026-05-20T16:02:40.860784Z[0m [34mDEBUG[0m [2mradar_bot[0m[2m:[0m DROP [Berliner Morgenpost] "Heute live! Finale der Europa League: Gelingt dem SC Freiburg der ganz große Coup?"
+[2m2026-05-20T16:02:40.861286Z[0m [34mDEBUG[0m [2mradar_bot[0m[2m:[0m DROP [Berliner Morgenpost] "Pärchensuche"
+[2m2026-05-20T16:02:40.861412Z[0m [32m INFO[0m [2mradar_bot[0m[2m:[0m PASS [Berliner Morgenpost] "Verkehr in Berlin live: Stau, Sperrungen, Störungen" keyword_implied=Some(1500)m terms=["Friedrichshain" (1500m)]
+[2m2026-05-20T16:02:40.862587Z[0m [34mDEBUG[0m [2mradar_bot[0m[2m:[0m DROP [Berliner Morgenpost] "Kann Merkel Putin besänftigen? Ex-Kanzlerin plötzlich aussichtsreiche Kandidatin" score=0 below threshold
+[2m2026-05-20T16:02:40.863652Z[0m [34mDEBUG[0m [2mradar_bot[0m[2m:[0m DROP [Berliner Morgenpost] "So steht es in den Umfragen zu den Landtagswahlen 2026"
+[2m2026-05-20T16:02:40.863770Z[0m [34mDEBUG[0m [2mradar_bot[0m[2m:[0m DROP [Berliner Morgenpost] "Nahrungsergänzungsmittel: Auf diese Supplements schwört Felix Bertram"
+[2m2026-05-20T16:02:40.863965Z[0m [34mDEBUG[0m [2mradar_bot[0m[2m:[0m DROP [Berliner Morgenpost] "Russland und China: Ihr Bündnis wird überschätzt, aber ein Thema ist bedrohlich" score=0 below threshold
+[2m2026-05-20T16:02:40.864715Z[0m [34mDEBUG[0m [2mradar_bot[0m[2m:[0m DROP [Berliner Morgenpost] "Candy Diaries – Der Diabetes-Podcast"
+[2m2026-05-20T16:02:40.865061Z[0m [34mDEBUG[0m [2mradar_bot[0m[2m:[0m DROP [Berliner Morgenpost] "Polizei schnappt Drogendealer in Berlin – am „ersten Arbeitstag“" score=0 below threshold
+[2m2026-05-20T16:02:40.866142Z[0m [34mDEBUG[0m [2mradar_bot[0m[2m:[0m DROP [Berliner Morgenpost] "Meine schwerste Entscheidung"
+[2m2026-05-20T16:02:40.866557Z[0m [34mDEBUG[0m [2mradar_bot[0m[2m:[0m DROP [Berliner Morgenpost] "Umstrittener Zoll-Deal mit Trump: Wie Europa den Schaden begrenzen will"
+[2m2026-05-20T16:02:40.870422Z[0m [34mDEBUG[0m [2mradar_bot[0m[2m:[0m DROP [Berliner Morgenpost] "Im Krisenmodus"
+[2m2026-05-20T16:02:40.882107Z[0m [34mDEBUG[0m [2mradar_bot[0m[2m:[0m DROP [Berliner Morgenpost] "Immer Hertha"

@@ -21,8 +21,9 @@ encryption_strategy = "all_devices"
 [schedule]
 # How often to poll all RSS/Atom sources (minutes).
 poll_interval_minutes = 30
-# Time to post the daily digest of queued items (HH:MM, 24h).
-digest_time = "08:00"
+# Times to post a digest of queued items (HH:MM, 24h). Each posting drains the
+# queue, so digests never overlap. Add as many times as you like.
+digest_times = ["08:00", "20:00"]
 
 # ── Filter ────────────────────────────────────────────────────────────────────
 [filter]
@@ -31,7 +32,7 @@ digest_time = "08:00"
 required = ["Yourcity"]
 
 # Minimum distance score (1–5) to include in the daily digest.
-digest_threshold = 1
+digest_threshold = 2
 
 # Your reference address — geocoded once at startup. All distances are measured from here.
 reference_address = "Yourstreet 1, 10000 Yourcity"

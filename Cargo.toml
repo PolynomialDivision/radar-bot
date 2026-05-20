@@ -9,6 +9,7 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = "1"
+dashmap = "6"
 chrono = "0.4"
 futures-util = "0.3"
 matrix-sdk = { git = "https://github.com/matrix-org/matrix-rust-sdk", rev = "7677f090990a0fd3ac0e578da24434d4f80cb4c8", features = ["sqlite"] }

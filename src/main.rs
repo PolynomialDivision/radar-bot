@@ -2,7 +2,8 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
-use tokio::sync::Mutex;
+use dashmap::DashMap;
+use tokio::sync::{Mutex, Semaphore};
 
 use anyhow::{Context, Result};
 use chrono::{Local, NaiveTime};
@@ -28,9 +29,9 @@ use matrix_sdk::{
 };
 use matrix_sdk_base::crypto::CollectStrategy;
 
-type GeocodeCache = Arc<Mutex<HashMap<String, Option<(f64, f64)>>>>;
+type GeocodeCache = Arc<DashMap<String, Option<(f64, f64)>>>;
 use serde::{Deserialize, Serialize};
-use tokio::{fs, time::sleep, time::Duration};
+use tokio::{fs, task::JoinSet, time::sleep, time::Duration};
 use tracing::{error, info, warn};
 
 // ── Config ────────────────────────────────────────────────────────────────────
@@ -119,22 +120,23 @@ struct ScheduleConfig {
     /// How often to poll all sources (minutes).
     #[serde(default = "default_poll_interval")]
     poll_interval_minutes: u64,
-    /// Time of day to post the daily digest (HH:MM, 24h).
-    #[serde(default = "default_digest_time")]
-    digest_time: String,
+    /// Times of day to post a digest (HH:MM, 24h). Each fires independently;
+    /// the queue is drained on every posting so digests never overlap.
+    #[serde(default = "default_digest_times")]
+    digest_times: Vec<String>,
 }
 
 impl Default for ScheduleConfig {
     fn default() -> Self {
         Self {
             poll_interval_minutes: default_poll_interval(),
-            digest_time: default_digest_time(),
+            digest_times: default_digest_times(),
         }
     }
 }
 
 fn default_poll_interval() -> u64 { 30 }
-fn default_digest_time() -> String { "08:00".to_owned() }
+fn default_digest_times() -> Vec<String> { vec!["08:00".to_owned()] }
 fn default_true() -> bool { true }
 
 #[derive(Deserialize, Default)]
@@ -410,13 +412,17 @@ fn find_tag_inner<'a>(html: &'a str, tag_name: &str) -> Option<&'a str> {
 fn remove_blocks(html: &str, tags: &[&str]) -> String {
     let mut result = html.to_owned();
     for tag in tags {
+        let open_str = format!("<{tag}");
         let close_str = format!("</{tag}>");
+        // Keep both original and lowercase in sync so to_lowercase() runs once per removal,
+        // not once per loop iteration over the whole string.
+        let mut lower = result.to_lowercase();
         loop {
-            let lower = result.to_lowercase();
-            let open_str = format!("<{tag}");
             match (lower.find(&open_str), lower.find(&close_str)) {
                 (Some(s), Some(e)) if s < e => {
-                    result = format!("{}{}", &result[..s], &result[e + close_str.len()..]);
+                    let end = e + close_str.len();
+                    result = format!("{}{}", &result[..s], &result[end..]);
+                    lower  = format!("{}{}", &lower[..s],  &lower[end..]);
                 }
                 _ => break,
             }
@@ -454,9 +460,15 @@ async fn fetch_article_text(http: &reqwest::Client, url: &str) -> Option<String>
     )
     .await.ok()?.ok()?;
 
-    let text = extract_article_body(&html);
-    let text = text.trim();
-    if text.is_empty() { None } else { Some(text.to_owned()) }
+    // extract_article_body calls remove_blocks which is CPU-intensive on large HTML pages.
+    // Run it on the blocking thread pool so it doesn't stall the async runtime.
+    let text = tokio::task::spawn_blocking(move || {
+        let t = extract_article_body(&html);
+        let t = t.trim().to_owned();
+        if t.is_empty() { None } else { Some(t) }
+    }).await.ok()??;
+
+    Some(text)
 }
 
 // ── Geocoding + distance ──────────────────────────────────────────────────────
@@ -470,17 +482,24 @@ fn haversine_meters(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
     R * 2.0 * a.sqrt().asin()
 }
 
+// Distance tier boundaries (metres) used by distance_score() and geocoding early-exit.
+const DIST_SCORE_5: f64 =    200.0; // 🔴 very close
+const DIST_SCORE_4: f64 =    500.0; // 🟠
+const DIST_SCORE_3: f64 =  1_000.0; // 🟡
+const DIST_SCORE_2: f64 =  2_000.0; // 🟢
+const DIST_SCORE_1: f64 = 10_000.0; // 🔵 city-wide
+
 fn format_distance(m: f64) -> String {
     if m < 1_000.0 { format!("~{}m", m.round() as u32) }
     else { format!("~{:.1}km", m / 1_000.0) }
 }
 
 fn distance_score(m: f64) -> i32 {
-    if m < 200.0 { 5 }
-    else if m < 500.0 { 4 }
-    else if m < 1_000.0 { 3 }
-    else if m < 2_000.0 { 2 }
-    else if m < 10_000.0 { 1 }
+    if m < DIST_SCORE_5 { 5 }
+    else if m < DIST_SCORE_4 { 4 }
+    else if m < DIST_SCORE_3 { 3 }
+    else if m < DIST_SCORE_2 { 2 }
+    else if m < DIST_SCORE_1 { 1 }
     else { 0 }
 }
 
@@ -507,6 +526,10 @@ fn extract_street_candidates(text: &str) -> Vec<String> {
         "am", "im", "zur", "zum", "vom", "von", "an", "in", "zu", "bei", "nach",
         "über", "unter", "vor", "durch", "entlang", "bis", "um", "seit", "ab",
         "außer", "gegenüber", "nahe",
+        // conjunctions — prevent "und Erreichbarkeit Platz" style false positives
+        "und", "oder", "sowie", "bzw",
+        // indefinite articles (cases not covered above)
+        "einem", "einer", "eines",
     ];
 
     let words: Vec<&str> = text.split_whitespace().collect();
@@ -552,7 +575,12 @@ fn extract_street_candidates(text: &str) -> Vec<String> {
             }
         }
 
-        let candidate = all_parts.join(" ");
+        // Strip trailing punctuation from each part so "Luftbrücke," and
+        // "Luftbrücke" produce the same candidate string and cache key.
+        let candidate = all_parts.iter()
+            .map(|w| w.trim_end_matches(|c: char| matches!(c, ',' | '.' | ';' | ':' | '!' | '?')))
+            .collect::<Vec<_>>()
+            .join(" ");
         if candidate.len() >= 5 && seen.insert(candidate.to_lowercase()) {
             out.push(candidate);
         }
@@ -576,22 +604,39 @@ fn url_encode(s: &str) -> String {
 
 /// Geocode a query string via Nominatim. If `city` is non-empty it is appended
 /// to anchor results (e.g. street lookups). Pass "" for a full address query.
-async fn geocode_location(http: &reqwest::Client, query: &str, city: &str) -> Option<(f64, f64)> {
+///
+/// Returns `Ok(Some(coords))` on hit, `Ok(None)` when Nominatim confirms the
+/// address doesn't exist, and `Err(())` for transient failures (network,
+/// timeout, parse). Only `Ok(_)` results should be cached.
+async fn geocode_location(http: &reqwest::Client, query: &str, city: &str) -> Result<Option<(f64, f64)>, ()> {
     let full = if city.is_empty() { query.to_owned() } else { format!("{query}, {city}") };
     let q = url_encode(&full);
     let url = format!("https://nominatim.openstreetmap.org/search?q={q}&format=json&limit=1");
     let resp: reqwest::Response = tokio::time::timeout(
-        Duration::from_secs(8),
+        NOMINATIM_TIMEOUT,
         http.get(&url).header("Accept-Language", "de").send(),
     )
-    .await.ok()?.ok()?;
-    let body = resp.text().await.ok()?;
-    let arr: serde_json::Value = serde_json::from_str(&body).ok()?;
-    let first = arr.get(0)?;
-    let lat: f64 = first["lat"].as_str()?.parse().ok()?;
-    let lon: f64 = first["lon"].as_str()?.parse().ok()?;
-    Some((lat, lon))
+    .await.map_err(|_| ())?.map_err(|_| ())?;
+    let body = tokio::time::timeout(NOMINATIM_TIMEOUT, resp.text())
+        .await.map_err(|_| ())?.map_err(|_| ())?;
+    let arr: serde_json::Value = serde_json::from_str(&body).map_err(|_| ())?;
+    let Some(first) = arr.get(0) else { return Ok(None) };
+    let lat: f64 = first["lat"].as_str().ok_or(())?.parse().map_err(|_| ())?;
+    let lon: f64 = first["lon"].as_str().ok_or(())?.parse().map_err(|_| ())?;
+    Ok(Some((lat, lon)))
 }
+
+// ── Nominatim rate limiter ────────────────────────────────────────────────────
+
+const NOMINATIM_INTERVAL: Duration = Duration::from_millis(1_100);
+const NOMINATIM_TIMEOUT: Duration = Duration::from_secs(8);
+const MAX_GEOCODE_CANDIDATES: usize = 60;
+const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(2);
+
+/// One-permit semaphore: only one geocode request runs at a time.
+/// The holder sleeps NOMINATIM_INTERVAL after the request before releasing,
+/// so the rate never exceeds 1 req/s regardless of how many tasks are waiting.
+type NominatimLimiter = Arc<Semaphore>;
 
 /// Find the closest geocodable street mention in `text` to `(ref_lat, ref_lon)`.
 /// Returns `(distance_m, street_name)` or `None`. Results are cached to avoid repeat lookups.
@@ -602,21 +647,37 @@ async fn find_nearest_distance(
     ref_lon: f64,
     city: &str,
     cache: &GeocodeCache,
+    limiter: &NominatimLimiter,
 ) -> Option<(f64, String)> {
     let candidates = extract_street_candidates(text);
-    if candidates.is_empty() { return None; }
+    if candidates.is_empty() {
+        return None;
+    }
     let mut best: Option<(f64, String)> = None;
 
-    for candidate in candidates.into_iter() {
-        // Check cache: Some(Some(coords)) = hit, Some(None) = prev miss, None = unseen
-        let cached: Option<Option<(f64, f64)>> = cache.lock().await.get(&candidate).copied();
+    for candidate in candidates.into_iter().take(MAX_GEOCODE_CANDIDATES) {
+        // Check cache first — Some(Some(coords)) = hit, Some(None) = confirmed miss.
+        let cached: Option<Option<(f64, f64)>> = cache.get(&candidate).map(|v| *v);
         let coords = match cached {
             Some(v) => v,
             None => {
-                sleep(Duration::from_millis(1_100)).await; // Nominatim: max 1 req/s
-                let result = geocode_location(http, &candidate, city).await;
-                cache.lock().await.insert(candidate.clone(), result);
-                result
+                // Acquire the single geocoding permit. Tasks queue here instead of
+                // pre-reserving time slots, so wait time stays bounded.
+                let _permit = limiter.acquire().await.unwrap();
+                // Re-check: another task may have geocoded this while we waited.
+                if let Some(v) = cache.get(&candidate).map(|v| *v) {
+                    v // cache hit — release permit immediately, no sleep needed
+                } else {
+                    let result = geocode_location(http, &candidate, city).await;
+                    sleep(NOMINATIM_INTERVAL).await; // enforce rate limit before releasing permit
+                    match result {
+                        Ok(coords) => { cache.insert(candidate.clone(), coords); coords }
+                        Err(()) => {
+                            warn!("geocode transient failure for {:?} — will retry next poll", candidate);
+                            None
+                        }
+                    }
+                }
             }
         };
         if let Some((lat, lon)) = coords {
@@ -683,6 +744,7 @@ fn keyword_check(item: &FeedItem, filter: &FilterConfig, required: &[String]) ->
     // No area match is not a hard drop — caller can fall back to source.base_implied_meters.
     Some((best_meters, matched))
 }
+
 
 // ── Seen-items store (append-only file) ───────────────────────────────────────
 
@@ -759,6 +821,114 @@ async fn post_to_rooms(client: &Client, plain: &str, html: &str) {
 
 // ── Polling loop ──────────────────────────────────────────────────────────────
 
+/// Process a single feed item: fetch article, keyword-check, geocode, score.
+/// Returns `Some(item)` if it should go to the digest, `None` if filtered out.
+async fn process_item(
+    http: reqwest::Client,
+    source: SourceConfig,
+    mut item: FeedItem,
+    filter: Arc<FilterConfig>,
+    ref_point: Option<(f64, f64)>,
+    geocode_city: Arc<str>,
+    geocode_cache: GeocodeCache,
+    limiter: NominatimLimiter,
+) -> (String, Option<FeedItem>) {
+    let source_name = source.name.clone();
+
+    // Fetch article body (used for filtering + geocoding street extraction).
+    // extract_article_body() isolates <article>/<main> to avoid navigation false-positives.
+    let needs_article = source.filter || source.base_implied_meters.is_some();
+    if needs_article && item.article_text.is_none() {
+        if let Some(ref url) = item.link {
+            tracing::debug!("fetching article [{}] {:?}", source_name, item.title);
+            item.article_text = fetch_article_text(&http, url).await;
+            if item.article_text.is_none() {
+                tracing::debug!("article fetch failed/empty [{}] {:?}", source_name, item.title);
+            }
+        }
+    }
+
+    // ── 1. Keyword check → implied distance ───────────────────────────────────
+    let effective_required: &[String] = source.required.as_deref().unwrap_or(&filter.required);
+    let kw_implied: Option<f64> = if source.filter {
+        match keyword_check(&item, &filter, effective_required) {
+            None => {
+                tracing::debug!("DROP [{}] {:?}", source_name, item.title);
+                return (source_name, None);
+            }
+            Some((implied, matched)) => {
+                let implied = implied.or(source.base_implied_meters);
+                if !matched.is_empty() {
+                    info!(
+                        "PASS [{}] {:?} keyword_implied={:?}m terms=[{}]",
+                        source_name, item.title,
+                        implied.map(|m| m as u32),
+                        matched.join(", ")
+                    );
+                }
+                implied
+            }
+        }
+    } else {
+        source.base_implied_meters
+    };
+
+    // ── 2. Geocode → actual distance ──────────────────────────────────────────
+    // Actual distance and keyword-implied are combined by taking the closer result.
+    let geocoded_dist: Option<f64> = if let Some((ref_lat, ref_lon)) = ref_point {
+        // If geocoding produces false positives from RSS footer boilerplate
+        // (e.g. Polizei Berlin appends their HQ address to every description),
+        // switch to article_text-only by uncommenting the two lines below and
+        // removing the third:
+        // let body = item.article_text.as_deref()
+        //     .or(item.description.as_deref())
+        //     .unwrap_or("");
+        let all_text = format!(
+            "{} {} {}",
+            item.title,
+            item.description.as_deref().unwrap_or(""),
+            item.article_text.as_deref().unwrap_or(""),
+        );
+        let candidates_count = {
+            let t = format!("{} {} {}", item.title, item.description.as_deref().unwrap_or(""), item.article_text.as_deref().unwrap_or(""));
+            extract_street_candidates(&t).len()
+        };
+        info!("  geocoding [{}] {:?} ({} candidates)", source_name, item.title, candidates_count);
+        match find_nearest_distance(&http, &all_text, ref_lat, ref_lon, &geocode_city, &geocode_cache, &limiter).await {
+            Some((dist, ref street)) => {
+                info!("  📍 [{}] {:?} → {} at {}", source_name, street, item.title, format_distance(dist));
+                item.distance_meters = Some(dist);
+                Some(dist)
+            }
+            None => {
+                info!("  no street geocoded [{}] {:?}", source_name, item.title);
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    // ── 3. Final score ────────────────────────────────────────────────────────
+    let final_meters = match (geocoded_dist, kw_implied) {
+        (Some(d), Some(k)) => Some(d.min(k)),
+        (Some(d), None)    => Some(d),
+        (None,    Some(k)) => Some(k),
+        (None,    None)    => None,
+    };
+    let score = final_meters.map(distance_score).unwrap_or(0);
+
+    if source.filter && score < filter.digest_threshold {
+        tracing::debug!("DROP [{}] {:?} score={} below threshold", source_name, item.title, score);
+        return (source_name, None);
+    }
+
+    info!("QUEUE [{}] {:?} score={}", source_name, item.title, score);
+    item.score = score;
+    item.max_score = 5;
+    (source_name, Some(item))
+}
+
 async fn poll_once(
     _client: &Client,
     http: &reqwest::Client,
@@ -771,7 +941,14 @@ async fn poll_once(
     geocode_cache: &GeocodeCache,
     test_mode: bool,
 ) {
-    let geocode_city = filter.geocode_city.as_deref().unwrap_or("");
+    let arc_filter = Arc::new(filter.clone());
+    let geocode_city: Arc<str> = Arc::from(filter.geocode_city.as_deref().unwrap_or(""));
+    let limiter: NominatimLimiter = Arc::new(Semaphore::new(1));
+
+    // Fetch all feeds and collect new items, then process them in parallel.
+    // Seen-check is sequential to avoid races; article fetch + geocoding run concurrently.
+    let mut pending: Vec<(SourceConfig, FeedItem)> = Vec::new();
+    let mut total_by_source: HashMap<String, usize> = HashMap::new();
 
     for source in sources {
         let xml = match http.get(&source.url).send().await {
@@ -783,109 +960,70 @@ async fn poll_once(
         };
 
         let items = parse_feed(&xml, &source.name);
-        let total = items.len();
+        *total_by_source.entry(source.name.clone()).or_default() += items.len();
 
-        let mut new_count = 0;
-        let mut filtered_out = 0;
-        for mut item in items {
+        for item in items {
             let is_new = if test_mode { true } else { mark_seen(seen, &item.guid, seen_path).await };
-            if !is_new { continue; }
-
-            // Fetch article body (used for both filtering and geocoding street extraction).
-            // extract_article_body() isolates <article>/<main> to avoid navigation false-positives.
-            let needs_article = source.filter || source.base_implied_meters.is_some();
-            if needs_article && item.article_text.is_none() {
-                if let Some(ref url) = item.link {
-                    item.article_text = fetch_article_text(http, url).await;
-                }
-            }
-
-            // ── 1. Keyword check → implied distance ───────────────────────────
-            // For filter=false sources, skip keyword check and use base_implied_meters.
-            let effective_required: &[String] = source.required.as_deref()
-                .unwrap_or(&filter.required);
-
-            let kw_implied: Option<f64> = if source.filter {
-                match keyword_check(&item, filter, effective_required) {
-                    None => {
-                        tracing::debug!("DROP [{}] {:?}", source.name, item.title);
-                        filtered_out += 1;
-                        continue;
-                    }
-                    Some((implied, matched)) => {
-                        // Fall back to source's base distance when no area group matched.
-                        let implied = implied.or(source.base_implied_meters);
-                        if !matched.is_empty() {
-                            info!(
-                                "PASS [{}] {:?} keyword_implied={:?}m terms=[{}]",
-                                source.name, item.title,
-                                implied.map(|m| m as u32),
-                                matched.join(", ")
-                            );
-                        }
-                        implied
-                    }
-                }
-            } else {
-                source.base_implied_meters
-            };
-
-            // ── 2. Geocode → actual distance ──────────────────────────────────
-            // Actual distance and keyword-implied distance are combined by taking
-            // whichever is smaller (= closer = higher relevance score).
-            let geocoded_dist: Option<f64> = if ref_point.is_some() {
-                let all_text = format!(
-                    "{} {} {}",
-                    item.title,
-                    item.description.as_deref().unwrap_or(""),
-                    item.article_text.as_deref().unwrap_or(""),
-                );
-                let (ref_lat, ref_lon) = ref_point.unwrap();
-                match find_nearest_distance(http, &all_text, ref_lat, ref_lon, geocode_city, geocode_cache).await {
-                    Some((dist, ref street)) => {
-                        info!("  📍 {:?} {}", street, format_distance(dist));
-                        item.distance_meters = Some(dist);
-                        Some(dist)
-                    }
-                    None => {
-                        tracing::debug!("  📍 no geocodable street found");
-                        None
-                    }
-                }
-            } else {
-                None
-            };
-
-            // ── 3. Final score ────────────────────────────────────────────────
-            let final_meters = match (geocoded_dist, kw_implied) {
-                (Some(d), Some(k)) => Some(d.min(k)),
-                (Some(d), None)    => Some(d),
-                (None,    Some(k)) => Some(k),
-                (None,    None)    => None,
-            };
-
-            let score = final_meters.map(distance_score).unwrap_or(0);
-
-            if source.filter && score < filter.digest_threshold {
-                tracing::debug!("DROP [{}] {:?} score={} below threshold", source.name, item.title, score);
-                filtered_out += 1;
-                continue;
-            }
-
-            item.score = score;
-            item.max_score = 5;
-
-            new_count += 1;
-            digest_queue.lock().await.push(item);
+            if is_new { pending.push((source.clone(), item)); }
         }
+    }
 
+    // Spawn one task per item — article fetches and geocoding run in parallel.
+    // Geocoding tasks share the NominatimLimiter so total Nominatim traffic stays ≤ 1 req/s.
+    let mut tasks: JoinSet<(String, Option<FeedItem>)> = JoinSet::new();
+    let n_pending = pending.len();
+    for (source, item) in pending {
+        tasks.spawn(process_item(
+            http.clone(), source, item,
+            arc_filter.clone(), ref_point,
+            geocode_city.clone(), geocode_cache.clone(), limiter.clone(),
+        ));
+    }
+    if n_pending > 0 {
+        info!("Processing {} new item(s) in parallel...", n_pending);
+    }
+
+    // Heartbeat: log progress every 5s so the bot doesn't appear frozen during geocoding.
+    let n_done_shared = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let ticker = {
+        let cache = geocode_cache.clone();
+        let n_done_shared = n_done_shared.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(HEARTBEAT_INTERVAL);
+            interval.tick().await; // skip immediate first tick
+            loop {
+                interval.tick().await;
+                let done = n_done_shared.load(std::sync::atomic::Ordering::Relaxed);
+                let cache_n = cache.len();
+                info!("  ... {}/{} items done, {} geocode cache entries", done, n_pending, cache_n);
+            }
+        })
+    };
+
+    let mut passed_by_source: HashMap<String, usize> = HashMap::new();
+    let mut dropped_by_source: HashMap<String, usize> = HashMap::new();
+
+    while let Some(res) = tasks.join_next().await {
+        n_done_shared.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        match res {
+            Ok((src, Some(item))) => {
+                *passed_by_source.entry(src).or_default() += 1;
+                digest_queue.lock().await.push(item);
+            }
+            Ok((src, None)) => { *dropped_by_source.entry(src).or_default() += 1; }
+            Err(e) => warn!("Item task panicked: {e}"),
+        }
+    }
+    ticker.abort();
+
+    for source in sources {
+        let total = total_by_source.get(&source.name).copied().unwrap_or(0);
+        let passed = passed_by_source.get(&source.name).copied().unwrap_or(0);
+        let dropped = dropped_by_source.get(&source.name).copied().unwrap_or(0);
         if source.filter {
-            info!(
-                "Source '{}': {total} in feed, {new_count} passed filter, {filtered_out} dropped",
-                source.name,
-            );
+            info!("Source '{}': {total} in feed, {passed} passed, {dropped} dropped", source.name);
         } else {
-            info!("Source '{}': {total} in feed, {new_count} new", source.name);
+            info!("Source '{}': {total} in feed, {passed} new", source.name);
         }
     }
 }
@@ -946,24 +1084,32 @@ fn chunk_digest(items: &[FeedItem]) -> Vec<Vec<FeedItem>> {
 
 async fn digest_loop(
     client: Client,
-    digest_time: String,
+    digest_times: Vec<String>,
     digest_queue: Arc<Mutex<Vec<FeedItem>>>,
 ) {
-    let parts: Vec<&str> = digest_time.splitn(2, ':').collect();
-    let hour: u32   = parts.first().and_then(|s| s.parse().ok()).unwrap_or(8);
-    let minute: u32 = parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(0);
-    let target = NaiveTime::from_hms_opt(hour, minute, 0).expect("invalid digest_time");
+    let targets: Vec<NaiveTime> = digest_times.iter()
+        .filter_map(|s| {
+            let mut p = s.splitn(2, ':');
+            let h: u32 = p.next()?.parse().ok()?;
+            let m: u32 = p.next()?.parse().ok()?;
+            NaiveTime::from_hms_opt(h, m, 0)
+        })
+        .collect();
+
+    if targets.is_empty() {
+        warn!("No valid digest_times configured — digest loop disabled");
+        return;
+    }
 
     loop {
         let now = Local::now();
         let today = now.date_naive();
-        let next_dt = if now.time() < target {
-            today.and_time(target)
-        } else {
-            (today + chrono::Duration::days(1)).and_time(target)
-        };
+        let next_dt = targets.iter()
+            .map(|t| if now.time() < *t { today.and_time(*t) } else { (today + chrono::Duration::days(1)).and_time(*t) })
+            .min()
+            .unwrap();
         let secs = (next_dt - now.naive_local()).num_seconds().max(0) as u64;
-        info!("Next digest in {secs}s (at {hour:02}:{minute:02})");
+        info!("Next digest in {secs}s (at {})", next_dt.format("%H:%M"));
         sleep(Duration::from_secs(secs)).await;
 
         let items: Vec<FeedItem> = {
@@ -1266,7 +1412,7 @@ async fn main() -> Result<()> {
     info!("Loaded {} seen GUIDs", seen.lock().await.len());
 
     let digest_queue: Arc<Mutex<Vec<FeedItem>>> = Arc::new(Mutex::new(Vec::new()));
-    let geocode_cache: GeocodeCache = Arc::new(Mutex::new(HashMap::new()));
+    let geocode_cache: GeocodeCache = Arc::new(DashMap::new());
     let http = reqwest::Client::builder()
         .user_agent("Mozilla/5.0 (compatible; radar-bot/0.1)")
         .build()?;
@@ -1275,11 +1421,11 @@ async fn main() -> Result<()> {
     let ref_point: Option<(f64, f64)> = if let Some(ref addr) = config.filter.reference_address {
         info!("Geocoding reference address: {addr}");
         match geocode_location(&http, addr, "").await {
-            Some(coords) => {
+            Ok(Some(coords)) => {
                 info!("Reference point: {:.5}, {:.5}", coords.0, coords.1);
                 Some(coords)
             }
-            None => {
+            Ok(None) | Err(()) => {
                 warn!("Could not geocode reference address '{addr}' — distance scoring disabled");
                 None
             }
@@ -1289,26 +1435,42 @@ async fn main() -> Result<()> {
         None
     };
 
+    tokio::spawn(async move {
+        tokio::signal::ctrl_c().await.ok();
+        info!("Interrupted — exiting.");
+        std::process::abort();
+    });
+
     if test_mode {
-        info!("Test mode: polling all sources once and posting immediately");
-        poll_once(
-            &client, &http, &config.sources, &config.filter, ref_point,
-            &seen, &seen_path, &digest_queue, &geocode_cache, true,
-        ).await;
-        // Flush digest queue — reuse chunk_digest so items are sorted by score desc
-        let items: Vec<FeedItem> = std::mem::take(&mut *digest_queue.lock().await);
-        if !items.is_empty() {
-            let chunks = chunk_digest(&items);
-            let total = chunks.len();
-            for (i, chunk) in chunks.into_iter().enumerate() {
-                let header = if total > 1 {
-                    format!("Test digest ({}/{})", i + 1, total)
-                } else {
-                    "Test digest".to_owned()
-                };
-                let (plain, html) = format_digest(&chunk, &header);
-                post_to_rooms(&client, &plain, &html).await;
-                if total > 1 { sleep(Duration::from_millis(500)).await; }
+        // Run twice: run 1 builds the geocode cache (cold), run 2 should hit it (warm).
+        // The seen-check is bypassed in test mode (is_new = true always), so both runs
+        // process the same items — no need to clear any state between them.
+        for run in 1..=2u32 {
+            let cache_before = geocode_cache.len();
+            info!("Test mode: run {run}/2 (geocode cache: {cache_before} entries before)");
+            poll_once(
+                &client, &http, &config.sources, &config.filter, ref_point,
+                &seen, &seen_path, &digest_queue, &geocode_cache, true,
+            ).await;
+            let cache_after = geocode_cache.len();
+            info!("Run {run}/2 done — geocode cache: {cache_before} → {cache_after} entries");
+
+            let items: Vec<FeedItem> = std::mem::take(&mut *digest_queue.lock().await);
+            if !items.is_empty() {
+                let chunks = chunk_digest(&items);
+                let total = chunks.len();
+                for (i, chunk) in chunks.into_iter().enumerate() {
+                    let header = if total > 1 {
+                        format!("Test digest run {run} ({}/{})", i + 1, total)
+                    } else {
+                        format!("Test digest (run {run}/2)")
+                    };
+                    let (plain, html) = format_digest(&chunk, &header);
+                    post_to_rooms(&client, &plain, &html).await;
+                    if total > 1 { sleep(Duration::from_millis(500)).await; }
+                }
+            } else {
+                info!("Run {run}/2: no items passed the filter");
             }
         }
         return Ok(());
@@ -1316,7 +1478,7 @@ async fn main() -> Result<()> {
 
     tokio::spawn(digest_loop(
         client.clone(),
-        config.schedule.digest_time.clone(),
+        config.schedule.digest_times.clone(),
         digest_queue.clone(),
     ));
 
