@@ -1,0 +1,119 @@
+[matrix]
+homeserver = "https://matrix.org"
+user_id = "@radar-bot:matrix.org"
+access_token = "your_access_token_here"
+device_id = "your_device_id_here"
+# recovery_key = "EsXX xxxx xxxx xxxx xxxx xxxx xxxx xxxx"
+
+[security]
+# Users allowed to invite the bot to Matrix rooms. Empty = accept from anyone.
+allowed_inviters = ["@you:matrix.org"]
+
+# Users allowed to run !reset-trust @user:server.
+admin_users = ["@you:matrix.org"]
+
+# Which devices receive room keys:
+#   identity_based  — only cross-signed devices (default, recommended)
+#   only_trusted    — only explicitly verified devices
+#   all_devices     — all devices, no restriction
+encryption_strategy = "all_devices"
+
+[schedule]
+# How often to poll all RSS/Atom sources (minutes).
+poll_interval_minutes = 30
+# Time to post the daily digest of queued items (HH:MM, 24h).
+digest_time = "08:00"
+
+# ── Filter ────────────────────────────────────────────────────────────────────
+[filter]
+# City-level guard: at least one must appear in the item (used for national feeds).
+# City-specific sources can override this per-source with required = [].
+required = ["Yourcity"]
+
+# Minimum distance score (1–5) to include in the daily digest.
+digest_threshold = 1
+
+# Your reference address — geocoded once at startup. All distances are measured from here.
+reference_address = "Yourstreet 1, 10000 Yourcity"
+
+# City string appended to Nominatim queries when geocoding street mentions from articles.
+# Keeps results anchored to the right city.
+geocode_city = "Yourcity, Yourcountry"
+
+# Blocklist: items matching any of these are always dropped.
+blocklist = [
+    "Motorway A1",
+    "Motorway A2",
+]
+
+# ── Area groups ───────────────────────────────────────────────────────────────
+# Each group maps keywords to an implied distance from your reference point.
+# When no street can be geocoded, the closest matching group's distance is used
+# as the relevance score. Geocoding always overrides with the real distance if found.
+#
+# Terms don't have to be street names — any location-specific keyword works:
+# building names, landmarks, organisation abbreviations, event keywords, etc.
+#
+# Distance → score mapping:
+#   < 200m  → 5 🔴   < 500m → 4 🟠   < 1km → 3 🟡
+#   < 2km   → 2 🟢   < 10km → 1 🔵   else → 0 ⚪
+
+# Your immediate street(s) — treated as ~300m away
+[[filter.area]]
+implied_meters = 300
+terms = [
+    "Yourstreet",
+]
+
+# Nearby postal codes — treated as ~800m away
+[[filter.area]]
+implied_meters = 800
+terms = ["10000", "10001"]
+
+# Your district / nearby landmarks — treated as ~1500m away
+[[filter.area]]
+implied_meters = 1500
+terms = [
+    "YourDistrict",
+    "NearbyStreet",
+    "LocalLandmark",
+]
+
+# ── Sources ───────────────────────────────────────────────────────────────────
+# Each source needs a name and a url. Optional fields:
+#   filter              = true (default) — apply location filter and scoring
+#   filter              = false — skip location filter, include everything
+#   required            = ["keyword"] — overrides global filter.required for this source.
+#                         Set to [] to skip the city check for city-specific sources.
+#   base_implied_meters = N — fallback distance when neither area keywords nor geocoding
+#                             produce a result.
+#                             City-wide feeds: ~9000 (score 1 🔵)
+#                             District feeds:  ~1500 (score 2 🟢)
+
+# City-specific source: skip the city required check, use base_implied_meters as floor score.
+[[sources]]
+name = "Local Police"
+url = "https://example.com/police/rss.xml"
+filter = true
+required = []
+base_implied_meters = 9000
+
+[[sources]]
+name = "Local Public Broadcaster"
+url = "https://example.com/news/rss.xml"
+filter = true
+required = []
+base_implied_meters = 9000
+
+# National source: keep the city required check so items from other cities are dropped.
+[[sources]]
+name = "National News"
+url = "https://example.com/national/rss.xml"
+filter = true
+
+# Hyper-local source: no filtering, all items are assumed to be in your district.
+[[sources]]
+name = "Neighbourhood Blog"
+url = "https://example.com/local/rss.xml"
+filter = false
+base_implied_meters = 1500
