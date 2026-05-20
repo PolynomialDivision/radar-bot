@@ -22,4 +22,6 @@ VOLUME /app/config
 
 WORKDIR /app
 
+ENV RUST_LOG=info
+
 CMD ["radar-bot", "/app/config/config.toml"]
