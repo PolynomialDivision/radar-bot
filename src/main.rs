@@ -27,7 +27,7 @@ use matrix_sdk::{
         },
     },
 };
-use matrix_sdk_base::crypto::CollectStrategy;
+use matrix_sdk_crypto::CollectStrategy;
 
 type GeocodeCache = Arc<DashMap<String, Option<(f64, f64)>>>;
 use serde::{Deserialize, Serialize};

@@ -12,12 +12,12 @@ anyhow = "1"
 dashmap = "6"
 chrono = "0.4"
 futures-util = "0.3"
-matrix-sdk = { git = "https://github.com/matrix-org/matrix-rust-sdk", rev = "7677f090990a0fd3ac0e578da24434d4f80cb4c8", features = ["sqlite"] }
-matrix-sdk-base = { git = "https://github.com/matrix-org/matrix-rust-sdk", rev = "7677f090990a0fd3ac0e578da24434d4f80cb4c8" }
+matrix-sdk = { version = "0.17", features = ["e2e-encryption", "sqlite", "automatic-room-key-forwarding"] }
+matrix-sdk-crypto = "0.17"
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "gzip", "deflate", "brotli", "zstd"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["full"] }
-toml = "0.8"
+toml = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
