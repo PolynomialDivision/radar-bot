@@ -18,6 +18,14 @@ admin_users = ["@you:matrix.org"]
 #   all_devices     — all devices, no restriction
 encryption_strategy = "all_devices"
 
+# ── Bluesky ───────────────────────────────────────────────────────────────────
+# Required if you have any [[sources]] with type = "bluesky".
+# Create an App Password in Bluesky → Settings → Privacy and Security → App Passwords.
+# Do NOT use your real account password here.
+[bluesky]
+identifier = "@you.bsky.social"
+password = "xxxx-xxxx-xxxx-xxxx"
+
 [schedule]
 # How often to poll all RSS/Atom sources (minutes).
 poll_interval_minutes = 30
@@ -81,7 +89,7 @@ terms = [
 ]
 
 # ── Sources ───────────────────────────────────────────────────────────────────
-# Each source needs a name and a url. Optional fields:
+# Each source needs a name and a type (default: "rss"). Shared optional fields:
 #   filter              = true (default) — apply location filter and scoring
 #   filter              = false — skip location filter, include everything
 #   required            = ["keyword"] — overrides global filter.required for this source.
@@ -90,6 +98,16 @@ terms = [
 #                             produce a result.
 #                             City-wide feeds: ~9000 (score 1 🔵)
 #                             District feeds:  ~1500 (score 2 🟢)
+#
+# RSS/Atom sources (type = "rss", the default — "type" field can be omitted):
+#   url = "https://..."    — required
+#
+# Bluesky sources (type = "bluesky"):
+#   query = "#Hashtag"     — keyword or hashtag search query, required
+#   limit = 25             — max posts per poll (default 25, API max 100)
+#
+# Posts are normalized to the same FeedItem as RSS entries and pass through
+# the same location filter, geocoding, and scoring pipeline unchanged.
 
 # City-specific source: skip the city required check, use base_implied_meters as floor score.
 [[sources]]
@@ -118,3 +136,16 @@ name = "Neighbourhood Blog"
 url = "https://example.com/local/rss.xml"
 filter = false
 base_implied_meters = 1500
+
+# Bluesky keyword search — posts are filtered and scored like RSS items.
+# Use a city-level hashtag as the query so only relevant posts get through.
+# Omit filter.required check for hashtag searches (the hashtag already scopes them).
+[[sources]]
+name = "Bluesky #YourCity"
+type = "bluesky"
+query = "#YourCity"
+limit = 25
+max_age_hours = 24        # only fetch posts newer than this (default 24)
+filter = true
+required = []
+base_implied_meters = 9000

@@ -1,3 +1,5 @@
+mod sources;
+
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -47,6 +49,14 @@ struct Config {
     filter: FilterConfig,
     #[serde(default)]
     sources: Vec<SourceConfig>,
+    #[serde(default)]
+    bluesky: BlueskyConfig,
+}
+
+#[derive(Deserialize, Default)]
+struct BlueskyConfig {
+    identifier: Option<String>,
+    password: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -62,8 +72,24 @@ struct MatrixConfig {
 struct SourceConfig {
     /// Display name shown in posted messages.
     name: String,
-    /// RSS or Atom feed URL.
-    url: String,
+    /// Source type. Defaults to "rss" so existing configs need no changes.
+    #[serde(rename = "type", default)]
+    source_type: sources::SourceType,
+    // ── RSS / Atom ────────────────────────────────────────────────────────────
+    /// Feed URL (required for type = "rss").
+    #[serde(default)]
+    url: Option<String>,
+    // ── Bluesky ───────────────────────────────────────────────────────────────
+    /// Keyword or hashtag query (required for type = "bluesky"), e.g. "#Berlin".
+    #[serde(default)]
+    query: Option<String>,
+    /// Max posts per poll for Bluesky (default 25, API max 100).
+    #[serde(default)]
+    limit: Option<usize>,
+    /// Only fetch posts newer than this many hours (Bluesky only, default 24).
+    #[serde(default)]
+    max_age_hours: Option<u64>,
+    // ── Shared ────────────────────────────────────────────────────────────────
     /// Apply location filter (default true). Set false for hyper-local sources.
     #[serde(default = "default_true")]
     filter: bool,
@@ -181,24 +207,25 @@ struct BotState {
 // ── Feed item ─────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct FeedItem {
-    guid: String,
-    title: String,
-    link: Option<String>,
-    /// Short snippet from the RSS feed — shown to the user.
-    description: Option<String>,
-    /// Full stripped text fetched from the article URL — used only for filtering.
+pub(crate) struct FeedItem {
+    pub(crate) guid: String,
+    pub(crate) title: String,
+    pub(crate) link: Option<String>,
+    /// Short snippet from the RSS/social feed — shown to the user.
+    pub(crate) description: Option<String>,
+    /// Full stripped text used only for filtering/geocoding. Pre-filled by
+    /// adapters that already have the full text (e.g. Bluesky posts).
     #[serde(default)]
-    article_text: Option<String>,
-    source_name: String,
+    pub(crate) article_text: Option<String>,
+    pub(crate) source_name: String,
     #[serde(default)]
-    score: i32,
+    pub(crate) score: i32,
     /// Sum of all possible area group scores (from config).
     #[serde(default)]
-    max_score: i32,
+    pub(crate) max_score: i32,
     /// Distance in metres from the reference point (if geocoded).
     #[serde(default)]
-    distance_meters: Option<f64>,
+    pub(crate) distance_meters: Option<f64>,
 }
 
 // ── HTML utilities ────────────────────────────────────────────────────────────
@@ -347,7 +374,7 @@ fn extract_atom_link(xml: &str) -> Option<String> {
     None
 }
 
-fn parse_feed(xml: &str, source_name: &str) -> Vec<FeedItem> {
+pub(crate) fn parse_feed(xml: &str, source_name: &str) -> Vec<FeedItem> {
     // RSS 2.0 feeds often declare xmlns:atom="..." for <atom:link rel="self"> — only
     // treat as Atom when the root element is <feed>, not <rss>
     let is_atom = !xml.contains("<rss") && xml.contains("http://www.w3.org/2005/Atom");
@@ -588,7 +615,7 @@ fn extract_street_candidates(text: &str) -> Vec<String> {
     out
 }
 
-fn url_encode(s: &str) -> String {
+pub(crate) fn url_encode(s: &str) -> String {
     let mut out = String::new();
     for b in s.bytes() {
         match b {
@@ -939,6 +966,7 @@ async fn poll_once(
     seen_path: &Path,
     digest_queue: &Arc<Mutex<Vec<FeedItem>>>,
     geocode_cache: &GeocodeCache,
+    bluesky: Option<&sources::BlueskyContext>,
     test_mode: bool,
 ) {
     let arc_filter = Arc::new(filter.clone());
@@ -951,15 +979,7 @@ async fn poll_once(
     let mut total_by_source: HashMap<String, usize> = HashMap::new();
 
     for source in sources {
-        let xml = match http.get(&source.url).send().await {
-            Ok(resp) => match resp.text().await {
-                Ok(t) => t,
-                Err(e) => { warn!("Failed to read response from '{}': {e}", source.name); continue; }
-            },
-            Err(e) => { warn!("Failed to fetch '{}': {e}", source.name); continue; }
-        };
-
-        let items = parse_feed(&xml, &source.name);
+        let items = sources::build_adapter(source, bluesky).fetch_items(http).await;
         *total_by_source.entry(source.name.clone()).or_default() += items.len();
 
         for item in items {
@@ -1039,10 +1059,11 @@ async fn poll_loop(
     seen_path: PathBuf,
     digest_queue: Arc<Mutex<Vec<FeedItem>>>,
     geocode_cache: GeocodeCache,
+    bluesky: Option<sources::BlueskyContext>,
 ) {
     let interval = Duration::from_secs(interval_mins * 60);
     loop {
-        poll_once(&client, &http, &sources, &filter, ref_point, &seen, &seen_path, &digest_queue, &geocode_cache, false).await;
+        poll_once(&client, &http, &sources, &filter, ref_point, &seen, &seen_path, &digest_queue, &geocode_cache, bluesky.as_ref(), false).await;
         info!("Next poll in {interval_mins}m");
         sleep(interval).await;
     }
@@ -1499,6 +1520,25 @@ async fn main() -> Result<()> {
         std::process::abort();
     });
 
+    let bluesky_ctx: Option<sources::BlueskyContext> =
+        match (config.bluesky.identifier, config.bluesky.password) {
+            (Some(identifier), Some(password)) => {
+                info!("Bluesky credentials configured for {identifier}");
+                Some(sources::BlueskyContext {
+                    identifier,
+                    password,
+                    session: sources::bluesky::new_shared_session(),
+                })
+            }
+            _ => {
+                let has_bluesky = config.sources.iter().any(|s| matches!(s.source_type, sources::SourceType::Bluesky));
+                if has_bluesky {
+                    warn!("Bluesky source(s) configured but [bluesky] identifier/password missing — searches will fail");
+                }
+                None
+            }
+        };
+
     if test_mode {
         // Run twice: run 1 builds the geocode cache (cold), run 2 should hit it (warm).
         // The seen-check is bypassed in test mode (is_new = true always), so both runs
@@ -1508,7 +1548,7 @@ async fn main() -> Result<()> {
             info!("Test mode: run {run}/2 (geocode cache: {cache_before} entries before)");
             poll_once(
                 &client, &http, &config.sources, &config.filter, ref_point,
-                &seen, &seen_path, &digest_queue, &geocode_cache, true,
+                &seen, &seen_path, &digest_queue, &geocode_cache, bluesky_ctx.as_ref(), true,
             ).await;
             let cache_after = geocode_cache.len();
             info!("Run {run}/2 done — geocode cache: {cache_before} → {cache_after} entries");
@@ -1552,6 +1592,7 @@ async fn main() -> Result<()> {
         seen_path,
         digest_queue,
         geocode_cache,
+        bluesky_ctx,
     ));
 
     // Continuous Matrix sync
