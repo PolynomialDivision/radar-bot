@@ -16,7 +16,7 @@ use matrix_sdk::{
         SasState, Verification, VerificationRequest, VerificationRequestState,
     },
     ruma::{
-        OwnedDeviceId, OwnedUserId,
+        OwnedDeviceId, OwnedServerName, OwnedUserId, RoomOrAliasId,
         api::client::filter::FilterDefinition,
         events::{
             key::verification::request::ToDeviceKeyVerificationRequestEvent,
@@ -1171,12 +1171,22 @@ async fn handle_sas(sas: matrix_sdk::encryption::verification::SasVerification) 
     }
 }
 
+fn is_join_terminal(e: &matrix_sdk::Error) -> bool {
+    let s = e.to_string();
+    s.contains("No known servers")
+        || s.contains("M_FORBIDDEN")
+        || s.contains("M_UNKNOWN_TOKEN")
+        || s.contains("M_GUEST_ACCESS_FORBIDDEN")
+}
+
 async fn bootstrap_cross_signing(client: &Client, user_id: &OwnedUserId) {
-    match client
-        .encryption()
-        .bootstrap_cross_signing(None)
-        .await
-    {
+    if let Some(status) = client.encryption().cross_signing_status().await {
+        if status.has_master && status.has_self_signing && status.has_user_signing {
+            info!("Cross-signing already complete (keys present) — skipping bootstrap");
+            return;
+        }
+    }
+    match client.encryption().bootstrap_cross_signing(None).await {
         Ok(()) => info!("Cross-signing bootstrapped for {user_id}"),
         Err(e) => warn!("Cross-signing bootstrap failed: {e}"),
     }
@@ -1313,7 +1323,7 @@ async fn main() -> Result<()> {
     // Invite handler
     client.add_event_handler({
         let state = bot_state.clone();
-        move |ev: StrippedRoomMemberEvent, room: Room| {
+        move |ev: StrippedRoomMemberEvent, room: Room, client: Client| {
             let state = state.clone();
             async move {
                 if ev.state_key != state.bot_user_id { return; }
@@ -1325,15 +1335,41 @@ async fn main() -> Result<()> {
                     return;
                 }
                 info!("Accepted invite from {} to {}", ev.sender, room.room_id());
+                let room_id = room.room_id().to_owned();
+                let mut via: Vec<OwnedServerName> = vec![ev.sender.server_name().to_owned()];
+                if let Some(s) = room_id.server_name() {
+                    let s = s.to_owned();
+                    if !via.contains(&s) {
+                        via.push(s);
+                    }
+                }
+                let room_or_alias = match RoomOrAliasId::parse(room_id.as_str()) {
+                    Ok(id) => id,
+                    Err(e) => {
+                        error!("Invalid room ID {room_id}: {e}");
+                        return;
+                    }
+                };
                 tokio::spawn(async move {
                     let mut delay = 2u64;
-                    loop {
-                        match room.join().await {
-                            Ok(_) => { info!("Joined {}", room.room_id()); break; }
+                    const MAX_ATTEMPTS: u32 = 8;
+                    for attempt in 1..=MAX_ATTEMPTS {
+                        match client.join_room_by_id_or_alias(&room_or_alias, &via).await {
+                            Ok(_) => {
+                                info!("Joined {room_id}");
+                                return;
+                            }
+                            Err(ref e) if is_join_terminal(e) => {
+                                warn!("Join failed (terminal) for {room_id}: {e}");
+                                return;
+                            }
+                            Err(e) if attempt == MAX_ATTEMPTS => {
+                                warn!("Join failed after {MAX_ATTEMPTS} attempts for {room_id}: {e}");
+                            }
                             Err(e) => {
-                                warn!("Join failed: {e}; retry in {delay}s");
+                                warn!("Join attempt {attempt}/{MAX_ATTEMPTS} failed for {room_id}: {e}; retry in {delay}s");
                                 sleep(Duration::from_secs(delay)).await;
-                                delay = (delay * 2).min(3600);
+                                delay = (delay * 2).min(300);
                             }
                         }
                     }
@@ -1407,6 +1443,28 @@ async fn main() -> Result<()> {
         client.sync_once(SyncSettings::default().filter(filter.into())).await?;
     }
     info!("Initial sync complete. {} source(s) configured.", config.sources.len());
+
+    // Drain pending invites from prior sessions.
+    let invited = client.invited_rooms();
+    if !invited.is_empty() {
+        info!("Pending invite(s) found after initial sync — joining {} room(s)", invited.len());
+        for room in invited {
+            let room_id = room.room_id().to_owned();
+            let via: Vec<OwnedServerName> = room_id
+                .server_name()
+                .map(|s| vec![s.to_owned()])
+                .unwrap_or_default();
+            match RoomOrAliasId::parse(room_id.as_str()) {
+                Ok(room_or_alias) => {
+                    match client.join_room_by_id_or_alias(&room_or_alias, &via).await {
+                        Ok(_) => info!("Joined pending invite room {room_id}"),
+                        Err(e) => warn!("Failed to join pending invite room {room_id}: {e}"),
+                    }
+                }
+                Err(e) => warn!("Invalid room ID in pending invite {room_id}: {e}"),
+            }
+        }
+    }
 
     let seen = Arc::new(Mutex::new(load_seen(&seen_path).await));
     info!("Loaded {} seen GUIDs", seen.lock().await.len());
