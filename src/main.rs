@@ -12,16 +12,11 @@ use tokio::sync::{Mutex, Semaphore};
 
 use anyhow::{Context, Result};
 use chrono::{Local, NaiveTime};
-use futures_util::StreamExt;
 use matrix_sdk::{
-    Client, Room, RoomState, SessionMeta, SessionTokens,
-    authentication::matrix::MatrixSession,
+    Client, Room, RoomState,
     config::SyncSettings,
-    encryption::verification::{
-        SasState, Verification, VerificationRequest, VerificationRequestState,
-    },
     ruma::{
-        OwnedDeviceId, OwnedServerName, OwnedUserId, RoomOrAliasId,
+        OwnedServerName, OwnedUserId, RoomOrAliasId,
         api::client::filter::FilterDefinition,
         events::{
             key::verification::request::ToDeviceKeyVerificationRequestEvent,
@@ -32,7 +27,7 @@ use matrix_sdk::{
         },
     },
 };
-use matrix_sdk_crypto::CollectStrategy;
+use mxbot_common::config::{MatrixConfig, SecurityConfig};
 
 type GeocodeCache = Arc<DashMap<String, Option<(f64, f64)>>>;
 use serde::{Deserialize, Serialize};
@@ -106,15 +101,6 @@ impl Default for WeatherConfig {
     fn default() -> Self {
         Self { enabled: true, provider: weather::WeatherProvider::Brightsky, post_time: None }
     }
-}
-
-#[derive(Deserialize)]
-struct MatrixConfig {
-    homeserver: String,
-    user_id: String,
-    access_token: String,
-    device_id: String,
-    recovery_key: Option<String>,
 }
 
 #[derive(Deserialize, Clone)]
@@ -213,35 +199,6 @@ impl Default for ScheduleConfig {
 fn default_poll_interval() -> u64 { 30 }
 fn default_digest_times() -> Vec<String> { vec!["08:00".to_owned()] }
 fn default_true() -> bool { true }
-
-#[derive(Deserialize, Default)]
-#[serde(rename_all = "snake_case")]
-enum EncryptionStrategy {
-    AllDevices,
-    #[default]
-    IdentityBased,
-    OnlyTrusted,
-}
-
-impl From<EncryptionStrategy> for CollectStrategy {
-    fn from(s: EncryptionStrategy) -> Self {
-        match s {
-            EncryptionStrategy::AllDevices => CollectStrategy::AllDevices,
-            EncryptionStrategy::IdentityBased => CollectStrategy::IdentityBasedStrategy,
-            EncryptionStrategy::OnlyTrusted => CollectStrategy::OnlyTrustedDevices,
-        }
-    }
-}
-
-#[derive(Deserialize, Default)]
-struct SecurityConfig {
-    #[serde(default)]
-    allowed_inviters: Vec<String>,
-    #[serde(default)]
-    admin_users: Vec<String>,
-    #[serde(default)]
-    encryption_strategy: EncryptionStrategy,
-}
 
 // ── Bot state ─────────────────────────────────────────────────────────────────
 
@@ -1238,99 +1195,6 @@ async fn digest_loop(
 
 // ── Verification (same pattern as all other bots) ─────────────────────────────
 
-async fn handle_sas(sas: matrix_sdk::encryption::verification::SasVerification) {
-    if let Err(e) = sas.accept().await {
-        error!("Failed to accept SAS: {e}");
-        return;
-    }
-    let mut stream = sas.changes();
-    while let Some(state) = stream.next().await {
-        match state {
-            SasState::KeysExchanged { emojis, .. } => {
-                if let Some(emojis) = emojis {
-                    let names: Vec<_> = emojis.emojis.iter().map(|e| e.description).collect();
-                    info!("SAS emojis: {}", names.join(" "));
-                }
-            }
-            SasState::Done { .. } => {
-                info!("SAS verification done");
-                break;
-            }
-            SasState::Cancelled(info) => {
-                warn!("SAS cancelled: {:?}", info.cancel_code());
-                break;
-            }
-            _ => {}
-        }
-    }
-}
-
-fn is_join_terminal(e: &matrix_sdk::Error) -> bool {
-    let s = e.to_string();
-    s.contains("No known servers")
-        || s.contains("M_FORBIDDEN")
-        || s.contains("M_UNKNOWN_TOKEN")
-        || s.contains("M_GUEST_ACCESS_FORBIDDEN")
-}
-
-async fn bootstrap_cross_signing(client: &Client, user_id: &OwnedUserId) {
-    if let Some(status) = client.encryption().cross_signing_status().await {
-        if status.has_master && status.has_self_signing && status.has_user_signing {
-            info!("Cross-signing already complete (keys present) — skipping bootstrap");
-            return;
-        }
-    }
-    match client.encryption().bootstrap_cross_signing(None).await {
-        Ok(()) => info!("Cross-signing bootstrapped for {user_id}"),
-        Err(e) => warn!("Cross-signing bootstrap failed: {e}"),
-    }
-}
-
-async fn handle_verification_request(
-    client: Client,
-    state: BotState,
-    request: VerificationRequest,
-) {
-    let user_id = request.other_user_id();
-
-    let already_verified = client
-        .encryption()
-        .get_user_devices(user_id)
-        .await
-        .map(|devices| devices.devices().any(|d| d.is_verified()))
-        .unwrap_or(false);
-
-    if already_verified {
-        let allowed = state.reset_allowed.lock().await.remove(user_id);
-        if !allowed {
-            warn!("Rejecting verification from {} — already has a verified device", user_id);
-            request.cancel().await.ok();
-            return;
-        }
-        info!("Allowing re-verification for {} (trust was reset by admin)", user_id);
-    }
-
-    info!("Accepting verification from {user_id}");
-    if let Err(e) = request.accept().await {
-        error!("Failed to accept verification: {e}");
-        return;
-    }
-
-    let mut stream = request.changes();
-    while let Some(s) = stream.next().await {
-        match s {
-            VerificationRequestState::Transitioned { verification } => {
-                if let Verification::SasV1(sas) = verification {
-                    tokio::spawn(handle_sas(sas));
-                    break;
-                }
-            }
-            VerificationRequestState::Done | VerificationRequestState::Cancelled(_) => break,
-            _ => {}
-        }
-    }
-}
-
 // ── main ──────────────────────────────────────────────────────────────────────
 
 #[tokio::main]
@@ -1347,38 +1211,13 @@ async fn main() -> Result<()> {
     let config: Config = toml::from_str(&config_str).context("TOML parse error")?;
 
     let store_dir = PathBuf::from("store");
-    fs::create_dir_all(&store_dir).await?;
-
-    let encryption_strategy: CollectStrategy = config.security.encryption_strategy.into();
-
-    let client = Client::builder()
-        .homeserver_url(&config.matrix.homeserver)
-        .sqlite_store(store_dir.join("matrix_store"), None)
-        .with_room_key_recipient_strategy(encryption_strategy)
-        .build()
-        .await?;
-
-    let user_id: OwnedUserId = config.matrix.user_id.parse().context("Invalid user_id")?;
-    let device_id: OwnedDeviceId = OwnedDeviceId::from(config.matrix.device_id);
-
-    client
-        .restore_session(MatrixSession {
-            meta: SessionMeta { user_id: user_id.clone(), device_id },
-            tokens: SessionTokens {
-                access_token: config.matrix.access_token,
-                refresh_token: None,
-            },
-        })
-        .await?;
-    info!("Session restored as {user_id}");
-
-    if let Some(ref key) = config.matrix.recovery_key {
-        match client.encryption().recovery().recover(key).await {
-            Ok(()) => info!("Cross-signing keys recovered"),
-            Err(e) => warn!("Recovery failed: {e}"),
-        }
-    }
-    bootstrap_cross_signing(&client, &user_id).await;
+    // radar-bot keeps its sqlite matrix store at store/matrix_store/ to leave
+    // room alongside store/items.db. Pass the full path to build_and_restore.
+    let (client, user_id) = mxbot_common::session::build_and_restore(
+        &config.matrix,
+        &store_dir.join("matrix_store"),
+        config.security.encryption_strategy.into(),
+    ).await?;
 
     let allowed_inviters: HashSet<OwnedUserId> = config
         .security
@@ -1452,7 +1291,7 @@ async fn main() -> Result<()> {
                                 info!("Joined {room_id}");
                                 return;
                             }
-                            Err(ref e) if is_join_terminal(e) => {
+                            Err(ref e) if mxbot_common::verify::is_join_terminal(e) => {
                                 warn!("Join failed (terminal) for {room_id}: {e}");
                                 return;
                             }
@@ -1485,7 +1324,9 @@ async fn main() -> Result<()> {
                     warn!("Verification request object not found");
                     return;
                 };
-                tokio::spawn(handle_verification_request(client, state, request));
+                tokio::spawn(mxbot_common::verify::handle_verification_request(
+                    client, Arc::clone(&state.reset_allowed), request,
+                ));
             }
         }
     });
@@ -1506,7 +1347,9 @@ async fn main() -> Result<()> {
                             .get_verification_request(&ev.sender, &ev.event_id)
                             .await
                         else { return; };
-                        tokio::spawn(handle_verification_request(client, state, request));
+                        tokio::spawn(mxbot_common::verify::handle_verification_request(
+                    client, Arc::clone(&state.reset_allowed), request,
+                ));
                     }
                     MessageType::Text(text) => {
                         if let Some(target) = text.body.trim().strip_prefix("!reset-trust ") {
