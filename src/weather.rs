@@ -11,7 +11,6 @@ pub async fn weather_loop(
     client: Client,
     http: reqwest::Client,
     ref_point: (f64, f64),
-    location_name: String,
     post_time: NaiveTime,
 ) {
     loop {
@@ -26,7 +25,7 @@ pub async fn weather_loop(
         info!("Next weather forecast in {secs}s (at {})", target.format("%H:%M"));
         sleep(Duration::from_secs(secs)).await;
 
-        match fetch_forecast(&http, ref_point, &location_name).await {
+        match fetch_forecast(&http, ref_point).await {
             Some((plain, html)) => {
                 crate::post_to_rooms(&client, &plain, &html).await;
             }
@@ -37,16 +36,11 @@ pub async fn weather_loop(
 
 // ── Fetch ─────────────────────────────────────────────────────────────────────
 
-async fn fetch_forecast(
-    http: &reqwest::Client,
-    (lat, lon): (f64, f64),
-    location: &str,
-) -> Option<(String, String)> {
+async fn fetch_forecast(http: &reqwest::Client, (lat, lon): (f64, f64)) -> Option<(String, String)> {
     let url = format!(
         "https://api.open-meteo.com/v1/forecast\
          ?latitude={lat}&longitude={lon}\
-         &daily=weathercode,temperature_2m_max,temperature_2m_min,\
-         precipitation_sum,windspeed_10m_max\
+         &hourly=weathercode,temperature_2m,precipitation_probability,windspeed_10m\
          &timezone=auto&forecast_days=1"
     );
 
@@ -58,25 +52,35 @@ async fn fetch_forecast(
     .text().await.ok()?;
 
     let json: serde_json::Value = serde_json::from_str(&body).ok()?;
-    let d = &json["daily"];
+    let h = &json["hourly"];
 
-    let code    = d["weathercode"][0].as_i64().unwrap_or(0);
-    let t_max   = d["temperature_2m_max"][0].as_f64()?;
-    let t_min   = d["temperature_2m_min"][0].as_f64()?;
-    let precip  = d["precipitation_sum"][0].as_f64().unwrap_or(0.0);
-    let wind    = d["windspeed_10m_max"][0].as_f64().unwrap_or(0.0);
+    // Representative hours for each period of the day.
+    let periods: &[(&str, usize)] = &[
+        ("🌅 Morning",  7),
+        ("🌞 Midday",  13),
+        ("🌆 Evening", 18),
+        ("🌙 Night",   22),
+    ];
 
-    let (icon, desc) = wmo_description(code);
     let date = Local::now().format("%A, %d %b").to_string();
+    let mut plain_rows = Vec::new();
+    let mut html_rows  = Vec::new();
 
-    let plain = format!(
-        "{icon} Weather for {location} — {date}\n{desc}\n🌡 {t_min:.0}°C – {t_max:.0}°C  💧 {precip:.1}mm  💨 {wind:.0} km/h"
-    );
-    let html = format!(
-        "<b>{icon} Weather for {location} — {date}</b><br>\
-         {desc}<br>\
-         🌡 {t_min:.0}°C – {t_max:.0}°C &nbsp; 💧 {precip:.1}mm &nbsp; 💨 {wind:.0} km/h"
-    );
+    for &(label, hour) in periods {
+        let code   = h["weathercode"][hour].as_i64().unwrap_or(0);
+        let temp   = h["temperature_2m"][hour].as_f64()?;
+        let precip = h["precipitation_probability"][hour].as_i64().unwrap_or(0);
+        let wind   = h["windspeed_10m"][hour].as_f64().unwrap_or(0.0);
+        let (icon, _) = wmo_description(code);
+
+        plain_rows.push(format!("{label}: {icon} {temp:.0}°C  💧 {precip}%  💨 {wind:.0} km/h"));
+        html_rows.push(format!(
+            "{label}: {icon} {temp:.0}°C &nbsp; 💧 {precip}% &nbsp; 💨 {wind:.0} km/h"
+        ));
+    }
+
+    let plain = format!("Weather — {date}\n{}", plain_rows.join("\n"));
+    let html  = format!("<b>Weather — {date}</b><br>{}", html_rows.join("<br>"));
 
     Some((plain, html))
 }
@@ -100,6 +104,6 @@ fn wmo_description(code: i64) -> (&'static str, &'static str) {
         85 | 86      => ("🌨️", "Snow showers"),
         95           => ("⛈️",  "Thunderstorm"),
         96 | 99      => ("⛈️",  "Thunderstorm with hail"),
-        _            => ("🌡️", "Unknown conditions"),
+        _            => ("🌡️", "Unknown"),
     }
 }

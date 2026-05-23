@@ -1683,9 +1683,6 @@ async fn main() -> Result<()> {
 
     if config.weather.enabled {
         if let Some(pt) = ref_point {
-            let location_name = config.filter.reference_address
-                .clone()
-                .unwrap_or_else(|| "your area".to_owned());
             let post_time_str = config.weather.post_time
                 .or_else(|| config.schedule.digest_times.first().cloned())
                 .unwrap_or_else(|| "08:00".to_owned());
@@ -1699,7 +1696,6 @@ async fn main() -> Result<()> {
                 client.clone(),
                 http.clone(),
                 pt,
-                location_name,
                 post_time,
             ));
         } else {
