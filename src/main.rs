@@ -94,6 +94,9 @@ fn default_alert_poll_secs() -> u64 { 120 }
 struct WeatherConfig {
     #[serde(default = "default_true")]
     enabled: bool,
+    /// "brightsky" (DWD, default) or "openmeteo".
+    #[serde(default)]
+    provider: weather::WeatherProvider,
     /// Time of day to post the forecast (HH:MM, 24h). Defaults to first digest time.
     #[serde(default)]
     post_time: Option<String>,
@@ -101,7 +104,7 @@ struct WeatherConfig {
 
 impl Default for WeatherConfig {
     fn default() -> Self {
-        Self { enabled: true, post_time: None }
+        Self { enabled: true, provider: weather::WeatherProvider::Brightsky, post_time: None }
     }
 }
 
@@ -1697,6 +1700,7 @@ async fn main() -> Result<()> {
                 http.clone(),
                 pt,
                 post_time,
+                config.weather.provider,
             ));
         } else {
             warn!("Weather forecast disabled — no reference_address configured");

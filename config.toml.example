@@ -156,7 +156,8 @@ base_implied_meters = 9000
 # per day at post_time (defaults to the first digest time).
 [weather]
 enabled = true
-# post_time = "08:00"   # defaults to first digest_time; location taken from reference_address
+provider = "brightsky"  # "brightsky" (DWD, default) or "openmeteo"
+# post_time = "08:00"   # defaults to first digest_time
 
 # ── Emergency alerts ──────────────────────────────────────────────────────────
 # Polls NINA (Germany civil protection), USGS (earthquakes), and GDACS (global
