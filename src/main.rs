@@ -1597,7 +1597,11 @@ async fn main() -> Result<()> {
 
     // Continuous Matrix sync
     let filter = FilterDefinition::with_lazy_loading();
-    client.sync(SyncSettings::default().filter(filter.into())).await?;
-
-    Ok(())
+    loop {
+        match client.sync(SyncSettings::default().filter(filter.clone().into())).await {
+            Ok(()) => warn!("Sync loop exited cleanly — reconnecting"),
+            Err(e) => warn!("Sync loop error: {e} — reconnecting in 5s"),
+        }
+        sleep(Duration::from_secs(5)).await;
+    }
 }
