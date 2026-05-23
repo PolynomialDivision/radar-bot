@@ -9,6 +9,7 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = "1"
+rusqlite = "0.37"
 dashmap = "6"
 chrono = "0.4"
 futures-util = "0.3"

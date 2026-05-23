@@ -2513,6 +2513,7 @@ dependencies = [
  "matrix-sdk",
  "matrix-sdk-crypto",
  "reqwest",
+ "rusqlite",
  "serde",
  "serde_json",
  "tokio",

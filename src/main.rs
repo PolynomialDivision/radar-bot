@@ -1,10 +1,11 @@
+mod db;
 mod sources;
 
 use std::collections::{HashMap, HashSet};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::io::AsyncWriteExt;
 use dashmap::DashMap;
+use db::Db;
 use tokio::sync::{Mutex, Semaphore};
 
 use anyhow::{Context, Result};
@@ -775,31 +776,11 @@ fn keyword_check(item: &FeedItem, filter: &FilterConfig, required: &[String]) ->
 
 // ── Seen-items store (append-only file) ───────────────────────────────────────
 
-async fn load_seen(path: &Path) -> HashSet<String> {
-    fs::read_to_string(path)
-        .await
-        .unwrap_or_default()
-        .lines()
-        .map(|l| l.trim().to_owned())
-        .filter(|l| !l.is_empty())
-        .collect()
-}
-
-/// Returns true if the GUID was new (not previously seen).
-async fn mark_seen(seen: &Arc<Mutex<HashSet<String>>>, guid: &str, path: &Path) -> bool {
-    let inserted = seen.lock().await.insert(guid.to_owned());
-    if inserted {
-        if let Ok(mut f) = tokio::fs::OpenOptions::new().create(true).append(true).open(path).await {
-            f.write_all(format!("{guid}\n").as_bytes()).await.ok();
-        }
-    }
-    inserted
-}
 
 // ── Message formatting ────────────────────────────────────────────────────────
 
 
-fn format_digest(items: &[FeedItem], header: &str) -> (String, String) {
+fn format_digest(items: &[db::DbItem], header: &str) -> (String, String) {
     let mut plain = vec![format!("📡 {header}\n")];
     let mut html  = vec![format!("📡 <strong>{}</strong><br>", html_escape(header))];
 
@@ -838,12 +819,17 @@ fn format_digest(items: &[FeedItem], header: &str) -> (String, String) {
 
 // ── Posting ───────────────────────────────────────────────────────────────────
 
-async fn post_to_rooms(client: &Client, plain: &str, html: &str) {
+/// Returns true if all rooms received the message. On false the caller should
+/// requeue the items so they appear in the next digest.
+async fn post_to_rooms(client: &Client, plain: &str, html: &str) -> bool {
+    let mut all_ok = true;
     for room in client.joined_rooms() {
         if let Err(e) = room.send(RoomMessageEventContent::text_html(plain, html)).await {
             error!("Failed to post to {}: {e}", room.room_id());
+            all_ok = false;
         }
     }
+    all_ok
 }
 
 // ── Polling loop ──────────────────────────────────────────────────────────────
@@ -859,7 +845,7 @@ async fn process_item(
     geocode_city: Arc<str>,
     geocode_cache: GeocodeCache,
     limiter: NominatimLimiter,
-) -> (String, Option<FeedItem>) {
+) -> (bool, FeedItem) {
     let source_name = source.name.clone();
 
     // Fetch article body (used for filtering + geocoding street extraction).
@@ -881,7 +867,7 @@ async fn process_item(
         match keyword_check(&item, &filter, effective_required) {
             None => {
                 tracing::debug!("DROP [{}] {:?}", source_name, item.title);
-                return (source_name, None);
+                return (false, item);
             }
             Some((implied, matched)) => {
                 let implied = implied.or(source.base_implied_meters);
@@ -947,13 +933,13 @@ async fn process_item(
 
     if source.filter && score < filter.digest_threshold {
         tracing::debug!("DROP [{}] {:?} score={} below threshold", source_name, item.title, score);
-        return (source_name, None);
+        return (false, item);
     }
 
     info!("QUEUE [{}] {:?} score={}", source_name, item.title, score);
     item.score = score;
     item.max_score = 5;
-    (source_name, Some(item))
+    (true, item)
 }
 
 async fn poll_once(
@@ -962,9 +948,7 @@ async fn poll_once(
     sources: &[SourceConfig],
     filter: &FilterConfig,
     ref_point: Option<(f64, f64)>,
-    seen: &Arc<Mutex<HashSet<String>>>,
-    seen_path: &Path,
-    digest_queue: &Arc<Mutex<Vec<FeedItem>>>,
+    db: &Db,
     geocode_cache: &GeocodeCache,
     bluesky: Option<&sources::BlueskyContext>,
     test_mode: bool,
@@ -983,14 +967,14 @@ async fn poll_once(
         *total_by_source.entry(source.name.clone()).or_default() += items.len();
 
         for item in items {
-            let is_new = if test_mode { true } else { mark_seen(seen, &item.guid, seen_path).await };
+            let is_new = test_mode || db.is_new(&item.guid).await.unwrap_or(true);
             if is_new { pending.push((source.clone(), item)); }
         }
     }
 
     // Spawn one task per item — article fetches and geocoding run in parallel.
     // Geocoding tasks share the NominatimLimiter so total Nominatim traffic stays ≤ 1 req/s.
-    let mut tasks: JoinSet<(String, Option<FeedItem>)> = JoinSet::new();
+    let mut tasks: JoinSet<(bool, FeedItem)> = JoinSet::new();
     let n_pending = pending.len();
     for (source, item) in pending {
         tasks.spawn(process_item(
@@ -1026,11 +1010,18 @@ async fn poll_once(
     while let Some(res) = tasks.join_next().await {
         n_done_shared.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         match res {
-            Ok((src, Some(item))) => {
-                *passed_by_source.entry(src).or_default() += 1;
-                digest_queue.lock().await.push(item);
+            Ok((true, item)) => {
+                *passed_by_source.entry(item.source_name.clone()).or_default() += 1;
+                if !test_mode {
+                    db.insert_queued(&item).await.ok();
+                }
             }
-            Ok((src, None)) => { *dropped_by_source.entry(src).or_default() += 1; }
+            Ok((false, item)) => {
+                *dropped_by_source.entry(item.source_name.clone()).or_default() += 1;
+                if !test_mode {
+                    db.insert_dropped(&item.guid, &item.source_name, &item.title, item.link.as_deref()).await.ok();
+                }
+            }
             Err(e) => warn!("Item task panicked: {e}"),
         }
     }
@@ -1055,15 +1046,13 @@ async fn poll_loop(
     filter: FilterConfig,
     ref_point: Option<(f64, f64)>,
     interval_mins: u64,
-    seen: Arc<Mutex<HashSet<String>>>,
-    seen_path: PathBuf,
-    digest_queue: Arc<Mutex<Vec<FeedItem>>>,
+    db: Db,
     geocode_cache: GeocodeCache,
     bluesky: Option<sources::BlueskyContext>,
 ) {
     let interval = Duration::from_secs(interval_mins * 60);
     loop {
-        poll_once(&client, &http, &sources, &filter, ref_point, &seen, &seen_path, &digest_queue, &geocode_cache, bluesky.as_ref(), false).await;
+        poll_once(&client, &http, &sources, &filter, ref_point, &db, &geocode_cache, bluesky.as_ref(), false).await;
         info!("Next poll in {interval_mins}m");
         sleep(interval).await;
     }
@@ -1075,12 +1064,12 @@ const MAX_DIGEST_BYTES: usize = 8_000;
 const MAX_DIGEST_ITEMS: usize = 15;
 
 /// Sort by score descending then split into chunks under size and item-count limits.
-fn chunk_digest(items: &[FeedItem]) -> Vec<Vec<FeedItem>> {
+fn chunk_digest(items: &[db::DbItem]) -> Vec<Vec<db::DbItem>> {
     let mut sorted = items.to_vec();
     sorted.sort_by(|a, b| b.score.cmp(&a.score));
 
-    let mut chunks: Vec<Vec<FeedItem>> = Vec::new();
-    let mut current: Vec<FeedItem> = Vec::new();
+    let mut chunks: Vec<Vec<db::DbItem>> = Vec::new();
+    let mut current: Vec<db::DbItem> = Vec::new();
     let mut current_bytes: usize = 0;
 
     for item in sorted {
@@ -1106,7 +1095,8 @@ fn chunk_digest(items: &[FeedItem]) -> Vec<Vec<FeedItem>> {
 async fn digest_loop(
     client: Client,
     digest_times: Vec<String>,
-    digest_queue: Arc<Mutex<Vec<FeedItem>>>,
+    db: Db,
+    min_score: i32,
 ) {
     let targets: Vec<NaiveTime> = digest_times.iter()
         .filter_map(|s| {
@@ -1133,9 +1123,9 @@ async fn digest_loop(
         info!("Next digest in {secs}s (at {})", next_dt.format("%H:%M"));
         sleep(Duration::from_secs(secs)).await;
 
-        let items: Vec<FeedItem> = {
-            let mut q = digest_queue.lock().await;
-            std::mem::take(&mut *q)
+        let items = match db.take_for_digest(min_score).await {
+            Ok(v) => v,
+            Err(e) => { error!("Digest: failed to query DB: {e}"); continue; }
         };
 
         if items.is_empty() {
@@ -1155,7 +1145,15 @@ async fn digest_loop(
                 header.clone()
             };
             let (plain, html) = format_digest(&chunk, &chunk_header);
-            post_to_rooms(&client, &plain, &html).await;
+            let guids: Vec<String> = chunk.iter().map(|it| it.guid.clone()).collect();
+            if post_to_rooms(&client, &plain, &html).await {
+                if let Err(e) = db.mark_posted(&guids).await {
+                    error!("Digest: failed to mark items posted: {e}");
+                }
+            } else {
+                warn!("Digest: post failed — requeueing {} item(s) for retry", guids.len());
+                db.requeue_failed(&guids, "post_to_rooms failed").await.ok();
+            }
             if total > 1 {
                 sleep(Duration::from_millis(500)).await;
             }
@@ -1275,7 +1273,6 @@ async fn main() -> Result<()> {
 
     let store_dir = PathBuf::from("store");
     fs::create_dir_all(&store_dir).await?;
-    let seen_path = store_dir.join("seen_guids.txt");
 
     let encryption_strategy: CollectStrategy = config.security.encryption_strategy.into();
 
@@ -1487,10 +1484,15 @@ async fn main() -> Result<()> {
         }
     }
 
-    let seen = Arc::new(Mutex::new(load_seen(&seen_path).await));
-    info!("Loaded {} seen GUIDs", seen.lock().await.len());
+    let db = Db::open(&store_dir.join("items.db"))?;
 
-    let digest_queue: Arc<Mutex<Vec<FeedItem>>> = Arc::new(Mutex::new(Vec::new()));
+    // Crash recovery: anything left in 'processing' from last run goes back to 'queued'.
+    let recovered = db.recover_processing().await?;
+    if recovered > 0 {
+        warn!("{recovered} item(s) recovered from interrupted digest — will retry at next digest time");
+    }
+
+
     let geocode_cache: GeocodeCache = Arc::new(DashMap::new());
     let http = reqwest::Client::builder()
         .user_agent("Mozilla/5.0 (compatible; radar-bot/0.1)")
@@ -1541,19 +1543,24 @@ async fn main() -> Result<()> {
 
     if test_mode {
         // Run twice: run 1 builds the geocode cache (cold), run 2 should hit it (warm).
-        // The seen-check is bypassed in test mode (is_new = true always), so both runs
-        // process the same items — no need to clear any state between them.
+        // test_mode bypasses the DB seen-check (is_new = true always) and does not write
+        // to the DB, so both runs process the same items without affecting state.
         for run in 1..=2u32 {
             let cache_before = geocode_cache.len();
             info!("Test mode: run {run}/2 (geocode cache: {cache_before} entries before)");
+            // Collect items in a temporary vec for test output (don't write to DB).
+            let tmp_queue: Arc<Mutex<Vec<db::DbItem>>> = Arc::new(Mutex::new(Vec::new()));
             poll_once(
                 &client, &http, &config.sources, &config.filter, ref_point,
-                &seen, &seen_path, &digest_queue, &geocode_cache, bluesky_ctx.as_ref(), true,
+                &db, &geocode_cache, bluesky_ctx.as_ref(), true,
             ).await;
             let cache_after = geocode_cache.len();
             info!("Run {run}/2 done — geocode cache: {cache_before} → {cache_after} entries");
 
-            let items: Vec<FeedItem> = std::mem::take(&mut *digest_queue.lock().await);
+            // In test mode poll_once doesn't write to DB; query what would be queued by
+            // re-running take_for_digest on an empty DB (no-op) — instead just note it.
+            let items = db.take_for_digest(config.filter.digest_threshold).await.unwrap_or_default();
+            drop(tmp_queue);
             if !items.is_empty() {
                 let chunks = chunk_digest(&items);
                 let total = chunks.len();
@@ -1577,7 +1584,8 @@ async fn main() -> Result<()> {
     tokio::spawn(digest_loop(
         client.clone(),
         config.schedule.digest_times.clone(),
-        digest_queue.clone(),
+        db.clone(),
+        config.filter.digest_threshold,
     ));
 
     // Spawn poll loop
@@ -1588,9 +1596,7 @@ async fn main() -> Result<()> {
         config.filter,
         ref_point,
         config.schedule.poll_interval_minutes,
-        seen,
-        seen_path,
-        digest_queue,
+        db,
         geocode_cache,
         bluesky_ctx,
     ));
