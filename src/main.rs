@@ -227,6 +227,9 @@ pub(crate) struct FeedItem {
     /// Distance in metres from the reference point (if geocoded).
     #[serde(default)]
     pub(crate) distance_meters: Option<f64>,
+    /// Unix timestamp from <pubDate> / <published> / <updated>. None if missing or unparseable.
+    #[serde(default)]
+    pub(crate) published_at: Option<i64>,
 }
 
 // ── HTML utilities ────────────────────────────────────────────────────────────
@@ -416,10 +419,34 @@ pub(crate) fn parse_feed(xml: &str, source_name: &str) -> Vec<FeedItem> {
             .or_else(|| link.clone())
             .unwrap_or_else(|| format!("{source_name}::{title}"));
 
-        items.push(FeedItem { guid, title, link, description, article_text: None, source_name: source_name.to_owned(), score: 0, max_score: 0, distance_meters: None });
+        let published_at = if is_atom {
+            extract_text(block, "published").or_else(|| extract_text(block, "updated"))
+        } else {
+            extract_text(block, "pubDate")
+        }
+        .as_deref()
+        .and_then(parse_feed_date);
+
+        items.push(FeedItem { guid, title, link, description, article_text: None, source_name: source_name.to_owned(), score: 0, max_score: 0, distance_meters: None, published_at });
     }
 
     items
+}
+
+/// Parse RFC 2822 (RSS pubDate) or RFC 3339/ISO 8601 (Atom) date strings to Unix timestamp.
+/// Returns None if the string is missing, empty, or unparseable — callers treat None as "keep".
+pub(crate) fn parse_feed_date(s: &str) -> Option<i64> {
+    let s = s.trim();
+    if s.is_empty() { return None; }
+    // RFC 3339 / ISO 8601 (Atom: "2024-01-15T10:30:00Z", "2024-01-15T10:30:00+01:00")
+    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(s) {
+        return Some(dt.timestamp());
+    }
+    // RFC 2822 (RSS 2.0: "Mon, 15 Jan 2024 10:30:00 +0000")
+    if let Ok(dt) = chrono::DateTime::parse_from_rfc2822(s) {
+        return Some(dt.timestamp());
+    }
+    None
 }
 
 // ── Article fetcher ───────────────────────────────────────────────────────────

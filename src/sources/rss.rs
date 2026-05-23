@@ -5,6 +5,8 @@ use tracing::warn;
 pub struct RssAdapter {
     pub name: String,
     pub url: String,
+    /// Drop items older than this many hours. None = no limit.
+    pub max_age_hours: Option<u64>,
 }
 
 impl RssAdapter {
@@ -33,6 +35,19 @@ impl RssAdapter {
             }
         };
 
-        crate::parse_feed(&xml, &self.name)
+        let mut items = crate::parse_feed(&xml, &self.name);
+
+        if let Some(max_age) = self.max_age_hours {
+            let cutoff = chrono::Utc::now().timestamp() - (max_age as i64 * 3600);
+            let before = items.len();
+            // Items with no date are kept (fail open — better to over-include than silently drop).
+            items.retain(|item| item.published_at.map_or(true, |ts| ts >= cutoff));
+            let dropped = before - items.len();
+            if dropped > 0 {
+                warn!("RSS age filter [{}]: dropped {dropped} item(s) older than {max_age}h", self.name);
+            }
+        }
+
+        items
     }
 }

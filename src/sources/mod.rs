@@ -63,6 +63,7 @@ pub fn build_adapter(source: &SourceConfig, bluesky: Option<&BlueskyContext>) ->
         SourceType::Rss => SourceAdapter::Rss(rss::RssAdapter {
             name: source.name.clone(),
             url: source.url.clone().unwrap_or_default(),
+            max_age_hours: source.max_age_hours,
         }),
         SourceType::Bluesky => {
             let (identifier, password, session) = bluesky

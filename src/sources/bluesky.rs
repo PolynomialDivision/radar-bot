@@ -158,6 +158,7 @@ impl BlueskyAdapter {
             score: 0,
             max_score: 0,
             distance_meters: None,
+            published_at: post["record"]["createdAt"].as_str().and_then(crate::parse_feed_date),
         })
     }
 }
