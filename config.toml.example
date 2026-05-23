@@ -150,6 +150,14 @@ filter = true
 required = []
 base_implied_meters = 9000
 
+# ── Weather forecast ─────────────────────────────────────────────────────────
+# Posts a daily weather forecast using Open-Meteo (free, no API key needed).
+# Coordinates are taken from reference_address. The forecast is posted once
+# per day at post_time (defaults to the first digest time).
+[weather]
+enabled = true
+# post_time = "08:00"   # defaults to first digest_time; location taken from reference_address
+
 # ── Emergency alerts ──────────────────────────────────────────────────────────
 # Polls NINA (Germany civil protection), USGS (earthquakes), and GDACS (global
 # disasters) every poll_interval_secs and sends an immediate Matrix message,

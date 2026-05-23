@@ -1,6 +1,7 @@
 mod alerts;
 mod db;
 mod sources;
+mod weather;
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -55,6 +56,8 @@ struct Config {
     bluesky: BlueskyConfig,
     #[serde(default)]
     emergency: EmergencyConfig,
+    #[serde(default)]
+    weather: WeatherConfig,
 }
 
 #[derive(Deserialize, Default)]
@@ -86,6 +89,21 @@ impl Default for EmergencyConfig {
 }
 
 fn default_alert_poll_secs() -> u64 { 120 }
+
+#[derive(Deserialize)]
+struct WeatherConfig {
+    #[serde(default = "default_true")]
+    enabled: bool,
+    /// Time of day to post the forecast (HH:MM, 24h). Defaults to first digest time.
+    #[serde(default)]
+    post_time: Option<String>,
+}
+
+impl Default for WeatherConfig {
+    fn default() -> Self {
+        Self { enabled: true, post_time: None }
+    }
+}
 
 #[derive(Deserialize)]
 struct MatrixConfig {
@@ -1661,6 +1679,32 @@ async fn main() -> Result<()> {
                 poll_interval_secs: config.emergency.poll_interval_secs,
             },
         ));
+    }
+
+    if config.weather.enabled {
+        if let Some(pt) = ref_point {
+            let location_name = config.filter.reference_address
+                .clone()
+                .unwrap_or_else(|| "your area".to_owned());
+            let post_time_str = config.weather.post_time
+                .or_else(|| config.schedule.digest_times.first().cloned())
+                .unwrap_or_else(|| "08:00".to_owned());
+            let post_time = {
+                let mut p = post_time_str.splitn(2, ':');
+                let h: u32 = p.next().and_then(|s| s.parse().ok()).unwrap_or(8);
+                let m: u32 = p.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+                NaiveTime::from_hms_opt(h, m, 0).unwrap_or_else(|| NaiveTime::from_hms_opt(8, 0, 0).unwrap())
+            };
+            tokio::spawn(weather::weather_loop(
+                client.clone(),
+                http.clone(),
+                pt,
+                location_name,
+                post_time,
+            ));
+        } else {
+            warn!("Weather forecast disabled — no reference_address configured");
+        }
     }
 
     // Spawn poll loop
