@@ -149,3 +149,21 @@ max_age_hours = 24        # only fetch posts newer than this (default 24)
 filter = true
 required = []
 base_implied_meters = 9000
+
+# ── Emergency alerts ──────────────────────────────────────────────────────────
+# Polls NINA (Germany civil protection), USGS (earthquakes), and GDACS (global
+# disasters) every poll_interval_secs and sends an immediate Matrix message,
+# bypassing the normal digest queue.
+#
+# NINA is automatically configured from your reference_address above:
+#   - Nominatim reverse geocode → city name
+#   - NINA completion API → AGS (Amtlicher Gemeindeschlüssel)
+# NINA is skipped if reference_address is outside Germany.
+#
+# USGS sends globally significant earthquakes. Set max_distance_km to limit to
+# events near your reference_address (e.g. 200 for Central Europe).
+# GDACS covers major global disasters (earthquakes, floods, cyclones, volcanoes).
+[emergency]
+enabled = true
+# max_distance_km = 200    # filter USGS events by distance; omit to receive all
+poll_interval_secs = 120

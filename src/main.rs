@@ -1,3 +1,4 @@
+mod alerts;
 mod db;
 mod sources;
 
@@ -52,6 +53,8 @@ struct Config {
     sources: Vec<SourceConfig>,
     #[serde(default)]
     bluesky: BlueskyConfig,
+    #[serde(default)]
+    emergency: EmergencyConfig,
 }
 
 #[derive(Deserialize, Default)]
@@ -59,6 +62,30 @@ struct BlueskyConfig {
     identifier: Option<String>,
     password: Option<String>,
 }
+
+#[derive(Deserialize)]
+struct EmergencyConfig {
+    #[serde(default = "default_true")]
+    enabled: bool,
+    /// Max distance in km for USGS earthquake alerts. None = send all globally.
+    #[serde(default)]
+    max_distance_km: Option<f64>,
+    /// Poll interval in seconds (default 120).
+    #[serde(default = "default_alert_poll_secs")]
+    poll_interval_secs: u64,
+}
+
+impl Default for EmergencyConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            max_distance_km: None,
+            poll_interval_secs: default_alert_poll_secs(),
+        }
+    }
+}
+
+fn default_alert_poll_secs() -> u64 { 120 }
 
 #[derive(Deserialize)]
 struct MatrixConfig {
@@ -848,7 +875,7 @@ fn format_digest(items: &[db::DbItem], header: &str) -> (String, String) {
 
 /// Returns true if all rooms received the message. On false the caller should
 /// requeue the items so they appear in the next digest.
-async fn post_to_rooms(client: &Client, plain: &str, html: &str) -> bool {
+pub(crate) async fn post_to_rooms(client: &Client, plain: &str, html: &str) -> bool {
     let mut all_ok = true;
     for room in client.joined_rooms() {
         if let Err(e) = room.send(RoomMessageEventContent::text_html(plain, html)).await {
@@ -1614,6 +1641,27 @@ async fn main() -> Result<()> {
         db.clone(),
         config.filter.digest_threshold,
     ));
+
+    if config.emergency.enabled {
+        let nina_ags = match ref_point {
+            Some(pt) => alerts::lookup_nina_ags(&http, pt).await,
+            None => {
+                warn!("No reference_address — NINA alerts disabled");
+                None
+            }
+        };
+        tokio::spawn(alerts::alert_loop(
+            client.clone(),
+            http.clone(),
+            db.clone(),
+            alerts::AlertConfig {
+                nina_ags,
+                ref_point,
+                max_distance_km: config.emergency.max_distance_km,
+                poll_interval_secs: config.emergency.poll_interval_secs,
+            },
+        ));
+    }
 
     // Spawn poll loop
     tokio::spawn(poll_loop(
