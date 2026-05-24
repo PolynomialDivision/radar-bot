@@ -178,6 +178,6 @@ fn format_message(rows_plain: Vec<String>, rows_html: Vec<String>) -> Option<(St
     }
     let date  = Local::now().format("%A, %d %b").to_string();
     let plain = format!("Weather — {date}\n{}", rows_plain.join("\n"));
-    let html  = format!("<b>Weather — {date}</b><br>{}", rows_html.join("<br>"));
+    let html  = format!("<strong>Weather — {date}</strong><br>{}", rows_html.join("<br>"));
     Some((plain, html))
 }
