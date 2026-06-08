@@ -177,12 +177,11 @@ async fn check_usgs(
         let lon = f["geometry"]["coordinates"][0].as_f64();
         let lat = f["geometry"]["coordinates"][1].as_f64();
 
-        if let (Some(max_km), Some((ref_lat, ref_lon)), Some(lat), Some(lon)) =
-            (max_distance_km, ref_point, lat, lon)
-        {
-            let dist = haversine_km(ref_lat, ref_lon, lat, lon);
-            if dist > max_km {
-                continue;
+        if let (Some(max_km), Some((ref_lat, ref_lon))) = (max_distance_km, ref_point) {
+            match (lat, lon) {
+                (Some(lat), Some(lon)) if haversine_km(ref_lat, ref_lon, lat, lon) <= max_km => {}
+                (Some(_), Some(_)) => continue, // too far
+                _                  => continue, // no coordinates — can't verify proximity, skip
             }
         }
 
@@ -241,8 +240,9 @@ async fn check_gdacs(
         // Distance filter using <geo:lat>/<geo:long> from the RSS item.
         if let (Some(max_km), Some((ref_lat, ref_lon))) = (max_distance_km, ref_point) {
             match coords.get(&item.guid) {
-                Some(&(lat, lon)) if haversine_km(ref_lat, ref_lon, lat, lon) > max_km => continue,
-                _ => {}
+                Some(&(lat, lon)) if haversine_km(ref_lat, ref_lon, lat, lon) <= max_km => {}
+                Some(_) => continue, // too far
+                None    => continue, // no coordinates — can't verify proximity, skip
             }
         }
 

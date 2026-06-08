@@ -5,6 +5,8 @@ use matrix_sdk::Client;
 use tokio::time::sleep;
 use tracing::{info, warn};
 
+use crate::db::Db;
+
 #[derive(serde::Deserialize, Default, Clone)]
 #[serde(rename_all = "snake_case")]
 pub enum WeatherProvider {
@@ -18,6 +20,7 @@ pub enum WeatherProvider {
 pub async fn weather_loop(
     client: Client,
     http: reqwest::Client,
+    db: Db,
     ref_point: (f64, f64),
     post_time: NaiveTime,
     provider: WeatherProvider,
@@ -34,13 +37,24 @@ pub async fn weather_loop(
         info!("Next weather forecast in {secs}s (at {})", target.format("%H:%M"));
         sleep(Duration::from_secs(secs)).await;
 
+        // Guard against double-posting when the container restarts near post_time.
+        let date_key = format!("weather:{}", Local::now().date_naive());
+        match db.is_alert_seen(&date_key).await {
+            Ok(true) => { info!("Weather already posted today — skipping"); continue; }
+            Err(e)   => { warn!("DB check for weather guard failed: {e}"); }
+            Ok(false) => {}
+        }
+
         let result = match provider {
             WeatherProvider::Brightsky  => fetch_brightsky(&http, ref_point).await,
             WeatherProvider::Openmeteo  => fetch_openmeteo(&http, ref_point).await,
         };
 
         match result {
-            Some((plain, html)) => { crate::post_to_rooms(&client, &plain, &html).await; }
+            Some((plain, html)) => {
+                crate::post_to_rooms(&client, &plain, &html).await;
+                db.mark_alert_seen(&date_key, "weather").await.ok();
+            }
             None => warn!("Weather forecast fetch failed — skipping today"),
         }
     }

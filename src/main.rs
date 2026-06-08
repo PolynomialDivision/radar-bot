@@ -77,7 +77,7 @@ impl Default for EmergencyConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            max_distance_km: None,
+            max_distance_km: Some(500.0),
             poll_interval_secs: default_alert_poll_secs(),
         }
     }
@@ -1541,6 +1541,7 @@ async fn main() -> Result<()> {
             tokio::spawn(weather::weather_loop(
                 client.clone(),
                 http.clone(),
+                db.clone(),
                 pt,
                 post_time,
                 config.weather.provider,
