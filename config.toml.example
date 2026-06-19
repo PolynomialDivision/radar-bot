@@ -159,6 +159,11 @@ enabled = true
 provider = "brightsky"  # "brightsky" (DWD, default) or "openmeteo"
 # post_time = "08:00"   # defaults to first digest_time
 
+# DWD weather warnings are sent immediately through the emergency alert loop.
+# If omitted, the bot derives this from filter.geocode_city/reference_address.
+alerts_enabled = true
+# warning_region_keywords = ["Yourcity"]
+
 # ── Emergency alerts ──────────────────────────────────────────────────────────
 # Polls NINA (Germany civil protection), USGS (earthquakes), and GDACS (global
 # disasters) every poll_interval_secs and sends an immediate Matrix message,

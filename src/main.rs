@@ -95,11 +95,24 @@ struct WeatherConfig {
     /// Time of day to post the forecast (HH:MM, 24h). Defaults to first digest time.
     #[serde(default)]
     post_time: Option<String>,
+    /// Poll DWD weather warnings and send them immediately through the alert loop.
+    #[serde(default = "default_true")]
+    alerts_enabled: bool,
+    /// Region keywords used to select DWD weather warnings. Empty = derive from
+    /// filter.geocode_city/reference_address, e.g. "Berlin".
+    #[serde(default)]
+    warning_region_keywords: Vec<String>,
 }
 
 impl Default for WeatherConfig {
     fn default() -> Self {
-        Self { enabled: true, provider: weather::WeatherProvider::Brightsky, post_time: None }
+        Self {
+            enabled: true,
+            provider: weather::WeatherProvider::Brightsky,
+            post_time: None,
+            alerts_enabled: true,
+            warning_region_keywords: Vec::new(),
+        }
     }
 }
 
@@ -199,6 +212,31 @@ impl Default for ScheduleConfig {
 fn default_poll_interval() -> u64 { 30 }
 fn default_digest_times() -> Vec<String> { vec!["08:00".to_owned()] }
 fn default_true() -> bool { true }
+
+fn derive_warning_region_keywords(filter: &FilterConfig, weather: &WeatherConfig) -> Vec<String> {
+    if !weather.warning_region_keywords.is_empty() {
+        return weather.warning_region_keywords.clone();
+    }
+
+    let from_geocode_city = filter
+        .geocode_city
+        .as_deref()
+        .and_then(|city| city.split(',').next())
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    if let Some(city) = from_geocode_city {
+        return vec![city.to_owned()];
+    }
+
+    filter
+        .reference_address
+        .as_deref()
+        .and_then(|addr| addr.rsplit(',').next())
+        .map(str::trim)
+        .and_then(|part| part.split_whitespace().find(|token| token.chars().any(|c| c.is_alphabetic())))
+        .map(|city| vec![city.to_owned()])
+        .unwrap_or_default()
+}
 
 // ── Bot state ─────────────────────────────────────────────────────────────────
 
@@ -1458,6 +1496,16 @@ async fn main() -> Result<()> {
                 None
             }
         };
+    let dwd_region_keywords = if config.weather.alerts_enabled {
+        derive_warning_region_keywords(&config.filter, &config.weather)
+    } else {
+        Vec::new()
+    };
+    if config.weather.alerts_enabled && dwd_region_keywords.is_empty() {
+        warn!("DWD weather warnings disabled — no weather.warning_region_keywords, geocode_city, or reference_address city found");
+    } else if !dwd_region_keywords.is_empty() {
+        info!("DWD weather warning region keyword(s): {:?}", dwd_region_keywords);
+    }
 
     if test_mode {
         // Run twice: run 1 builds the geocode cache (cold), run 2 should hit it (warm).
@@ -1466,8 +1514,6 @@ async fn main() -> Result<()> {
         for run in 1..=2u32 {
             let cache_before = geocode_cache.len();
             info!("Test mode: run {run}/2 (geocode cache: {cache_before} entries before)");
-            // Collect items in a temporary vec for test output (don't write to DB).
-            let tmp_queue: Arc<Mutex<Vec<db::DbItem>>> = Arc::new(Mutex::new(Vec::new()));
             poll_once(
                 &client, &http, &config.sources, &config.filter, ref_point,
                 &db, &geocode_cache, bluesky_ctx.as_ref(), true,
@@ -1478,7 +1524,6 @@ async fn main() -> Result<()> {
             // In test mode poll_once doesn't write to DB; query what would be queued by
             // re-running take_for_digest on an empty DB (no-op) — instead just note it.
             let items = db.take_for_digest(config.filter.digest_threshold).await.unwrap_or_default();
-            drop(tmp_queue);
             if !items.is_empty() {
                 let chunks = chunk_digest(&items);
                 let total = chunks.len();
@@ -1521,6 +1566,7 @@ async fn main() -> Result<()> {
             alerts::AlertConfig {
                 nina_ags,
                 ref_point,
+                dwd_region_keywords,
                 max_distance_km: config.emergency.max_distance_km,
                 poll_interval_secs: config.emergency.poll_interval_secs,
             },
