@@ -18,6 +18,7 @@ use serde::Deserialize;
 pub enum SourceType {
     #[default]
     Rss,
+    GoogleNews,
     Bluesky,
     // Mastodon,
     // Reddit,
@@ -66,6 +67,11 @@ pub fn build_adapter(source: &SourceConfig, bluesky: Option<&BlueskyContext>) ->
             url: source.url.clone().unwrap_or_default(),
             max_age_hours: source.max_age_hours,
         }),
+        SourceType::GoogleNews => SourceAdapter::Rss(rss::RssAdapter {
+            name: source.name.clone(),
+            url: google_news_rss_url(source.query.as_deref().unwrap_or_default()),
+            max_age_hours: source.max_age_hours,
+        }),
         SourceType::Bluesky => {
             let (identifier, password, session) = bluesky
                 .map(|ctx| {
@@ -86,5 +92,25 @@ pub fn build_adapter(source: &SourceConfig, bluesky: Option<&BlueskyContext>) ->
                 session,
             })
         }
+    }
+}
+
+fn google_news_rss_url(query: &str) -> String {
+    let q = crate::url_encode(query);
+    format!("https://news.google.com/rss/search?q={q}&hl=de&gl=DE&ceid=DE:de")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn google_news_source_builds_german_rss_search_url() {
+        let url = google_news_rss_url(r#""Frankfurter Allee" Berlin Unfall"#);
+
+        assert_eq!(
+            url,
+            "https://news.google.com/rss/search?q=%22Frankfurter+Allee%22+Berlin+Unfall&hl=de&gl=DE&ceid=DE:de"
+        );
     }
 }

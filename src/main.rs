@@ -143,8 +143,8 @@ struct SourceConfig {
     /// Feed URL (required for type = "rss").
     #[serde(default)]
     url: Option<String>,
-    // ── Bluesky ───────────────────────────────────────────────────────────────
-    /// Keyword or hashtag query (required for type = "bluesky"), e.g. "#Berlin".
+    // ── Search-based sources ──────────────────────────────────────────────────
+    /// Search query for type = "bluesky" or type = "google_news".
     #[serde(default)]
     query: Option<String>,
     /// Max posts per poll for Bluesky (default 25, API max 100).

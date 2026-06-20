@@ -102,6 +102,11 @@ terms = [
 # RSS/Atom sources (type = "rss", the default — "type" field can be omitted):
 #   url = "https://..."    — required
 #
+# Google News search RSS sources (type = "google_news"):
+#   query = "\"Yourstreet\" Yourcity Unfall OR Brand OR Polizei"
+#   max_age_hours = 48     — recommended, keeps search results fresh
+#   Keep filter = true. Use narrow street/district queries to reduce false positives.
+#
 # Bluesky sources (type = "bluesky"):
 #   query = "#Hashtag"     — keyword or hashtag search query, required
 #   limit = 25             — max posts per poll (default 25, API max 100)
@@ -129,6 +134,16 @@ base_implied_meters = 9000
 name = "National News"
 url = "https://example.com/national/rss.xml"
 filter = true
+
+# Google News can discover articles from publishers that have no useful direct RSS.
+# Keep these searches local and incident-focused; the normal bot filter still applies.
+[[sources]]
+name = "Google News Yourstreet"
+type = "google_news"
+query = "\"Yourstreet\" Yourcity Unfall OR Brand OR Polizei OR Feuerwehr OR Sperrung"
+filter = true
+required = []
+max_age_hours = 48
 
 # Hyper-local source: no filtering, all items are assumed to be in your district.
 [[sources]]

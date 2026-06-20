@@ -24,6 +24,14 @@ pub struct DwdActiveWarning {
     pub end_ms: i64,
 }
 
+#[derive(Debug, Clone)]
+pub struct NinaActiveWarning {
+    pub headline: String,
+    pub event_ids_json: String,
+    pub original_plain: String,
+    pub original_html: String,
+}
+
 /// A row from the items table, sufficient to format and post a digest.
 #[derive(Debug, Clone)]
 pub struct DbItem {
@@ -68,6 +76,9 @@ impl Db {
             "end_ms",
             "INTEGER NOT NULL DEFAULT 0",
         )?;
+        ensure_column(&conn, "nina_active_warnings", "event_ids_json", "TEXT")?;
+        ensure_column(&conn, "nina_active_warnings", "original_plain", "TEXT")?;
+        ensure_column(&conn, "nina_active_warnings", "original_html", "TEXT")?;
         Ok(Db(Arc::new(Mutex::new(conn))))
     }
 
@@ -287,6 +298,89 @@ impl Db {
             db.lock().unwrap().execute(
                 "INSERT OR IGNORE INTO alerts (id, source, sent_at) VALUES (?1, ?2, ?3)",
                 params![id, source, now],
+            )?;
+            Ok::<(), anyhow::Error>(())
+        })
+        .await?
+    }
+
+    // ── NINA active-warning tracking ──────────────────────────────────────────
+
+    pub async fn get_active_nina_warning(&self, id: &str) -> Result<Option<NinaActiveWarning>> {
+        let db = self.0.clone();
+        let id = id.to_owned();
+        tokio::task::spawn_blocking(move || {
+            let conn = db.lock().unwrap();
+            let mut stmt = conn.prepare(
+                "SELECT headline, event_ids_json, original_plain, original_html
+                 FROM nina_active_warnings
+                 WHERE id = ?1",
+            )?;
+            let mut rows = stmt.query(params![id])?;
+            let Some(row) = rows.next()? else {
+                return Ok::<Option<NinaActiveWarning>, anyhow::Error>(None);
+            };
+            Ok(Some(NinaActiveWarning {
+                headline: row.get(0)?,
+                event_ids_json: row.get(1)?,
+                original_plain: row.get(2)?,
+                original_html: row.get(3)?,
+            }))
+        })
+        .await?
+    }
+
+    pub async fn mark_nina_alert_posted(
+        &self,
+        id: &str,
+        headline: &str,
+        region: &str,
+        event_ids_json: &str,
+        original_plain: &str,
+        original_html: &str,
+    ) -> Result<()> {
+        let db = self.0.clone();
+        let id = id.to_owned();
+        let headline = headline.to_owned();
+        let region = region.to_owned();
+        let event_ids_json = event_ids_json.to_owned();
+        let original_plain = original_plain.to_owned();
+        let original_html = original_html.to_owned();
+        let now = chrono::Utc::now().timestamp();
+        tokio::task::spawn_blocking(move || {
+            db.lock().unwrap().execute(
+                "INSERT INTO nina_active_warnings
+                     (id, headline, region, seen_at, event_ids_json, original_plain, original_html)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                 ON CONFLICT(id) DO UPDATE SET
+                     headline       = excluded.headline,
+                     region         = excluded.region,
+                     seen_at        = excluded.seen_at,
+                     event_ids_json = excluded.event_ids_json,
+                     original_plain = excluded.original_plain,
+                     original_html  = excluded.original_html",
+                params![
+                    id,
+                    headline,
+                    region,
+                    now,
+                    event_ids_json,
+                    original_plain,
+                    original_html
+                ],
+            )?;
+            Ok::<(), anyhow::Error>(())
+        })
+        .await?
+    }
+
+    pub async fn mark_nina_allclear_sent(&self, id: &str) -> Result<()> {
+        let db = self.0.clone();
+        let id = id.to_owned();
+        tokio::task::spawn_blocking(move || {
+            db.lock().unwrap().execute(
+                "DELETE FROM nina_active_warnings WHERE id = ?1",
+                params![id],
             )?;
             Ok::<(), anyhow::Error>(())
         })
@@ -564,5 +658,14 @@ const SCHEMA: &str = "
         original_html  TEXT,
         start_ms       INTEGER NOT NULL DEFAULT 0,
         end_ms         INTEGER NOT NULL DEFAULT 0
+    );
+    CREATE TABLE IF NOT EXISTS nina_active_warnings (
+        id             TEXT    PRIMARY KEY,
+        headline       TEXT    NOT NULL,
+        region         TEXT    NOT NULL,
+        seen_at        INTEGER NOT NULL,
+        event_ids_json TEXT    NOT NULL,
+        original_plain TEXT    NOT NULL,
+        original_html  TEXT    NOT NULL
     );
 ";

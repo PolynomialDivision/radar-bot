@@ -70,8 +70,13 @@ pub async fn lookup_nina_ags(http: &reqwest::Client, ref_point: (f64, f64)) -> O
 
     info!("Looking up NINA AGS for '{city}'");
 
+    if let Some(ags) = known_nina_ags(city) {
+        info!("NINA AGS resolved from built-in mapping: {ags} ({city})");
+        return Some(ags.to_owned());
+    }
+
     let nina_url = format!(
-        "https://nina.api.bund.de/api31/completion/search?q={}",
+        "https://warnung.bund.de/api31/completion/search?q={}",
         crate::url_encode(city)
     );
     let body = tokio::time::timeout(Duration::from_secs(15), http.get(&nina_url).send())
@@ -86,6 +91,14 @@ pub async fn lookup_nina_ags(http: &reqwest::Client, ref_point: (f64, f64)) -> O
     let ags = results[0]["id"].as_str()?.to_owned();
     info!("NINA AGS resolved: {ags} ({city})");
     Some(ags)
+}
+
+fn known_nina_ags(city: &str) -> Option<&'static str> {
+    match city.trim().to_lowercase().as_str() {
+        // Berlin is a city-state; warnung.bund.de dashboard expects the 12-digit ARS.
+        "berlin" => Some("110000000000"),
+        _ => None,
+    }
 }
 
 // ── Main loop ─────────────────────────────────────────────────────────────────
@@ -148,7 +161,7 @@ pub async fn alert_loop(client: Client, http: reqwest::Client, db: Db, config: A
 // ── NINA/warnung.bund.de ──────────────────────────────────────────────────────
 
 async fn check_nina(client: &Client, http: &reqwest::Client, db: &Db, ags: &str) -> Result<()> {
-    let url = format!("https://nina.api.bund.de/api31/dashboard/{ags}");
+    let url = format!("https://warnung.bund.de/api31/dashboard/{ags}.json");
 
     let body = tokio::time::timeout(Duration::from_secs(15), http.get(&url).send())
         .await
@@ -168,20 +181,102 @@ async fn check_nina(client: &Client, http: &reqwest::Client, db: &Db, ags: &str)
         };
 
         let data = &w["payload"]["data"];
-        if data["msgType"].as_str() == Some("Cancel") {
-            continue;
-        }
-
         let headline = data["headline"].as_str().unwrap_or("Warnung");
         let alert_key = nina_alert_key(id, data);
         if db.is_alert_seen(&alert_key).await? {
+            continue;
+        }
+        let active_key = nina_active_key(id);
+
+        if data["msgType"].as_str() == Some("Cancel") {
+            match db.get_active_nina_warning(&active_key).await? {
+                Some(active) => {
+                    let (plain, html) =
+                        append_allclear_to_warning(&active.original_plain, &active.original_html);
+                    match edit_alert_message_in_rooms(client, &active.event_ids_json, &plain, &html)
+                        .await
+                    {
+                        DwdEditResult::Ok => {
+                            db.mark_nina_allclear_sent(&active_key).await?;
+                            db.mark_alert_seen(&alert_key, "nina").await?;
+                            info!("ALL-CLEAR sent [nina]: {}", active.headline);
+                        }
+                        DwdEditResult::MissingOriginal => {
+                            db.mark_nina_allclear_sent(&active_key).await?;
+                            db.mark_alert_seen(&alert_key, "nina").await?;
+                            info!(
+                                "ALL-CLEAR skipped [nina], original message is gone: {}",
+                                active.headline
+                            );
+                        }
+                        DwdEditResult::Failed => {
+                            warn!(
+                                "ALL-CLEAR send failed [nina], will retry next poll: {}",
+                                active.headline
+                            );
+                        }
+                    }
+                }
+                None => {
+                    db.mark_alert_seen(&alert_key, "nina").await?;
+                    info!("ALL-CLEAR skipped [nina], no active message found: {headline}");
+                }
+            }
             continue;
         }
 
         let desc = format_nina_description(data);
         let link = format!("https://warnung.bund.de/meldung/{id}");
         let (plain, html) = format_alert("NINA/warnung.bund.de", headline, &desc, Some(&link));
-        if crate::post_to_rooms(client, &plain, &html).await {
+
+        if let Some(active) = db.get_active_nina_warning(&active_key).await? {
+            match edit_alert_message_in_rooms(client, &active.event_ids_json, &plain, &html).await {
+                DwdEditResult::Ok => {
+                    db.mark_nina_alert_posted(
+                        &active_key,
+                        headline,
+                        &nina_region(data),
+                        &active.event_ids_json,
+                        &plain,
+                        &html,
+                    )
+                    .await?;
+                    db.mark_alert_seen(&alert_key, "nina").await?;
+                    info!("ALERT updated [nina]: {headline}");
+                }
+                DwdEditResult::MissingOriginal => {
+                    if post_nina_warning_to_rooms(
+                        client,
+                        db,
+                        &active_key,
+                        headline,
+                        &nina_region(data),
+                        &plain,
+                        &html,
+                    )
+                    .await?
+                    {
+                        db.mark_alert_seen(&alert_key, "nina").await?;
+                        info!("ALERT reposted [nina] after missing original: {headline}");
+                    } else {
+                        warn!("ALERT repost failed [nina], will retry next poll: {headline}");
+                    }
+                }
+                DwdEditResult::Failed => {
+                    warn!("ALERT update failed [nina], will retry next poll: {headline}");
+                }
+            }
+        } else if post_nina_warning_to_rooms(
+            client,
+            db,
+            &active_key,
+            headline,
+            &nina_region(data),
+            &plain,
+            &html,
+        )
+        .await?
+        {
             db.mark_alert_seen(&alert_key, "nina").await?;
             info!("ALERT sent [nina]: {headline}");
         } else {
@@ -190,6 +285,26 @@ async fn check_nina(client: &Client, http: &reqwest::Client, db: &Db, ags: &str)
     }
 
     Ok(())
+}
+
+fn nina_active_key(id: &str) -> String {
+    let Some((base, suffix)) = id.rsplit_once('-') else {
+        return id.to_owned();
+    };
+    if suffix.len() == 3 && suffix.chars().all(|c| c.is_ascii_digit()) {
+        base.to_owned()
+    } else {
+        id.to_owned()
+    }
+}
+
+fn nina_region(data: &serde_json::Value) -> String {
+    data["area"]
+        .as_array()
+        .and_then(|areas| areas.first())
+        .and_then(|area| area["areaDesc"].as_str())
+        .unwrap_or("Region unbekannt")
+        .to_owned()
 }
 
 fn nina_alert_key(id: &str, data: &serde_json::Value) -> String {
@@ -396,7 +511,8 @@ async fn check_dwd_weather_warnings(
                             &desc,
                             Some("https://www.dwd.de/DE/wetter/warnungen_gemeinden/warnWetter_node.html"),
                         );
-                        let edit_result = edit_dwd_warning_in_rooms(client, ids_json, &p, &h).await;
+                        let edit_result =
+                            edit_alert_message_in_rooms(client, ids_json, &p, &h).await;
                         (p, h, edit_result)
                     }
                     // No event IDs stored (pre-upgrade row): can't edit.
@@ -461,7 +577,8 @@ async fn check_dwd_weather_warnings(
                             "https://www.dwd.de/DE/wetter/warnungen_gemeinden/warnWetter_node.html",
                         ),
                     );
-                    match edit_dwd_warning_in_rooms(client, ids_json, &new_plain, &new_html).await {
+                    match edit_alert_message_in_rooms(client, ids_json, &new_plain, &new_html).await
+                    {
                         DwdEditResult::Ok => {
                             db.update_dwd_active_warning(
                                 &primary_id,
@@ -547,7 +664,8 @@ async fn check_dwd_weather_warnings(
                         primary.level,
                         event_key,
                     );
-                    match edit_dwd_warning_in_rooms(client, ids_json, &edit_plain, &edit_html).await
+                    match edit_alert_message_in_rooms(client, ids_json, &edit_plain, &edit_html)
+                        .await
                     {
                         DwdEditResult::Ok => {
                             // Store new_plain (without the footer) so future all-clear appends cleanly.
@@ -615,7 +733,7 @@ async fn check_dwd_weather_warnings(
                     // No event IDs (pre-upgrade row) — can't edit. Post fresh and
                     // clean up the stale row so no spurious all-clear fires.
                     let (all_ok, room_event_ids) =
-                        post_dwd_warning_to_rooms(client, &new_plain, &new_html).await;
+                        post_alert_to_rooms(client, &new_plain, &new_html).await;
                     if all_ok {
                         let ids_json = serde_json::to_string(&room_event_ids)
                             .unwrap_or_else(|_| String::from("{}"));
@@ -654,7 +772,7 @@ async fn check_dwd_weather_warnings(
                 &desc,
                 Some("https://www.dwd.de/DE/wetter/warnungen_gemeinden/warnWetter_node.html"),
             );
-            let (all_ok, room_event_ids) = post_dwd_warning_to_rooms(client, &plain, &html).await;
+            let (all_ok, room_event_ids) = post_alert_to_rooms(client, &plain, &html).await;
             if all_ok {
                 let ids_json =
                     serde_json::to_string(&room_event_ids).unwrap_or_else(|_| String::from("{}"));
@@ -700,7 +818,7 @@ async fn check_dwd_weather_warnings(
         ) {
             (Some(ids_json), Some(orig_plain), Some(orig_html)) => {
                 let (new_plain, new_html) = append_allclear_to_warning(orig_plain, orig_html);
-                edit_dwd_warning_in_rooms(client, ids_json, &new_plain, &new_html).await
+                edit_alert_message_in_rooms(client, ids_json, &new_plain, &new_html).await
             }
             _ => {
                 let (plain, html) = format_dwd_allclear(&prev.headline, &prev.region);
@@ -1345,7 +1463,7 @@ fn xml_tag(xml: &str, tag: &str) -> Option<String> {
 
 /// Returns `(all_ok, room_id_str → event_id_str)`.
 /// Collects event IDs from all rooms so they can be stored for future edits.
-async fn post_dwd_warning_to_rooms(
+async fn post_alert_to_rooms(
     client: &Client,
     plain: &str,
     html: &str,
@@ -1364,7 +1482,7 @@ async fn post_dwd_warning_to_rooms(
                 );
             }
             Err(e) => {
-                error!("Failed to post DWD warning to {}: {e}", room.room_id());
+                error!("Failed to post alert message to {}: {e}", room.room_id());
                 all_ok = false;
             }
         }
@@ -1385,7 +1503,7 @@ async fn repost_dwd_active_warning(
     plain: &str,
     html: &str,
 ) -> Result<bool> {
-    let (all_ok, room_event_ids) = post_dwd_warning_to_rooms(client, plain, html).await;
+    let (all_ok, room_event_ids) = post_alert_to_rooms(client, plain, html).await;
     if !all_ok {
         return Ok(false);
     }
@@ -1397,11 +1515,30 @@ async fn repost_dwd_active_warning(
     Ok(true)
 }
 
-/// Edit the original DWD warning message in each room to append the all-clear notice.
+async fn post_nina_warning_to_rooms(
+    client: &Client,
+    db: &Db,
+    id: &str,
+    headline: &str,
+    region: &str,
+    plain: &str,
+    html: &str,
+) -> Result<bool> {
+    let (all_ok, room_event_ids) = post_alert_to_rooms(client, plain, html).await;
+    if !all_ok {
+        return Ok(false);
+    }
+    let ids_json = serde_json::to_string(&room_event_ids).unwrap_or_else(|_| String::from("{}"));
+    db.mark_nina_alert_posted(id, headline, region, &ids_json, plain, html)
+        .await?;
+    Ok(true)
+}
+
+/// Edit the original alert message in each room.
 /// `event_ids_json` is a JSON object mapping room_id strings to event_id strings.
 /// Returns whether all edits succeeded, failed transiently, or likely targeted
 /// messages that are gone from the room.
-async fn edit_dwd_warning_in_rooms(
+async fn edit_alert_message_in_rooms(
     client: &Client,
     event_ids_json: &str,
     new_plain: &str,
@@ -1410,7 +1547,7 @@ async fn edit_dwd_warning_in_rooms(
     let map: HashMap<String, String> = match serde_json::from_str(event_ids_json) {
         Ok(m) => m,
         Err(e) => {
-            warn!("Could not parse DWD event_ids_json for edit: {e}");
+            warn!("Could not parse alert event_ids_json for edit: {e}");
             return DwdEditResult::Failed;
         }
     };
@@ -1425,7 +1562,7 @@ async fn edit_dwd_warning_in_rooms(
         let event_id = match event_id_str.parse::<OwnedEventId>() {
             Ok(id) => id,
             Err(e) => {
-                warn!("Invalid event ID {event_id_str} for DWD edit: {e}");
+                warn!("Invalid event ID {event_id_str} for alert edit: {e}");
                 all_ok = false;
                 continue;
             }
@@ -1433,7 +1570,7 @@ async fn edit_dwd_warning_in_rooms(
         let edited = RoomMessageEventContent::text_html(new_plain, new_html)
             .make_replacement(ReplacementMetadata::new(event_id, None));
         if let Err(e) = room.send(edited).await {
-            error!("Failed to edit DWD warning in {room_id}: {e}");
+            error!("Failed to edit alert message in {room_id}: {e}");
             all_ok = false;
             if looks_like_missing_matrix_event(&e.to_string()) {
                 missing_original = true;
@@ -1556,6 +1693,20 @@ fn alert_html_escape(s: &str) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn known_nina_ags_resolves_berlin_dashboard_key() {
+        assert_eq!(known_nina_ags("Berlin"), Some("110000000000"));
+    }
+
+    #[test]
+    fn nina_active_key_groups_versioned_messages() {
+        assert_eq!(
+            nina_active_key("mow.DE-BE-B-SE017-20260620-017-000"),
+            "mow.DE-BE-B-SE017-20260620-017"
+        );
+        assert_eq!(nina_active_key("custom-id"), "custom-id");
+    }
 
     #[test]
     fn dwd_description_is_structured_and_concise() {
