@@ -1,6 +1,6 @@
 use std::{
     collections::{HashMap, HashSet},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result};
@@ -22,6 +22,8 @@ enum DwdEditResult {
     MissingOriginal,
     Failed,
 }
+
+const DWD_ACTIVE_RECONCILE_INTERVAL: Duration = Duration::from_secs(60 * 60);
 
 pub struct AlertConfig {
     /// AGS resolved at startup from ref_point. None = outside Germany, skip NINA.
@@ -90,6 +92,7 @@ pub async fn lookup_nina_ags(http: &reqwest::Client, ref_point: (f64, f64)) -> O
 
 pub async fn alert_loop(client: Client, http: reqwest::Client, db: Db, config: AlertConfig) {
     let mut dwd_area_cache: HashMap<String, bool> = HashMap::new();
+    let mut last_dwd_reconcile: Option<Instant> = None;
 
     loop {
         if let Some(ref ags) = config.nina_ags {
@@ -98,6 +101,8 @@ pub async fn alert_loop(client: Client, http: reqwest::Client, db: Db, config: A
             }
         }
         if !config.dwd_region_keywords.is_empty() {
+            let reconcile_active_messages = last_dwd_reconcile
+                .map_or(true, |last| last.elapsed() >= DWD_ACTIVE_RECONCILE_INTERVAL);
             if let Err(e) = check_dwd_weather_warnings(
                 &client,
                 &http,
@@ -105,10 +110,13 @@ pub async fn alert_loop(client: Client, http: reqwest::Client, db: Db, config: A
                 &config.dwd_region_keywords,
                 config.ref_point,
                 &mut dwd_area_cache,
+                reconcile_active_messages,
             )
             .await
             {
                 warn!("DWD weather-warning check failed: {e:#}");
+            } else if reconcile_active_messages {
+                last_dwd_reconcile = Some(Instant::now());
             }
         }
         if let Err(e) = check_usgs(
@@ -229,6 +237,7 @@ async fn check_dwd_weather_warnings(
     region_keywords: &[String],
     ref_point: Option<(f64, f64)>,
     area_cache: &mut HashMap<String, bool>,
+    reconcile_active_messages: bool,
 ) -> Result<()> {
     let body = tokio::time::timeout(
         Duration::from_secs(15),
@@ -438,6 +447,64 @@ async fn check_dwd_weather_warnings(
                             "ALERT repost failed [dwd], will retry: {} ({region})",
                             primary.headline
                         );
+                    }
+                }
+            } else if reconcile_active_messages {
+                if let Some(ids_json) = active.event_ids_json.as_deref() {
+                    let desc =
+                        format_dwd_description_with_continuations(region, &primary.w, &cont_notes);
+                    let (new_plain, new_html) = format_alert(
+                        "DWD Weather Warnings",
+                        &primary.headline,
+                        &desc,
+                        Some(
+                            "https://www.dwd.de/DE/wetter/warnungen_gemeinden/warnWetter_node.html",
+                        ),
+                    );
+                    match edit_dwd_warning_in_rooms(client, ids_json, &new_plain, &new_html).await {
+                        DwdEditResult::Ok => {
+                            db.update_dwd_active_warning(
+                                &primary_id,
+                                primary.start_ms,
+                                primary.end_ms,
+                                Some(&new_plain),
+                                Some(&new_html),
+                            )
+                            .await?;
+                            info!("ALERT reconciled [dwd]: {} ({region})", primary.headline);
+                        }
+                        DwdEditResult::MissingOriginal => {
+                            if repost_dwd_active_warning(
+                                client,
+                                db,
+                                &primary_id,
+                                &primary.headline,
+                                region,
+                                event_key,
+                                primary.start_ms,
+                                primary.end_ms,
+                                &new_plain,
+                                &new_html,
+                            )
+                            .await?
+                            {
+                                info!(
+                                    "ALERT reposted [dwd] after missing original during reconcile: {} ({region})",
+                                    primary.headline
+                                );
+                            } else {
+                                warn!(
+                                    "ALERT reconcile repost failed [dwd], will retry: {} ({region})",
+                                    primary.headline
+                                );
+                            }
+                        }
+                        DwdEditResult::Failed => {
+                            warn!(
+                                "ALERT reconcile edit failed [dwd], will retry later: {} ({region})",
+                                primary.headline
+                            );
+                        }
                     }
                 }
             }

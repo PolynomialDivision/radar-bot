@@ -37,6 +37,13 @@ struct GeocodeHit {
 }
 
 type GeocodeCache = Arc<DashMap<String, Option<GeocodeHit>>>;
+
+#[derive(Debug, Clone)]
+enum DistanceLookup {
+    Found(f64, String),
+    NoMatch,
+    TransientFailure,
+}
 use serde::{Deserialize, Serialize};
 use tokio::{fs, task::JoinSet, time::sleep, time::Duration};
 use tracing::{error, info, warn};
@@ -1300,7 +1307,8 @@ const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(2);
 type NominatimLimiter = Arc<Semaphore>;
 
 /// Find the closest geocodable street mention in `text` to `(ref_lat, ref_lon)`.
-/// Returns `(distance_m, street_name)` or `None`. Results are cached to avoid repeat lookups.
+/// Transient lookup failures stay separate from "no geocodable street" so the
+/// caller can retry instead of permanently dropping a potentially relevant item.
 async fn find_nearest_distance(
     http: &reqwest::Client,
     title: &str,
@@ -1311,12 +1319,13 @@ async fn find_nearest_distance(
     city: &str,
     cache: &GeocodeCache,
     limiter: &NominatimLimiter,
-) -> Option<(f64, String)> {
+) -> DistanceLookup {
     let candidates = extract_street_evidence(title, description, article);
     if candidates.is_empty() {
-        return None;
+        return DistanceLookup::NoMatch;
     }
     let mut best: Option<(i32, f64, String)> = None;
+    let mut transient_failure = false;
 
     for evidence in candidates.into_iter().take(MAX_GEOCODE_CANDIDATES) {
         if evidence.confidence < 3 {
@@ -1347,6 +1356,7 @@ async fn find_nearest_distance(
                                 "geocode transient failure for {:?} — will retry next poll",
                                 candidate
                             );
+                            transient_failure = true;
                             None
                         }
                     }
@@ -1371,7 +1381,13 @@ async fn find_nearest_distance(
             }
         }
     }
-    best.map(|(_, dist, label)| (dist, label))
+    if let Some((_, dist, label)) = best {
+        DistanceLookup::Found(dist, label)
+    } else if transient_failure {
+        DistanceLookup::TransientFailure
+    } else {
+        DistanceLookup::NoMatch
+    }
 }
 
 // ── Filtering ─────────────────────────────────────────────────────────────────
@@ -1795,7 +1811,7 @@ async fn process_item(
         )
         .await
         {
-            Some((dist, ref label)) => {
+            DistanceLookup::Found(dist, ref label) => {
                 info!(
                     "  📍 [{}] {:?} → {} at {}",
                     source_name,
@@ -1806,9 +1822,15 @@ async fn process_item(
                 item.distance_meters = Some(dist);
                 Some((dist, label.clone()))
             }
-            None => {
+            DistanceLookup::NoMatch => {
                 info!("  no street geocoded [{}] {:?}", source_name, item.title);
                 None
+            }
+            DistanceLookup::TransientFailure => {
+                return ProcessOutcome::Retry {
+                    item,
+                    reason: "geocode transient failure before distance decision".to_owned(),
+                };
             }
         }
     } else {
