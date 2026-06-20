@@ -18,6 +18,7 @@ pub struct DbItem {
     pub score: i32,
     pub max_score: i32,
     pub distance_meters: Option<f64>,
+    pub location_label: Option<String>,
 }
 
 // ── Db handle ─────────────────────────────────────────────────────────────────
@@ -32,6 +33,7 @@ impl Db {
         // Wait up to 5 s instead of immediately returning SQLITE_BUSY.
         conn.pragma_update(None, "busy_timeout", 5_000i64)?;
         conn.execute_batch(SCHEMA).context("Failed to initialise DB schema")?;
+        ensure_column(&conn, "items", "location_label", "TEXT")?;
         Ok(Db(Arc::new(Mutex::new(conn))))
     }
 
@@ -63,14 +65,15 @@ impl Db {
         let score        = item.score;
         let max_score    = item.max_score;
         let distance_m   = item.distance_meters;
+        let location     = item.location_label.clone();
         let now          = chrono::Utc::now().timestamp();
 
         tokio::task::spawn_blocking(move || {
             db.lock().unwrap().execute(
                 "INSERT OR IGNORE INTO items
-                 (guid, source_name, title, link, score, max_score, distance_m, discovered_at, state)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'queued')",
-                params![guid, source_name, title, link, score, max_score, distance_m, now],
+                 (guid, source_name, title, link, score, max_score, distance_m, location_label, discovered_at, state)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'queued')",
+                params![guid, source_name, title, link, score, max_score, distance_m, location, now],
             )?;
             Ok::<(), anyhow::Error>(())
         })
@@ -126,7 +129,7 @@ impl Db {
             )?;
 
             let mut stmt = tx.prepare(
-                "SELECT guid, source_name, title, link, score, max_score, distance_m
+                "SELECT guid, source_name, title, link, score, max_score, distance_m, location_label
                  FROM items WHERE state = 'processing'
                  ORDER BY score DESC",
             )?;
@@ -139,6 +142,7 @@ impl Db {
                     score:           row.get(4)?,
                     max_score:       row.get(5)?,
                     distance_meters: row.get(6)?,
+                    location_label:  row.get(7)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -260,6 +264,20 @@ impl Db {
     }
 }
 
+fn ensure_column(conn: &Connection, table: &str, column: &str, definition: &str) -> Result<()> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let exists = stmt
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<rusqlite::Result<Vec<_>>>()?
+        .iter()
+        .any(|name| name == column);
+
+    if !exists {
+        conn.execute(&format!("ALTER TABLE {table} ADD COLUMN {column} {definition}"), [])?;
+    }
+    Ok(())
+}
+
 // ── Schema ────────────────────────────────────────────────────────────────────
 
 const SCHEMA: &str = "
@@ -271,6 +289,7 @@ const SCHEMA: &str = "
         score            INTEGER NOT NULL DEFAULT 0,
         max_score        INTEGER NOT NULL DEFAULT 0,
         distance_m       REAL,
+        location_label   TEXT,
         discovered_at    INTEGER NOT NULL,
         state            TEXT    NOT NULL DEFAULT 'queued'
                          CHECK(state IN ('queued','processing','posted','dropped')),

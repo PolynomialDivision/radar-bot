@@ -270,6 +270,9 @@ pub(crate) struct FeedItem {
     /// Distance in metres from the reference point (if geocoded).
     #[serde(default)]
     pub(crate) distance_meters: Option<f64>,
+    /// Human-readable place that produced the distance/fallback score.
+    #[serde(default)]
+    pub(crate) location_label: Option<String>,
     /// Unix timestamp from <pubDate> / <published> / <updated>. None if missing or unparseable.
     #[serde(default)]
     pub(crate) published_at: Option<i64>,
@@ -465,6 +468,7 @@ fn normalize_feed_entry(entry: feed_rs::model::Entry, source_name: &str) -> Opti
         score: 0,
         max_score: 0,
         distance_meters: None,
+        location_label: None,
         published_at,
     })
 }
@@ -556,6 +560,25 @@ mod feed_tests {
         assert_eq!(items[0].link.as_deref(), Some("https://example.test/atom/1"));
         assert_eq!(items[0].description.as_deref(), Some("Atom summary"));
         assert_eq!(items[0].published_at, Some(1_705_314_600));
+    }
+
+    #[test]
+    fn digest_includes_location_with_distance() {
+        let item = db::DbItem {
+            guid: "1".to_owned(),
+            source_name: "Local".to_owned(),
+            title: "Street closed".to_owned(),
+            link: None,
+            score: 4,
+            max_score: 5,
+            distance_meters: Some(350.0),
+            location_label: Some("Boxhagener Platz".to_owned()),
+        };
+
+        let (plain, html) = format_digest(&[item], "Test");
+
+        assert!(plain.contains("~350m · Boxhagener Platz"));
+        assert!(html.contains("~350m · Boxhagener Platz"));
     }
 }
 
@@ -871,7 +894,7 @@ fn normalize(s: &str) -> String {
 /// Returns `None` if the item should be dropped.
 /// Returns `Some((implied_meters, matched_terms))` where `implied_meters` is the
 /// closest matching area group's distance, or `None` if no area groups are configured.
-fn keyword_check(item: &FeedItem, filter: &FilterConfig, required: &[String]) -> Option<(Option<f64>, Vec<String>)> {
+fn keyword_check(item: &FeedItem, filter: &FilterConfig, required: &[String]) -> Option<(Option<(f64, String)>, Vec<String>)> {
     let text = normalize(&format!(
         "{} {} {}",
         item.title,
@@ -894,20 +917,20 @@ fn keyword_check(item: &FeedItem, filter: &FilterConfig, required: &[String]) ->
     }
 
     // Find the group with the smallest implied_meters (= closest = highest score)
-    let mut best_meters: Option<f64> = None;
+    let mut best: Option<(f64, String)> = None;
     let mut matched: Vec<String> = Vec::new();
 
     for group in &filter.area {
         if let Some(term) = group.terms.iter().find(|t| text.contains(&normalize(t))) {
             matched.push(format!("\"{}\" ({}m)", term, group.implied_meters as u32));
-            if best_meters.map_or(true, |d| group.implied_meters < d) {
-                best_meters = Some(group.implied_meters);
+            if best.as_ref().map_or(true, |(d, _)| group.implied_meters < *d) {
+                best = Some((group.implied_meters, term.clone()));
             }
         }
     }
 
     // No area match is not a hard drop — caller can fall back to source.base_implied_meters.
-    Some((best_meters, matched))
+    Some((best, matched))
 }
 
 
@@ -929,7 +952,12 @@ fn format_digest(items: &[db::DbItem], header: &str) -> (String, String) {
             info_parts.push(format!("{}/{}", item.score, item.max_score));
         }
         if let Some(d) = item.distance_meters {
-            info_parts.push(format_distance(d));
+            match item.location_label.as_deref() {
+                Some(label) if !label.trim().is_empty() => {
+                    info_parts.push(format!("{} · {}", format_distance(d), label.trim()));
+                }
+                _ => info_parts.push(format_distance(d)),
+            }
         }
         let info_plain = if info_parts.is_empty() { String::new() }
                          else { format!(" [{}]", info_parts.join(" ")) };
@@ -1000,19 +1028,30 @@ async fn process_item(
 
     // ── 1. Keyword check → implied distance ───────────────────────────────────
     let effective_required: &[String] = source.required.as_deref().unwrap_or(&filter.required);
-    let kw_implied: Option<f64> = if source.filter {
+    let kw_evidence: Option<(f64, String)> = if source.filter {
         match keyword_check(&item, &filter, effective_required) {
             None => {
                 tracing::debug!("DROP [{}] {:?}", source_name, item.title);
                 return (false, item);
             }
             Some((implied, matched)) => {
-                let implied = implied.or(source.base_implied_meters);
+                let implied = implied.or_else(|| {
+                    source.base_implied_meters.map(|meters| {
+                        let label = geocode_city
+                            .split(',')
+                            .next()
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty())
+                            .unwrap_or(&source_name)
+                            .to_owned();
+                        (meters, label)
+                    })
+                });
                 if !matched.is_empty() {
                     info!(
                         "PASS [{}] {:?} keyword_implied={:?}m terms=[{}]",
                         source_name, item.title,
-                        implied.map(|m| m as u32),
+                        implied.as_ref().map(|(m, _)| *m as u32),
                         matched.join(", ")
                     );
                 }
@@ -1020,12 +1059,12 @@ async fn process_item(
             }
         }
     } else {
-        source.base_implied_meters
+        source.base_implied_meters.map(|meters| (meters, source_name.clone()))
     };
 
     // ── 2. Geocode → actual distance ──────────────────────────────────────────
     // Actual distance and keyword-implied are combined by taking the closer result.
-    let geocoded_dist: Option<f64> = if let Some((ref_lat, ref_lon)) = ref_point {
+    let geocoded_evidence: Option<(f64, String)> = if let Some((ref_lat, ref_lon)) = ref_point {
         // If geocoding produces false positives from RSS footer boilerplate
         // (e.g. Polizei Berlin appends their HQ address to every description),
         // switch to article_text-only by uncommenting the two lines below and
@@ -1048,7 +1087,7 @@ async fn process_item(
             Some((dist, ref street)) => {
                 info!("  📍 [{}] {:?} → {} at {}", source_name, street, item.title, format_distance(dist));
                 item.distance_meters = Some(dist);
-                Some(dist)
+                Some((dist, street.clone()))
             }
             None => {
                 info!("  no street geocoded [{}] {:?}", source_name, item.title);
@@ -1060,12 +1099,15 @@ async fn process_item(
     };
 
     // ── 3. Final score ────────────────────────────────────────────────────────
-    let final_meters = match (geocoded_dist, kw_implied) {
-        (Some(d), Some(k)) => Some(d.min(k)),
-        (Some(d), None)    => Some(d),
-        (None,    Some(k)) => Some(k),
-        (None,    None)    => None,
+    let final_location = match (geocoded_evidence, kw_evidence) {
+        (Some((d, street)), Some((k, label))) => {
+            if d <= k { Some((d, street)) } else { Some((k, label)) }
+        }
+        (Some(v), None) => Some(v),
+        (None, Some(v)) => Some(v),
+        (None, None) => None,
     };
+    let final_meters = final_location.as_ref().map(|(meters, _)| *meters);
     let score = final_meters.map(distance_score).unwrap_or(0);
 
     if source.filter && score < filter.digest_threshold {
@@ -1076,6 +1118,8 @@ async fn process_item(
     info!("QUEUE [{}] {:?} score={}", source_name, item.title, score);
     item.score = score;
     item.max_score = 5;
+    item.distance_meters = final_meters;
+    item.location_label = final_location.map(|(_, label)| label);
     (true, item)
 }
 
