@@ -596,9 +596,10 @@ mod feed_tests {
 
     #[test]
     fn digest_includes_location_with_distance() {
-        let item = db::DbItem {
-            guid: "1".to_owned(),
+        let item = DigestItem {
+            guids: vec!["1".to_owned()],
             source_name: "Local".to_owned(),
+            source_count: 1,
             title: "Street closed".to_owned(),
             link: None,
             link_note: None,
@@ -612,6 +613,41 @@ mod feed_tests {
 
         assert!(plain.contains("~350m · Boxhagener Platz"));
         assert!(html.contains("~350m · Boxhagener Platz"));
+    }
+
+    #[test]
+    fn clustering_collapses_multi_source_same_incident_and_boosts_score() {
+        let a = db::DbItem {
+            guid: "a".to_owned(),
+            source_name: "Source A".to_owned(),
+            title: "Brand in der Rigaer Straße".to_owned(),
+            link: Some("https://a.test/1".to_owned()),
+            link_note: None,
+            score: 3,
+            max_score: 5,
+            distance_meters: Some(700.0),
+            location_label: Some("Rigaer Straße".to_owned()),
+        };
+        let b = db::DbItem {
+            guid: "b".to_owned(),
+            source_name: "Source B".to_owned(),
+            title: "Feuerwehreinsatz Rigaer Straße nach Brand".to_owned(),
+            link: Some("https://b.test/2".to_owned()),
+            link_note: None,
+            score: 3,
+            max_score: 5,
+            distance_meters: Some(730.0),
+            location_label: Some("Rigaer Straße".to_owned()),
+        };
+
+        let clustered = cluster_digest_items(vec![a, b]);
+
+        assert_eq!(clustered.len(), 1);
+        assert_eq!(clustered[0].guids, vec!["a", "b"]);
+        assert_eq!(clustered[0].source_count, 2);
+        assert_eq!(clustered[0].score, 4);
+        assert!(clustered[0].source_name.contains("Source A"));
+        assert!(clustered[0].source_name.contains("Source B"));
     }
 
     #[test]
@@ -1404,7 +1440,38 @@ fn keyword_check(
 
 // ── Message formatting ────────────────────────────────────────────────────────
 
-fn format_digest(items: &[db::DbItem], header: &str) -> (String, String) {
+#[derive(Debug, Clone)]
+struct DigestItem {
+    guids: Vec<String>,
+    source_name: String,
+    source_count: usize,
+    title: String,
+    link: Option<String>,
+    link_note: Option<String>,
+    score: i32,
+    max_score: i32,
+    distance_meters: Option<f64>,
+    location_label: Option<String>,
+}
+
+impl DigestItem {
+    fn from_db(item: db::DbItem) -> Self {
+        Self {
+            guids: vec![item.guid],
+            source_name: item.source_name,
+            source_count: 1,
+            title: item.title,
+            link: item.link,
+            link_note: item.link_note,
+            score: item.score,
+            max_score: item.max_score,
+            distance_meters: item.distance_meters,
+            location_label: item.location_label,
+        }
+    }
+}
+
+fn format_digest(items: &[DigestItem], header: &str) -> (String, String) {
     let mut plain = vec![format!("📡 {header}\n")];
     let mut html = vec![format!("📡 <strong>{}</strong><br>", html_escape(header))];
 
@@ -1414,6 +1481,9 @@ fn format_digest(items: &[db::DbItem], header: &str) -> (String, String) {
         let mut info_parts: Vec<String> = Vec::new();
         if item.max_score > 0 {
             info_parts.push(format!("{}/{}", item.score, item.max_score));
+        }
+        if item.source_count > 1 {
+            info_parts.push(format!("{} sources", item.source_count));
         }
         if let Some(d) = item.distance_meters {
             match item.location_label.as_deref() {
@@ -1469,6 +1539,105 @@ fn format_digest(items: &[db::DbItem], header: &str) -> (String, String) {
     let html_out = html.join("");
     let html_out = html_out.trim_end_matches("<br>").to_owned();
     (plain.join("\n").trim_end().to_owned(), html_out)
+}
+
+fn unique_source_names(names: &[String]) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for name in names {
+        if seen.insert(name.to_lowercase()) {
+            out.push(name.clone());
+        }
+    }
+    out
+}
+
+fn normalized_location_label(item: &db::DbItem) -> Option<String> {
+    item.location_label
+        .as_deref()
+        .map(normalize)
+        .map(|s| s.trim().to_owned())
+        .filter(|s| !s.is_empty())
+}
+
+fn locations_compatible(a: &db::DbItem, b: &db::DbItem) -> bool {
+    match (normalized_location_label(a), normalized_location_label(b)) {
+        (Some(la), Some(lb)) if la == lb => return true,
+        _ => {}
+    }
+
+    match (a.distance_meters, b.distance_meters) {
+        (Some(da), Some(db)) => (da - db).abs() <= 300.0,
+        _ => false,
+    }
+}
+
+fn title_overlap(a: &str, b: &str) -> usize {
+    let a_words: HashSet<String> = significant_words(a).into_iter().collect();
+    let b_words: HashSet<String> = significant_words(b).into_iter().collect();
+    a_words.intersection(&b_words).count()
+}
+
+fn likely_same_incident(item: &db::DbItem, cluster: &[db::DbItem]) -> bool {
+    cluster.iter().any(|other| {
+        let same_link = item.link.is_some() && item.link == other.link;
+        if same_link {
+            return true;
+        }
+        locations_compatible(item, other) && title_overlap(&item.title, &other.title) >= 2
+    })
+}
+
+fn cluster_digest_items(items: Vec<db::DbItem>) -> Vec<DigestItem> {
+    let mut sorted = items;
+    sorted.sort_by(|a, b| b.score.cmp(&a.score));
+
+    let mut clusters: Vec<Vec<db::DbItem>> = Vec::new();
+    for item in sorted {
+        if let Some(cluster) = clusters
+            .iter_mut()
+            .find(|cluster| likely_same_incident(&item, cluster))
+        {
+            cluster.push(item);
+        } else {
+            clusters.push(vec![item]);
+        }
+    }
+
+    clusters
+        .into_iter()
+        .map(|cluster| {
+            let mut iter = cluster.into_iter();
+            let first = iter.next().expect("cluster is never empty");
+            let mut digest = DigestItem::from_db(first.clone());
+            let mut source_names = vec![first.source_name.clone()];
+            let mut best_score = digest.score;
+
+            for item in iter {
+                digest.guids.push(item.guid.clone());
+                source_names.push(item.source_name.clone());
+                if item.score > best_score {
+                    best_score = item.score;
+                    digest.title = item.title.clone();
+                    digest.link = item.link.clone();
+                    digest.link_note = item.link_note.clone();
+                    digest.distance_meters = item.distance_meters;
+                    digest.location_label = item.location_label.clone();
+                    digest.max_score = item.max_score;
+                }
+            }
+
+            let unique_sources = unique_source_names(&source_names);
+            digest.source_count = unique_sources.len();
+            digest.source_name = unique_sources.join(" + ");
+            digest.score = if digest.source_count > 1 {
+                (best_score + 1).min(5)
+            } else {
+                best_score
+            };
+            digest
+        })
+        .collect()
 }
 
 // ── Posting ───────────────────────────────────────────────────────────────────
@@ -1882,18 +2051,19 @@ const MAX_DIGEST_BYTES: usize = 8_000;
 const MAX_DIGEST_ITEMS: usize = 15;
 
 /// Sort by score descending then split into chunks under size and item-count limits.
-fn chunk_digest(items: &[db::DbItem]) -> Vec<Vec<db::DbItem>> {
+fn chunk_digest(items: &[DigestItem]) -> Vec<Vec<DigestItem>> {
     let mut sorted = items.to_vec();
     sorted.sort_by(|a, b| b.score.cmp(&a.score));
 
-    let mut chunks: Vec<Vec<db::DbItem>> = Vec::new();
-    let mut current: Vec<db::DbItem> = Vec::new();
+    let mut chunks: Vec<Vec<DigestItem>> = Vec::new();
+    let mut current: Vec<DigestItem> = Vec::new();
     let mut current_bytes: usize = 0;
 
     for item in sorted {
         let item_bytes = item.title.len()
             + item.source_name.len()
             + item.link.as_deref().map_or(0, |l| l.len())
+            + item.source_count * 8
             + 50;
         let would_overflow =
             current_bytes + item_bytes > MAX_DIGEST_BYTES || current.len() >= MAX_DIGEST_ITEMS;
@@ -1961,8 +2131,12 @@ async fn digest_loop(client: Client, digest_times: Vec<String>, db: Db, min_scor
 
         let day_str = Local::now().format("%A, %d %b %Y").to_string();
         let header = format!("Digest — {day_str}");
-        info!("Posting digest with {} item(s)", items.len());
-        let chunks = chunk_digest(&items);
+        let clustered_items = cluster_digest_items(items);
+        info!(
+            "Posting digest with {} clustered item(s)",
+            clustered_items.len()
+        );
+        let chunks = chunk_digest(&clustered_items);
         let total = chunks.len();
         for (i, chunk) in chunks.into_iter().enumerate() {
             let chunk_header = if total > 1 {
@@ -1971,7 +2145,10 @@ async fn digest_loop(client: Client, digest_times: Vec<String>, db: Db, min_scor
                 header.clone()
             };
             let (plain, html) = format_digest(&chunk, &chunk_header);
-            let guids: Vec<String> = chunk.iter().map(|it| it.guid.clone()).collect();
+            let guids: Vec<String> = chunk
+                .iter()
+                .flat_map(|it| it.guids.iter().cloned())
+                .collect();
             if post_to_rooms(&client, &plain, &html).await {
                 if let Err(e) = db.mark_posted(&guids).await {
                     error!("Digest: failed to mark items posted: {e}");
@@ -2319,7 +2496,8 @@ async fn main() -> Result<()> {
                 .await
                 .unwrap_or_default();
             if !items.is_empty() {
-                let chunks = chunk_digest(&items);
+                let clustered_items = cluster_digest_items(items);
+                let chunks = chunk_digest(&clustered_items);
                 let total = chunks.len();
                 for (i, chunk) in chunks.into_iter().enumerate() {
                     let header = if total > 1 {
