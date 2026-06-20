@@ -134,28 +134,27 @@ async fn check_nina(client: &Client, http: &reqwest::Client, db: &Db, ags: &str)
             None => continue,
         };
 
-        if db.is_alert_seen(id).await? {
-            continue;
-        }
-
         let data = &w["payload"]["data"];
         if data["msgType"].as_str() == Some("Cancel") {
             continue;
         }
 
         let headline = data["headline"].as_str().unwrap_or("Warnung");
-        let severity = data["severity"].as_str();
-        let desc: String = data["description"]
-            .as_str()
-            .unwrap_or("")
-            .trim()
-            .chars()
-            .take(400)
-            .collect();
+        let alert_key = nina_alert_key(id, data);
+        if db.is_alert_seen(&alert_key).await? {
+            continue;
+        }
 
-        let (plain, html) = format_alert("NINA/warnung.bund.de", headline, severity, &desc, None);
+        let desc = format_nina_description(data);
+        let link = format!("https://warnung.bund.de/meldung/{id}");
+        let (plain, html) = format_alert(
+            "NINA/warnung.bund.de",
+            headline,
+            &desc,
+            Some(&link),
+        );
         if crate::post_to_rooms(client, &plain, &html).await {
-            db.mark_alert_seen(id, "nina").await?;
+            db.mark_alert_seen(&alert_key, "nina").await?;
             info!("ALERT sent [nina]: {headline}");
         } else {
             warn!("ALERT post failed [nina], will retry next poll: {headline}");
@@ -163,6 +162,40 @@ async fn check_nina(client: &Client, http: &reqwest::Client, db: &Db, ags: &str)
     }
 
     Ok(())
+}
+
+fn nina_alert_key(id: &str, data: &serde_json::Value) -> String {
+    let sent = data["sent"].as_str().unwrap_or("");
+    let effective = data["effective"].as_str().unwrap_or("");
+    let expires = data["expires"].as_str().unwrap_or("");
+    let severity = data["severity"].as_str().unwrap_or("");
+    format!("nina:{id}:{sent}:{effective}:{expires}:{severity}")
+}
+
+fn format_nina_description(data: &serde_json::Value) -> String {
+    let mut lines = Vec::new();
+
+    if let Some(area) = data["area"]
+        .as_array()
+        .and_then(|areas| areas.first())
+        .and_then(|area| area["areaDesc"].as_str())
+    {
+        lines.push(format!("📍 {area}"));
+    }
+
+    if let Some(valid) = format_rfc3339_validity(data["effective"].as_str(), data["expires"].as_str()) {
+        lines.push(format!("🕒 {valid}"));
+    }
+
+    if let Some(details) = concise_sentences(data["description"].as_str().unwrap_or(""), 2) {
+        lines.push(format!("ℹ️ {details}"));
+    }
+
+    if let Some(advice) = concise_sentences(data["instruction"].as_str().unwrap_or(""), 2) {
+        lines.push(format!("✅ {advice}"));
+    }
+
+    lines.join("\n")
 }
 
 // ── DWD weather warnings ─────────────────────────────────────────────────────
@@ -223,7 +256,6 @@ async fn check_dwd_weather_warnings(
                 let (plain, html) = format_alert(
                     "DWD Weather Warnings",
                     headline,
-                    None,
                     &desc,
                     Some("https://www.dwd.de/DE/wetter/warnungen_gemeinden/warnWetter_node.html"),
                 );
@@ -273,15 +305,15 @@ fn format_dwd_description(region: &str, w: &serde_json::Value) -> String {
     let description = w["description"].as_str().unwrap_or("").trim();
     let instruction = w["instruction"].as_str().unwrap_or("").trim();
 
-    let mut parts = vec![format!("Region: {region}")];
+    let mut parts = vec![format!("📍 {region}")];
     if let Some(valid) = format_dwd_validity(w) {
-        parts.push(format!("Valid: {valid}"));
+        parts.push(format!("🕒 {valid}"));
     }
     if let Some(details) = concise_sentences(description, 2) {
-        parts.push(format!("Details: {details}"));
+        parts.push(format!("ℹ️ {details}"));
     }
     if let Some(advice) = concise_sentences(instruction, 1) {
-        parts.push(format!("Advice: {advice}"));
+        parts.push(format!("✅ {advice}"));
     }
     parts.join("\n")
 }
@@ -305,6 +337,79 @@ fn format_dwd_validity(w: &serde_json::Value) -> Option<String> {
             end.format("%a, %d %b %H:%M")
         ))
     }
+}
+
+fn format_rfc3339_validity(start: Option<&str>, end: Option<&str>) -> Option<String> {
+    let start = start
+        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+        .map(|dt| dt.with_timezone(&chrono::Local));
+    let end = end
+        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+        .map(|dt| dt.with_timezone(&chrono::Local));
+
+    match (start, end) {
+        (Some(start), Some(end)) if start.date_naive() == end.date_naive() => Some(format!(
+            "{}-{}",
+            start.format("%a, %d %b %H:%M"),
+            end.format("%H:%M")
+        )),
+        (Some(start), Some(end)) => Some(format!(
+            "{} - {}",
+            start.format("%a, %d %b %H:%M"),
+            end.format("%a, %d %b %H:%M")
+        )),
+        (Some(start), None) => Some(format!("from {}", start.format("%a, %d %b %H:%M"))),
+        (None, Some(end)) => Some(format!("until {}", end.format("%a, %d %b %H:%M"))),
+        (None, None) => None,
+    }
+}
+
+fn format_usgs_description(f: &serde_json::Value) -> String {
+    let props = &f["properties"];
+    let mut lines = Vec::new();
+
+    if let Some(place) = props["place"].as_str().filter(|s| !s.trim().is_empty()) {
+        lines.push(format!("📍 {place}"));
+    }
+
+    if let Some(time_ms) = props["time"].as_i64() {
+        if let Some(dt) = chrono::DateTime::from_timestamp_millis(time_ms) {
+            let local = dt.with_timezone(&chrono::Local);
+            lines.push(format!("🕒 {}", local.format("%a, %d %b %H:%M")));
+        }
+    }
+
+    let mut detail = Vec::new();
+    if let Some(mag) = props["mag"].as_f64() {
+        detail.push(format!("Magnitude {mag:.1}"));
+    }
+    if let Some(alert) = props["alert"].as_str().filter(|s| !s.trim().is_empty()) {
+        detail.push(format!("USGS alert: {alert}"));
+    }
+    if !detail.is_empty() {
+        lines.push(format!("ℹ️ {}", detail.join(" · ")));
+    }
+
+    lines.join("\n")
+}
+
+fn format_gdacs_description(item: &crate::FeedItem, coords: Option<(f64, f64)>) -> String {
+    let mut lines = Vec::new();
+
+    if let Some((lat, lon)) = coords {
+        lines.push(format!("📍 {:.2}, {:.2}", lat, lon));
+    }
+    if let Some(ts) = item.published_at {
+        if let Some(dt) = chrono::DateTime::from_timestamp(ts, 0) {
+            let local = dt.with_timezone(&chrono::Local);
+            lines.push(format!("🕒 {}", local.format("%a, %d %b %H:%M")));
+        }
+    }
+    if let Some(details) = concise_sentences(item.description.as_deref().unwrap_or(""), 2) {
+        lines.push(format!("ℹ️ {details}"));
+    }
+
+    lines.join("\n")
 }
 
 fn concise_sentences(text: &str, max_sentences: usize) -> Option<String> {
@@ -396,21 +501,11 @@ async fn check_usgs(
 
         let props = &f["properties"];
         let title = props["title"].as_str().unwrap_or("Earthquake");
-        let place = props["place"].as_str().unwrap_or("");
-        let mag = props["mag"]
-            .as_f64()
-            .map(|m| format!("M{m:.1}"))
-            .unwrap_or_default();
-        let alert = props["alert"].as_str(); // "green","yellow","orange","red"
         let url = props["url"].as_str();
 
-        let desc = if place.is_empty() {
-            mag.clone()
-        } else {
-            format!("{mag} — {place}")
-        };
+        let desc = format_usgs_description(f);
 
-        let (plain, html) = format_alert("USGS Earthquakes", title, alert, &desc, url);
+        let (plain, html) = format_alert("USGS Earthquakes", title, &desc, url);
         if crate::post_to_rooms(client, &plain, &html).await {
             db.mark_alert_seen(id, "usgs").await?;
             info!("ALERT sent [usgs]: {title}");
@@ -469,15 +564,8 @@ async fn check_gdacs(
             continue;
         }
 
-        let desc: String = item
-            .description
-            .as_deref()
-            .unwrap_or("")
-            .trim()
-            .chars()
-            .take(300)
-            .collect();
-        let (plain, html) = format_alert("GDACS", &item.title, None, &desc, item.link.as_deref());
+        let desc = format_gdacs_description(&item, coords.get(&item.guid).copied());
+        let (plain, html) = format_alert("GDACS", &item.title, &desc, item.link.as_deref());
         if crate::post_to_rooms(client, &plain, &html).await {
             db.mark_alert_seen(&item.guid, "gdacs").await?;
             info!("ALERT sent [gdacs]: {}", item.title);
@@ -530,25 +618,23 @@ fn haversine_km(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
 fn format_alert(
     source: &str,
     event: &str,
-    severity: Option<&str>,
     description: &str,
     link: Option<&str>,
 ) -> (String, String) {
-    let sev = severity.map(|s| format!(" [{s}]")).unwrap_or_default();
-    let link_plain = link.map(|l| format!("\n{l}")).unwrap_or_default();
+    let link_plain = link.map(|l| format!("\n🔗 {l}")).unwrap_or_default();
     let link_html = link
         .map(|l| {
             let escaped = alert_html_escape(l);
-            format!("<br><a href=\"{escaped}\">{escaped}</a>")
+            format!("<br>🔗 <a href=\"{escaped}\">{escaped}</a>")
         })
         .unwrap_or_default();
     let event_html = alert_html_escape(event);
     let description_html = alert_html_escape(description).replace('\n', "<br>");
     let source_html = alert_html_escape(source);
 
-    let plain = format!("EMERGENCY{sev}: {event}\n{description}{link_plain}\nSource: {source}");
+    let plain = format!("🚨 {event}\n{description}{link_plain}\nSource: {source}");
     let html = format!(
-        "<b>🚨 EMERGENCY{sev}: {event_html}</b><br>{description_html}{link_html}<br><em>Source: {source_html}</em>"
+        "<b>🚨 {event_html}</b><br>{description_html}{link_html}<br><em>Source: {source_html}</em>"
     );
     (plain, html)
 }
@@ -576,10 +662,10 @@ mod tests {
 
         let desc = format_dwd_description("Berlin", &warning);
 
-        assert!(desc.contains("Region: Berlin"));
-        assert!(desc.contains("Valid:"));
-        assert!(desc.contains("Details: Am Samstag wird eine extreme Wärmebelastung erwartet."));
-        assert!(desc.contains("Advice: Hitzebelastung kann für den menschlichen Körper gefährlich werden."));
+        assert!(desc.contains("📍 Berlin"));
+        assert!(desc.contains("🕒"));
+        assert!(desc.contains("ℹ️ Am Samstag wird eine extreme Wärmebelastung erwartet."));
+        assert!(desc.contains("✅ Hitzebelastung kann für den menschlichen Körper gefährlich werden."));
         assert!(!desc.contains("Noch ein Satz"));
     }
 
@@ -588,14 +674,32 @@ mod tests {
         let (plain, html) = format_alert(
             "DWD Weather Warnings",
             "Amtliche WARNUNG vor HITZE",
-            None,
-            "Region: Berlin\nAdvice: Drink water",
+            "📍 Berlin\n✅ Drink water",
             Some("https://www.dwd.de/"),
         );
 
-        assert!(plain.contains("Region: Berlin\nAdvice: Drink water\nhttps://www.dwd.de/"));
-        assert!(html.contains("Region: Berlin<br>Advice: Drink water"));
-        assert!(html.contains("<a href=\"https://www.dwd.de/\">https://www.dwd.de/</a>"));
+        assert!(plain.contains("🚨 Amtliche WARNUNG vor HITZE"));
+        assert!(plain.contains("📍 Berlin\n✅ Drink water\n🔗 https://www.dwd.de/"));
+        assert!(html.contains("📍 Berlin<br>✅ Drink water"));
+        assert!(html.contains("🔗 <a href=\"https://www.dwd.de/\">https://www.dwd.de/</a>"));
         assert!(!html.contains("DWD level"));
+    }
+
+    #[test]
+    fn nina_key_changes_when_warning_is_updated() {
+        let first = json!({
+            "sent": "2026-06-20T10:00:00+02:00",
+            "effective": "2026-06-20T11:00:00+02:00",
+            "expires": "2026-06-20T19:00:00+02:00",
+            "severity": "Severe"
+        });
+        let updated = json!({
+            "sent": "2026-06-20T12:00:00+02:00",
+            "effective": "2026-06-20T11:00:00+02:00",
+            "expires": "2026-06-20T20:00:00+02:00",
+            "severity": "Severe"
+        });
+
+        assert_ne!(nina_alert_key("warn-1", &first), nina_alert_key("warn-1", &updated));
     }
 }
