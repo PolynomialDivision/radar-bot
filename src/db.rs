@@ -8,6 +8,19 @@ use crate::FeedItem;
 
 // ── Public types ──────────────────────────────────────────────────────────────
 
+/// A DWD warning that was posted and is currently tracked as active.
+#[derive(Debug, Clone)]
+pub struct DwdActiveWarning {
+    pub id: String,
+    pub headline: String,
+    pub region: String,
+    /// JSON-encoded map of room_id → event_id for the original warning posts.
+    /// None when event IDs were not recorded (e.g. first run after upgrade).
+    pub event_ids_json: Option<String>,
+    pub original_plain: Option<String>,
+    pub original_html: Option<String>,
+}
+
 /// A row from the items table, sufficient to format and post a digest.
 #[derive(Debug, Clone)]
 pub struct DbItem {
@@ -37,6 +50,9 @@ impl Db {
             .context("Failed to initialise DB schema")?;
         ensure_column(&conn, "items", "location_label", "TEXT")?;
         ensure_column(&conn, "items", "link_note", "TEXT")?;
+        ensure_column(&conn, "dwd_active_warnings", "event_ids_json", "TEXT")?;
+        ensure_column(&conn, "dwd_active_warnings", "original_plain", "TEXT")?;
+        ensure_column(&conn, "dwd_active_warnings", "original_html", "TEXT")?;
         Ok(Db(Arc::new(Mutex::new(conn))))
     }
 
@@ -262,6 +278,90 @@ impl Db {
         .await?
     }
 
+    // ── DWD active-warning tracking ───────────────────────────────────────────
+
+    pub async fn list_active_dwd_warnings(&self) -> Result<Vec<DwdActiveWarning>> {
+        let db = self.0.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = db.lock().unwrap();
+            let mut stmt = conn.prepare(
+                "SELECT id, headline, region, event_ids_json, original_plain, original_html
+                 FROM dwd_active_warnings",
+            )?;
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok(DwdActiveWarning {
+                        id: row.get(0)?,
+                        headline: row.get(1)?,
+                        region: row.get(2)?,
+                        event_ids_json: row.get(3)?,
+                        original_plain: row.get(4)?,
+                        original_html: row.get(5)?,
+                    })
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok::<Vec<DwdActiveWarning>, anyhow::Error>(rows)
+        })
+        .await?
+    }
+
+    /// Upsert a currently-active DWD warning.
+    ///
+    /// `event_ids_json` and `original_*` are only written when `Some`; existing
+    /// values are preserved via COALESCE so a "heartbeat" upsert without new post
+    /// data does not overwrite previously stored event IDs.
+    pub async fn upsert_dwd_active_warning(
+        &self,
+        id: &str,
+        headline: &str,
+        region: &str,
+        event: &str,
+        event_ids_json: Option<&str>,
+        original_plain: Option<&str>,
+        original_html: Option<&str>,
+    ) -> Result<()> {
+        let db = self.0.clone();
+        let id = id.to_owned();
+        let headline = headline.to_owned();
+        let region = region.to_owned();
+        let event = event.to_owned();
+        let event_ids_json = event_ids_json.map(str::to_owned);
+        let original_plain = original_plain.map(str::to_owned);
+        let original_html = original_html.map(str::to_owned);
+        let now = chrono::Utc::now().timestamp();
+        tokio::task::spawn_blocking(move || {
+            db.lock().unwrap().execute(
+                "INSERT INTO dwd_active_warnings
+                     (id, headline, region, event, seen_at, event_ids_json, original_plain, original_html)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                 ON CONFLICT(id) DO UPDATE SET
+                     headline       = excluded.headline,
+                     region         = excluded.region,
+                     event          = excluded.event,
+                     seen_at        = excluded.seen_at,
+                     event_ids_json = COALESCE(excluded.event_ids_json, dwd_active_warnings.event_ids_json),
+                     original_plain = COALESCE(excluded.original_plain, dwd_active_warnings.original_plain),
+                     original_html  = COALESCE(excluded.original_html,  dwd_active_warnings.original_html)",
+                params![id, headline, region, event, now, event_ids_json, original_plain, original_html],
+            )?;
+            Ok::<(), anyhow::Error>(())
+        })
+        .await?
+    }
+
+    pub async fn remove_dwd_active_warning(&self, id: &str) -> Result<()> {
+        let db = self.0.clone();
+        let id = id.to_owned();
+        tokio::task::spawn_blocking(move || {
+            db.lock().unwrap().execute(
+                "DELETE FROM dwd_active_warnings WHERE id = ?1",
+                params![id],
+            )?;
+            Ok::<(), anyhow::Error>(())
+        })
+        .await?
+    }
+
     // ── Maintenance ───────────────────────────────────────────────────────────
 
     /// Delete posted/dropped items older than keep_days. Returns rows deleted.
@@ -326,5 +426,15 @@ const SCHEMA: &str = "
         id       TEXT    PRIMARY KEY,
         source   TEXT    NOT NULL,
         sent_at  INTEGER NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS dwd_active_warnings (
+        id             TEXT    PRIMARY KEY,
+        headline       TEXT    NOT NULL,
+        region         TEXT    NOT NULL,
+        event          TEXT    NOT NULL,
+        seen_at        INTEGER NOT NULL,
+        event_ids_json TEXT,
+        original_plain TEXT,
+        original_html  TEXT
     );
 ";

@@ -1,9 +1,18 @@
-use std::{collections::HashMap, time::Duration};
+use std::{
+    collections::{HashMap, HashSet},
+    time::Duration,
+};
 
 use anyhow::{Context, Result};
-use matrix_sdk::Client;
+use matrix_sdk::{
+    ruma::{
+        events::room::message::{ReplacementMetadata, RoomMessageEventContent},
+        OwnedEventId,
+    },
+    Client,
+};
 use tokio::time::sleep;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 use crate::db::Db;
 
@@ -229,6 +238,11 @@ async fn check_dwd_weather_warnings(
     let json = parse_dwd_jsonp(&body).context("DWD warnings JSON parse failed")?;
     let now_ms = chrono::Utc::now().timestamp_millis();
 
+    // Collect all warning IDs that are currently valid (pass region, time, geometry filters).
+    // We upsert every passing warning into dwd_active_warnings so that on the next poll
+    // we can detect which ones have disappeared.
+    let mut current_active: HashSet<String> = HashSet::new();
+
     for bucket in ["warnings", "vorabInformation"] {
         let Some(regions) = json[bucket].as_object() else {
             continue;
@@ -264,27 +278,90 @@ async fn check_dwd_weather_warnings(
                     .as_str()
                     .or_else(|| w["headline"].as_str())
                     .unwrap_or("Wetterwarnung");
+                let headline = w["headline"].as_str().unwrap_or(event);
                 let id = dwd_warning_id(bucket, region, w);
+
+                // Heartbeat upsert: mark as currently active on every poll.
+                // Event IDs / original content are left intact via COALESCE.
+                current_active.insert(id.clone());
+                db.upsert_dwd_active_warning(&id, headline, region, event, None, None, None).await?;
+
                 if db.is_alert_seen(&id).await? {
                     continue;
                 }
 
-                let headline = w["headline"].as_str().unwrap_or(event);
                 let desc = format_dwd_description(region, w);
-
                 let (plain, html) = format_alert(
                     "DWD Weather Warnings",
                     headline,
                     &desc,
                     Some("https://www.dwd.de/DE/wetter/warnungen_gemeinden/warnWetter_node.html"),
                 );
-                if crate::post_to_rooms(client, &plain, &html).await {
+                let (all_ok, room_event_ids) =
+                    post_dwd_warning_to_rooms(client, &plain, &html).await;
+                if all_ok {
                     db.mark_alert_seen(&id, "dwd").await?;
+                    // Store event IDs and original content so the all-clear can edit
+                    // the original messages rather than posting a new one.
+                    let ids_json = serde_json::to_string(&room_event_ids)
+                        .unwrap_or_else(|_| String::from("{}"));
+                    db.upsert_dwd_active_warning(
+                        &id,
+                        headline,
+                        region,
+                        event,
+                        Some(&ids_json),
+                        Some(&plain),
+                        Some(&html),
+                    )
+                    .await?;
                     info!("ALERT sent [dwd]: {headline} ({region})");
                 } else {
                     warn!("ALERT post failed [dwd], will retry next poll: {headline} ({region})");
                 }
             }
+        }
+    }
+
+    // Resolve warnings no longer in the DWD feed or no longer valid.
+    // Prefer editing the original message so no extra timeline entry appears.
+    // Falls back to a standalone message when event IDs were not stored.
+    let previously_active = db.list_active_dwd_warnings().await?;
+    for prev in previously_active {
+        if current_active.contains(&prev.id) {
+            continue;
+        }
+        let clear_key = format!("dwd_clear:{}", prev.id);
+        if !db.is_alert_seen(&clear_key).await? {
+            let sent = match (
+                prev.event_ids_json.as_deref(),
+                prev.original_plain.as_deref(),
+                prev.original_html.as_deref(),
+            ) {
+                (Some(ids_json), Some(orig_plain), Some(orig_html)) => {
+                    let (new_plain, new_html) =
+                        append_allclear_to_warning(orig_plain, orig_html);
+                    edit_dwd_warning_in_rooms(client, ids_json, &new_plain, &new_html).await
+                }
+                _ => {
+                    // No event IDs stored — fall back to a standalone all-clear message.
+                    let (plain, html) = format_dwd_allclear(&prev.headline, &prev.region);
+                    crate::post_to_rooms(client, &plain, &html).await
+                }
+            };
+            if sent {
+                db.mark_alert_seen(&clear_key, "dwd_clear").await?;
+                db.remove_dwd_active_warning(&prev.id).await?;
+                info!("ALL-CLEAR sent [dwd]: {} ({})", prev.headline, prev.region);
+            } else {
+                warn!(
+                    "ALL-CLEAR send failed [dwd], will retry next poll: {} ({})",
+                    prev.headline, prev.region
+                );
+            }
+        } else {
+            // All-clear already sent in a previous run; just clean up the active row.
+            db.remove_dwd_active_warning(&prev.id).await?;
         }
     }
 
@@ -765,6 +842,95 @@ fn xml_tag(xml: &str, tag: &str) -> Option<String> {
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
+/// Returns `(all_ok, room_id_str → event_id_str)`.
+/// Collects event IDs from all rooms so they can be stored for future edits.
+async fn post_dwd_warning_to_rooms(
+    client: &Client,
+    plain: &str,
+    html: &str,
+) -> (bool, HashMap<String, String>) {
+    let mut event_ids: HashMap<String, String> = HashMap::new();
+    let mut all_ok = true;
+    for room in client.joined_rooms() {
+        match room.send(RoomMessageEventContent::text_html(plain, html)).await {
+            Ok(resp) => {
+                event_ids.insert(room.room_id().to_string(), resp.response.event_id.to_string());
+            }
+            Err(e) => {
+                error!("Failed to post DWD warning to {}: {e}", room.room_id());
+                all_ok = false;
+            }
+        }
+    }
+    (all_ok, event_ids)
+}
+
+/// Edit the original DWD warning message in each room to append the all-clear notice.
+/// `event_ids_json` is a JSON object mapping room_id strings to event_id strings.
+/// Returns true if all edits succeeded.
+async fn edit_dwd_warning_in_rooms(
+    client: &Client,
+    event_ids_json: &str,
+    new_plain: &str,
+    new_html: &str,
+) -> bool {
+    let map: HashMap<String, String> = match serde_json::from_str(event_ids_json) {
+        Ok(m) => m,
+        Err(e) => {
+            warn!("Could not parse DWD event_ids_json for edit: {e}");
+            return false;
+        }
+    };
+
+    let mut all_ok = true;
+    for room in client.joined_rooms() {
+        let room_id = room.room_id().to_string();
+        let Some(event_id_str) = map.get(&room_id) else {
+            continue;
+        };
+        let event_id = match event_id_str.parse::<OwnedEventId>() {
+            Ok(id) => id,
+            Err(e) => {
+                warn!("Invalid event ID {event_id_str} for DWD edit: {e}");
+                all_ok = false;
+                continue;
+            }
+        };
+        let edited = RoomMessageEventContent::text_html(new_plain, new_html)
+            .make_replacement(ReplacementMetadata::new(event_id, None));
+        if let Err(e) = room.send(edited).await {
+            error!("Failed to edit DWD warning in {room_id}: {e}");
+            all_ok = false;
+        }
+    }
+    all_ok
+}
+
+/// Append an all-clear notice to the original warning content.
+/// The `<hr>` separator is well-supported in Matrix HTML clients.
+fn append_allclear_to_warning(original_plain: &str, original_html: &str) -> (String, String) {
+    let time = chrono::Local::now().format("%H:%M").to_string();
+    let new_plain = format!(
+        "{original_plain}\n\n---\n✅ Entwarnung ({time}): Diese Warnung gilt nicht mehr."
+    );
+    let new_html = format!(
+        "{original_html}<hr><em>✅ Entwarnung ({time}): Diese Warnung gilt nicht mehr.</em>"
+    );
+    (new_plain, new_html)
+}
+
+/// Standalone all-clear fallback for when event IDs were not stored.
+fn format_dwd_allclear(headline: &str, region: &str) -> (String, String) {
+    let body = format!("📍 {region}\nDie Warnung ist nicht mehr aktiv.");
+    let headline_html = alert_html_escape(headline);
+    let body_html = alert_html_escape(&body).replace('\n', "<br>");
+    let plain = format!("✅ Entwarnung: {headline}\n{body}\nSource: DWD Weather Warnings");
+    let html = format!(
+        "<b>✅ Entwarnung: {headline_html}</b><br>{body_html}<br><em>Source: DWD Weather Warnings</em>"
+    );
+    (plain, html)
+}
+
 fn haversine_km(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
     const R: f64 = 6371.0;
     let dlat = (lat2 - lat1).to_radians();
@@ -887,6 +1053,52 @@ mod tests {
         assert!(html.contains("📍 Berlin<br>✅ Drink water"));
         assert!(html.contains("🔗 <a href=\"https://www.dwd.de/\">https://www.dwd.de/</a>"));
         assert!(!html.contains("DWD level"));
+    }
+
+    #[test]
+    fn dwd_allclear_edit_appends_below_hr() {
+        let orig_plain = "🚨 Amtliche WARNUNG vor HITZE\n📍 Berlin\nSource: DWD Weather Warnings";
+        let orig_html =
+            "<b>🚨 Amtliche WARNUNG vor HITZE</b><br>📍 Berlin<br><em>Source: DWD Weather Warnings</em>";
+
+        let (plain, html) = append_allclear_to_warning(orig_plain, orig_html);
+
+        // Original content preserved
+        assert!(plain.starts_with(orig_plain));
+        assert!(html.starts_with(orig_html));
+        // Separator present
+        assert!(plain.contains("\n\n---\n"));
+        assert!(html.contains("<hr>"));
+        // All-clear marker present
+        assert!(plain.contains("✅ Entwarnung"));
+        assert!(html.contains("✅ Entwarnung"));
+        assert!(plain.contains("gilt nicht mehr"));
+    }
+
+    #[test]
+    fn dwd_allclear_references_headline_and_region() {
+        let (plain, html) =
+            format_dwd_allclear("Amtliche WARNUNG vor HITZE", "Berlin, Stadt");
+
+        assert!(plain.contains("✅ Entwarnung"));
+        assert!(plain.contains("Amtliche WARNUNG vor HITZE"));
+        assert!(plain.contains("Berlin, Stadt"));
+        assert!(plain.contains("nicht mehr aktiv"));
+        assert!(plain.contains("DWD Weather Warnings"));
+
+        assert!(html.contains("✅ Entwarnung"));
+        assert!(html.contains("Amtliche WARNUNG vor HITZE"));
+        assert!(html.contains("Berlin, Stadt"));
+        assert!(html.contains("nicht mehr aktiv"));
+    }
+
+    #[test]
+    fn dwd_allclear_escapes_html() {
+        let (_, html) = format_dwd_allclear("WARNUNG <test>", "Region & Co.");
+
+        assert!(!html.contains("<test>"));
+        assert!(html.contains("&lt;test&gt;"));
+        assert!(html.contains("Region &amp; Co."));
     }
 
     #[test]
