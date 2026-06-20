@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::{collections::HashMap, time::Duration};
 
 use anyhow::{Context, Result};
 use matrix_sdk::Client;
@@ -73,6 +73,8 @@ pub async fn lookup_nina_ags(http: &reqwest::Client, ref_point: (f64, f64)) -> O
 // ── Main loop ─────────────────────────────────────────────────────────────────
 
 pub async fn alert_loop(client: Client, http: reqwest::Client, db: Db, config: AlertConfig) {
+    let mut dwd_area_cache: HashMap<String, bool> = HashMap::new();
+
     loop {
         if let Some(ref ags) = config.nina_ags {
             if let Err(e) = check_nina(&client, &http, &db, ags).await {
@@ -80,8 +82,15 @@ pub async fn alert_loop(client: Client, http: reqwest::Client, db: Db, config: A
             }
         }
         if !config.dwd_region_keywords.is_empty() {
-            if let Err(e) =
-                check_dwd_weather_warnings(&client, &http, &db, &config.dwd_region_keywords).await
+            if let Err(e) = check_dwd_weather_warnings(
+                &client,
+                &http,
+                &db,
+                &config.dwd_region_keywords,
+                config.ref_point,
+                &mut dwd_area_cache,
+            )
+            .await
             {
                 warn!("DWD weather-warning check failed: {e:#}");
             }
@@ -202,6 +211,8 @@ async fn check_dwd_weather_warnings(
     http: &reqwest::Client,
     db: &Db,
     region_keywords: &[String],
+    ref_point: Option<(f64, f64)>,
+    area_cache: &mut HashMap<String, bool>,
 ) -> Result<()> {
     let body = tokio::time::timeout(
         Duration::from_secs(15),
@@ -222,7 +233,7 @@ async fn check_dwd_weather_warnings(
         let Some(regions) = json[bucket].as_object() else {
             continue;
         };
-        for warnings in regions.values() {
+        for (warncell_id, warnings) in regions {
             let Some(warnings) = warnings.as_array() else {
                 continue;
             };
@@ -236,6 +247,17 @@ async fn check_dwd_weather_warnings(
                 let end = w["end"].as_i64().unwrap_or(i64::MAX);
                 if start > now_ms || end < now_ms {
                     continue;
+                }
+                if let Some(point) = ref_point {
+                    if !dwd_warning_area_contains_point(http, warncell_id, point, area_cache)
+                        .await?
+                    {
+                        info!(
+                            "DWD warning skipped outside configured location: {} ({region}, cell {warncell_id})",
+                            w["headline"].as_str().unwrap_or("Wetterwarnung")
+                        );
+                        continue;
+                    }
                 }
 
                 let event = w["event"]
@@ -296,6 +318,146 @@ fn dwd_warning_id(bucket: &str, region: &str, w: &serde_json::Value) -> String {
     let end = w["end"].as_i64().unwrap_or(0);
     let level = w["level"].as_i64().unwrap_or(0);
     format!("dwd:{bucket}:{region}:{event}:{start}:{end}:{level}")
+}
+
+async fn dwd_warning_area_contains_point(
+    http: &reqwest::Client,
+    warncell_id: &str,
+    point: (f64, f64),
+    cache: &mut HashMap<String, bool>,
+) -> Result<bool> {
+    if let Some(inside) = cache.get(warncell_id) {
+        return Ok(*inside);
+    }
+
+    match fetch_dwd_warning_area(http, warncell_id).await {
+        Ok(Some(geometry)) => {
+            let inside = geometry_contains_point(&geometry, point);
+            cache.insert(warncell_id.to_owned(), inside);
+            Ok(inside)
+        }
+        Ok(None) => {
+            warn!(
+                "DWD warning-area geometry not found for cell {warncell_id}; falling back to region-name match"
+            );
+            cache.insert(warncell_id.to_owned(), true);
+            Ok(true)
+        }
+        Err(e) => {
+            warn!(
+                "DWD warning-area geometry lookup failed for cell {warncell_id}: {e:#}; falling back to region-name match"
+            );
+            cache.insert(warncell_id.to_owned(), true);
+            Ok(true)
+        }
+    }
+}
+
+async fn fetch_dwd_warning_area(
+    http: &reqwest::Client,
+    warncell_id: &str,
+) -> Result<Option<serde_json::Value>> {
+    const DWD_GEOMETRY_LAYERS: &[&str] = &[
+        "Warngebiete_Kreise",
+        "Warngebiete_Gemeinden",
+        "Warngebiete_Bundeslaender",
+        "Warngebiete_Binnenseen",
+        "Warngebiete_Kueste",
+    ];
+
+    for layer in DWD_GEOMETRY_LAYERS {
+        let url = format!(
+            "https://maps.dwd.de/geoserver/dwd/ows?service=WFS&version=1.1.0&request=GetFeature&typeName=dwd:{layer}&outputFormat=application/json&CQL_FILTER=WARNCELLID%3D{}",
+            crate::url_encode(warncell_id)
+        );
+        let body = tokio::time::timeout(Duration::from_secs(15), http.get(&url).send())
+            .await
+            .context("DWD warning-area fetch timed out")?
+            .context("DWD warning-area request failed")?
+            .text()
+            .await
+            .context("DWD warning-area response read failed")?;
+        let json: serde_json::Value =
+            serde_json::from_str(&body).context("DWD warning-area JSON parse failed")?;
+        if let Some(geometry) = json["features"]
+            .as_array()
+            .and_then(|features| features.first())
+            .and_then(|feature| feature.get("geometry"))
+        {
+            return Ok(Some(geometry.clone()));
+        }
+    }
+
+    Ok(None)
+}
+
+fn geometry_contains_point(geometry: &serde_json::Value, point: (f64, f64)) -> bool {
+    match geometry["type"].as_str() {
+        Some("Polygon") => polygon_contains_point(&geometry["coordinates"], point),
+        Some("MultiPolygon") => geometry["coordinates"]
+            .as_array()
+            .map(|polygons| {
+                polygons
+                    .iter()
+                    .any(|polygon| polygon_contains_point(polygon, point))
+            })
+            .unwrap_or(false),
+        _ => false,
+    }
+}
+
+fn polygon_contains_point(coordinates: &serde_json::Value, point: (f64, f64)) -> bool {
+    let Some(rings) = coordinates.as_array() else {
+        return false;
+    };
+    let Some(outer) = rings.first() else {
+        return false;
+    };
+    if !ring_contains_point(outer, point) {
+        return false;
+    }
+    !rings
+        .iter()
+        .skip(1)
+        .any(|hole| ring_contains_point(hole, point))
+}
+
+fn ring_contains_point(ring: &serde_json::Value, point: (f64, f64)) -> bool {
+    let Some(points) = ring.as_array() else {
+        return false;
+    };
+    if points.len() < 3 {
+        return false;
+    }
+
+    let (lat, lon) = point;
+    let mut inside = false;
+    let mut prev = points.len() - 1;
+    for current in 0..points.len() {
+        let Some((x1, y1)) = geojson_position(points[current].as_array()) else {
+            prev = current;
+            continue;
+        };
+        let Some((x2, y2)) = geojson_position(points[prev].as_array()) else {
+            prev = current;
+            continue;
+        };
+        let intersects =
+            ((y1 > lat) != (y2 > lat)) && (lon < (x2 - x1) * (lat - y1) / (y2 - y1) + x1);
+        if intersects {
+            inside = !inside;
+        }
+        prev = current;
+    }
+
+    inside
+}
+
+fn geojson_position(position: Option<&Vec<serde_json::Value>>) -> Option<(f64, f64)> {
+    let position = position?;
+    let lon = position.first()?.as_f64()?;
+    let lat = position.get(1)?.as_f64()?;
+    Some((lon, lat))
 }
 
 fn format_dwd_description(region: &str, w: &serde_json::Value) -> String {
@@ -666,6 +828,49 @@ mod tests {
             desc.contains("✅ Hitzebelastung kann für den menschlichen Körper gefährlich werden.")
         );
         assert!(!desc.contains("Noch ein Satz"));
+    }
+
+    #[test]
+    fn dwd_polygon_geometry_contains_point() {
+        let geometry = json!({
+            "type": "Polygon",
+            "coordinates": [[
+                [13.0, 52.0],
+                [14.0, 52.0],
+                [14.0, 53.0],
+                [13.0, 53.0],
+                [13.0, 52.0]
+            ]]
+        });
+
+        assert!(geometry_contains_point(&geometry, (52.5, 13.5)));
+        assert!(!geometry_contains_point(&geometry, (51.5, 13.5)));
+    }
+
+    #[test]
+    fn dwd_polygon_hole_excludes_point() {
+        let geometry = json!({
+            "type": "Polygon",
+            "coordinates": [
+                [
+                    [13.0, 52.0],
+                    [14.0, 52.0],
+                    [14.0, 53.0],
+                    [13.0, 53.0],
+                    [13.0, 52.0]
+                ],
+                [
+                    [13.4, 52.4],
+                    [13.6, 52.4],
+                    [13.6, 52.6],
+                    [13.4, 52.6],
+                    [13.4, 52.4]
+                ]
+            ]
+        });
+
+        assert!(!geometry_contains_point(&geometry, (52.5, 13.5)));
+        assert!(geometry_contains_point(&geometry, (52.2, 13.2)));
     }
 
     #[test]
