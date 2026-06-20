@@ -27,6 +27,7 @@ pub enum SourceType {
 
 /// Credentials and shared token state for all Bluesky sources.
 /// Created once in main() and passed to every poll.
+#[derive(Clone)]
 pub struct BlueskyContext {
     pub identifier: String,
     pub password: String,
@@ -67,10 +68,14 @@ pub fn build_adapter(source: &SourceConfig, bluesky: Option<&BlueskyContext>) ->
         }),
         SourceType::Bluesky => {
             let (identifier, password, session) = bluesky
-                .map(|ctx| (ctx.identifier.clone(), ctx.password.clone(), ctx.session.clone()))
-                .unwrap_or_else(|| {
-                    (String::new(), String::new(), bluesky::new_shared_session())
-                });
+                .map(|ctx| {
+                    (
+                        ctx.identifier.clone(),
+                        ctx.password.clone(),
+                        ctx.session.clone(),
+                    )
+                })
+                .unwrap_or_else(|| (String::new(), String::new(), bluesky::new_shared_session()));
             SourceAdapter::Bluesky(bluesky::BlueskyAdapter {
                 name: source.name.clone(),
                 query: source.query.clone().unwrap_or_default(),

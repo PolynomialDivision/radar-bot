@@ -119,7 +119,10 @@ impl BlueskyAdapter {
         };
 
         let Some(posts) = json["posts"].as_array() else {
-            warn!("Bluesky response missing 'posts' array [{}]: {body:.200}", self.name);
+            warn!(
+                "Bluesky response missing 'posts' array [{}]: {body:.200}",
+                self.name
+            );
             return vec![];
         };
 
@@ -151,6 +154,7 @@ impl BlueskyAdapter {
             guid: uri.to_owned(),
             title,
             link: Some(link),
+            link_note: None,
             description: Some(text.to_owned()),
             // Pre-fill article_text so process_item() skips the HTTP article fetch.
             article_text: Some(text.to_owned()),
@@ -159,15 +163,22 @@ impl BlueskyAdapter {
             max_score: 0,
             distance_meters: None,
             location_label: None,
-            published_at: post["record"]["createdAt"].as_str().and_then(crate::parse_feed_date),
+            published_at: post["record"]["createdAt"]
+                .as_str()
+                .and_then(crate::parse_feed_date),
         })
     }
 }
 
 // ── Auth helpers ──────────────────────────────────────────────────────────────
 
-async fn create_session(http: &reqwest::Client, identifier: &str, password: &str) -> Option<BlueskySession> {
-    let body = format!(r#"{{"identifier":{},"password":{}}}"#,
+async fn create_session(
+    http: &reqwest::Client,
+    identifier: &str,
+    password: &str,
+) -> Option<BlueskySession> {
+    let body = format!(
+        r#"{{"identifier":{},"password":{}}}"#,
         serde_json::to_string(identifier).ok()?,
         serde_json::to_string(password).ok()?,
     );
@@ -182,8 +193,14 @@ async fn create_session(http: &reqwest::Client, identifier: &str, password: &str
     .await
     {
         Ok(Ok(r)) => r,
-        Ok(Err(e)) => { warn!("Bluesky createSession request failed: {e}"); return None; }
-        Err(_)    => { warn!("Bluesky createSession timed out"); return None; }
+        Ok(Err(e)) => {
+            warn!("Bluesky createSession request failed: {e}");
+            return None;
+        }
+        Err(_) => {
+            warn!("Bluesky createSession timed out");
+            return None;
+        }
     };
 
     parse_session_response(resp, "createSession").await
@@ -199,8 +216,14 @@ async fn refresh_session(http: &reqwest::Client, refresh_jwt: &str) -> Option<Bl
     .await
     {
         Ok(Ok(r)) => r,
-        Ok(Err(e)) => { warn!("Bluesky refreshSession request failed: {e}"); return None; }
-        Err(_)    => { warn!("Bluesky refreshSession timed out"); return None; }
+        Ok(Err(e)) => {
+            warn!("Bluesky refreshSession request failed: {e}");
+            return None;
+        }
+        Err(_) => {
+            warn!("Bluesky refreshSession timed out");
+            return None;
+        }
     };
 
     parse_session_response(resp, "refreshSession").await
@@ -209,20 +232,30 @@ async fn refresh_session(http: &reqwest::Client, refresh_jwt: &str) -> Option<Bl
 async fn parse_session_response(resp: reqwest::Response, op: &str) -> Option<BlueskySession> {
     let body = match resp.text().await {
         Ok(b) => b,
-        Err(e) => { warn!("Bluesky {op} response read failed: {e}"); return None; }
+        Err(e) => {
+            warn!("Bluesky {op} response read failed: {e}");
+            return None;
+        }
     };
 
     let json: serde_json::Value = match serde_json::from_str(&body) {
         Ok(j) => j,
-        Err(e) => { warn!("Bluesky {op} JSON parse failed: {e}"); return None; }
+        Err(e) => {
+            warn!("Bluesky {op} JSON parse failed: {e}");
+            return None;
+        }
     };
 
     if let Some(err) = json["error"].as_str() {
-        warn!("Bluesky {op} error: {} — {}", err, json["message"].as_str().unwrap_or(""));
+        warn!(
+            "Bluesky {op} error: {} — {}",
+            err,
+            json["message"].as_str().unwrap_or("")
+        );
         return None;
     }
 
-    let access_jwt  = json["accessJwt"].as_str()?.to_owned();
+    let access_jwt = json["accessJwt"].as_str()?.to_owned();
     let refresh_jwt = json["refreshJwt"].as_str()?.to_owned();
 
     Some(BlueskySession {

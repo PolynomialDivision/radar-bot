@@ -3,20 +3,18 @@ mod db;
 mod sources;
 mod weather;
 
+use dashmap::DashMap;
+use db::Db;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
-use dashmap::DashMap;
-use db::Db;
 use tokio::sync::{Mutex, Semaphore};
 
 use anyhow::{Context, Result};
 use chrono::{Local, NaiveTime};
 use matrix_sdk::{
-    Client, Room, RoomState,
     config::SyncSettings,
     ruma::{
-        OwnedServerName, OwnedUserId, RoomOrAliasId,
         api::client::filter::FilterDefinition,
         events::{
             key::verification::request::ToDeviceKeyVerificationRequestEvent,
@@ -25,11 +23,20 @@ use matrix_sdk::{
                 message::{MessageType, OriginalSyncRoomMessageEvent, RoomMessageEventContent},
             },
         },
+        OwnedServerName, OwnedUserId, RoomOrAliasId,
     },
+    Client, Room, RoomState,
 };
 use mxbot_common::config::{MatrixConfig, SecurityConfig};
 
-type GeocodeCache = Arc<DashMap<String, Option<(f64, f64)>>>;
+#[derive(Debug, Clone)]
+struct GeocodeHit {
+    lat: f64,
+    lon: f64,
+    display_name: Option<String>,
+}
+
+type GeocodeCache = Arc<DashMap<String, Option<GeocodeHit>>>;
 use serde::{Deserialize, Serialize};
 use tokio::{fs, task::JoinSet, time::sleep, time::Duration};
 use tracing::{error, info, warn};
@@ -83,7 +90,9 @@ impl Default for EmergencyConfig {
     }
 }
 
-fn default_alert_poll_secs() -> u64 { 120 }
+fn default_alert_poll_secs() -> u64 {
+    120
+}
 
 #[derive(Deserialize)]
 struct WeatherConfig {
@@ -187,7 +196,9 @@ struct FilterConfig {
     geocode_city: Option<String>,
 }
 
-fn default_digest_threshold() -> i32 { 1 }
+fn default_digest_threshold() -> i32 {
+    1
+}
 
 #[derive(Deserialize, Clone)]
 struct ScheduleConfig {
@@ -209,9 +220,15 @@ impl Default for ScheduleConfig {
     }
 }
 
-fn default_poll_interval() -> u64 { 30 }
-fn default_digest_times() -> Vec<String> { vec!["08:00".to_owned()] }
-fn default_true() -> bool { true }
+fn default_poll_interval() -> u64 {
+    30
+}
+fn default_digest_times() -> Vec<String> {
+    vec!["08:00".to_owned()]
+}
+fn default_true() -> bool {
+    true
+}
 
 fn derive_warning_region_keywords(filter: &FilterConfig, weather: &WeatherConfig) -> Vec<String> {
     if !weather.warning_region_keywords.is_empty() {
@@ -233,7 +250,10 @@ fn derive_warning_region_keywords(filter: &FilterConfig, weather: &WeatherConfig
         .as_deref()
         .and_then(|addr| addr.rsplit(',').next())
         .map(str::trim)
-        .and_then(|part| part.split_whitespace().find(|token| token.chars().any(|c| c.is_alphabetic())))
+        .and_then(|part| {
+            part.split_whitespace()
+                .find(|token| token.chars().any(|c| c.is_alphabetic()))
+        })
         .map(|city| vec![city.to_owned()])
         .unwrap_or_default()
 }
@@ -255,6 +275,9 @@ pub(crate) struct FeedItem {
     pub(crate) guid: String,
     pub(crate) title: String,
     pub(crate) link: Option<String>,
+    /// Optional user-facing note about the link, e.g. rolling/live ticker pages.
+    #[serde(default)]
+    pub(crate) link_note: Option<String>,
     /// Short snippet from the RSS/social feed — shown to the user.
     pub(crate) description: Option<String>,
     /// Full stripped text used only for filtering/geocoding. Pre-filled by
@@ -311,54 +334,59 @@ fn decode_entities(s: &str) -> String {
         rest = &rest[amp..];
         if let Some(semi) = rest.find(';') {
             let entity = &rest[1..semi]; // between & and ;
-            let replaced = if let Some(hex) = entity.strip_prefix("#x").or_else(|| entity.strip_prefix("#X")) {
-                u32::from_str_radix(hex, 16).ok()
+            let replaced = if let Some(hex) = entity
+                .strip_prefix("#x")
+                .or_else(|| entity.strip_prefix("#X"))
+            {
+                u32::from_str_radix(hex, 16)
+                    .ok()
                     .and_then(char::from_u32)
                     .map(|c| c.to_string())
             } else if let Some(dec) = entity.strip_prefix('#') {
-                dec.parse::<u32>().ok()
+                dec.parse::<u32>()
+                    .ok()
                     .and_then(char::from_u32)
                     .map(|c| c.to_string())
             } else {
                 match entity {
-                    "amp"    => Some("&".into()),
-                    "lt"     => Some("<".into()),
-                    "gt"     => Some(">".into()),
-                    "quot"   => Some("\"".into()),
-                    "apos"   => Some("'".into()),
-                    "nbsp"   => Some(" ".into()),
-                    "shy"    => Some("".into()),
+                    "amp" => Some("&".into()),
+                    "lt" => Some("<".into()),
+                    "gt" => Some(">".into()),
+                    "quot" => Some("\"".into()),
+                    "apos" => Some("'".into()),
+                    "nbsp" => Some(" ".into()),
+                    "shy" => Some("".into()),
                     // dashes & ellipsis
-                    "mdash"  => Some("—".into()),
-                    "ndash"  => Some("–".into()),
+                    "mdash" => Some("—".into()),
+                    "ndash" => Some("–".into()),
                     "hellip" => Some("…".into()),
                     // typographic quotes
-                    "ldquo"  => Some("\u{201C}".into()),
-                    "rdquo"  => Some("\u{201D}".into()),
-                    "lsquo"  => Some("\u{2018}".into()),
-                    "rsquo"  => Some("\u{2019}".into()),
-                    "laquo"  => Some("«".into()),
-                    "raquo"  => Some("»".into()),
+                    "ldquo" => Some("\u{201C}".into()),
+                    "rdquo" => Some("\u{201D}".into()),
+                    "lsquo" => Some("\u{2018}".into()),
+                    "rsquo" => Some("\u{2019}".into()),
+                    "laquo" => Some("«".into()),
+                    "raquo" => Some("»".into()),
                     // German-specific
-                    "auml"   => Some("ä".into()),
-                    "ouml"   => Some("ö".into()),
-                    "uuml"   => Some("ü".into()),
-                    "Auml"   => Some("Ä".into()),
-                    "Ouml"   => Some("Ö".into()),
-                    "Uuml"   => Some("Ü".into()),
-                    "szlig"  => Some("ß".into()),
+                    "auml" => Some("ä".into()),
+                    "ouml" => Some("ö".into()),
+                    "uuml" => Some("ü".into()),
+                    "Auml" => Some("Ä".into()),
+                    "Ouml" => Some("Ö".into()),
+                    "Uuml" => Some("Ü".into()),
+                    "szlig" => Some("ß".into()),
                     // other common
                     "eacute" => Some("é".into()),
                     "egrave" => Some("è".into()),
-                    "ecirc"  => Some("ê".into()),
-                    "euro"   => Some("€".into()),
-                    "pound"  => Some("£".into()),
-                    "copy"   => Some("©".into()),
-                    "reg"    => Some("®".into()),
-                    "trade"  => Some("™".into()),
-                    "bull"   => Some("•".into()),
+                    "ecirc" => Some("ê".into()),
+                    "euro" => Some("€".into()),
+                    "pound" => Some("£".into()),
+                    "copy" => Some("©".into()),
+                    "reg" => Some("®".into()),
+                    "trade" => Some("™".into()),
+                    "bull" => Some("•".into()),
                     "middot" => Some("·".into()),
-                    _        => None,
+                    _ => None,
                 }
             };
             if let Some(r) = replaced {
@@ -425,12 +453,7 @@ fn normalize_feed_entry(entry: feed_rs::model::Entry, source_name: &str) -> Opti
                 .content
                 .as_ref()
                 .and_then(|c| c.body.as_ref())
-                .map(|body| {
-                    text_to_plain(body)
-                        .chars()
-                        .take(120)
-                        .collect::<String>()
-                })
+                .map(|body| text_to_plain(body).chars().take(120).collect::<String>())
                 .filter(|s| !s.is_empty())
         })?;
 
@@ -462,6 +485,7 @@ fn normalize_feed_entry(entry: feed_rs::model::Entry, source_name: &str) -> Opti
         guid,
         title,
         link,
+        link_note: None,
         description,
         article_text: None,
         source_name: source_name.to_owned(),
@@ -491,7 +515,9 @@ fn text_to_plain(s: &str) -> String {
 /// Returns None if the string is missing, empty, or unparseable — callers treat None as "keep".
 pub(crate) fn parse_feed_date(s: &str) -> Option<i64> {
     let s = s.trim();
-    if s.is_empty() { return None; }
+    if s.is_empty() {
+        return None;
+    }
     // RFC 3339 / ISO 8601 (Atom: "2024-01-15T10:30:00Z", "2024-01-15T10:30:00+01:00")
     if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(s) {
         return Some(dt.timestamp());
@@ -531,7 +557,10 @@ mod feed_tests {
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].guid, "abc-1");
         assert_eq!(items[0].title, "Incident & update");
-        assert_eq!(items[0].link.as_deref(), Some("https://example.test/news/1"));
+        assert_eq!(
+            items[0].link.as_deref(),
+            Some("https://example.test/news/1")
+        );
         assert_eq!(items[0].description.as_deref(), Some("Short summary"));
         assert_eq!(items[0].published_at, Some(1_705_314_600));
     }
@@ -557,7 +586,10 @@ mod feed_tests {
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].guid, "tag:example.test,2024:entry-1");
         assert_eq!(items[0].title, "Atom entry");
-        assert_eq!(items[0].link.as_deref(), Some("https://example.test/atom/1"));
+        assert_eq!(
+            items[0].link.as_deref(),
+            Some("https://example.test/atom/1")
+        );
         assert_eq!(items[0].description.as_deref(), Some("Atom summary"));
         assert_eq!(items[0].published_at, Some(1_705_314_600));
     }
@@ -569,6 +601,7 @@ mod feed_tests {
             source_name: "Local".to_owned(),
             title: "Street closed".to_owned(),
             link: None,
+            link_note: None,
             score: 4,
             max_score: 5,
             distance_meters: Some(350.0),
@@ -579,6 +612,39 @@ mod feed_tests {
 
         assert!(plain.contains("~350m · Boxhagener Platz"));
         assert!(html.contains("~350m · Boxhagener Platz"));
+    }
+
+    #[test]
+    fn rolling_link_gets_note_when_title_no_longer_matches() {
+        let html = r#"
+            <html><head><link rel="canonical" href="https://example.test/live/ticker" /></head>
+            <body><main>Aktuelle Meldungen zur Verkehrslage ohne den alten Eintrag.</main></body></html>
+        "#;
+        let (link, note) = resolve_article_link(
+            "https://example.test/liveticker",
+            html,
+            "Aktuelle Meldungen zur Verkehrslage ohne den alten Eintrag.",
+            "Brand in der Rigaer Straße",
+        );
+
+        assert_eq!(link.as_deref(), Some("https://example.test/live/ticker"));
+        assert_eq!(
+            note.as_deref(),
+            Some("rolling source link may no longer show this item")
+        );
+    }
+
+    #[test]
+    fn street_evidence_ignores_boilerplate_after_impressum() {
+        let evidence = extract_street_evidence(
+            "Brand in der Rigaer Straße",
+            None,
+            Some("Weitere Details folgen. Impressum Kontakt Alexanderplatz 1 Datenschutz."),
+        );
+        let candidates: Vec<String> = evidence.into_iter().map(|e| e.candidate).collect();
+
+        assert!(candidates.iter().any(|c| c.contains("Rigaer Straße")));
+        assert!(!candidates.iter().any(|c| c.contains("Alexanderplatz")));
     }
 }
 
@@ -610,7 +676,7 @@ fn remove_blocks(html: &str, tags: &[&str]) -> String {
                 (Some(s), Some(e)) if s < e => {
                     let end = e + close_str.len();
                     result = format!("{}{}", &result[..s], &result[end..]);
-                    lower  = format!("{}{}", &lower[..s],  &lower[end..]);
+                    lower = format!("{}{}", &lower[..s], &lower[end..]);
                 }
                 _ => break,
             }
@@ -630,31 +696,190 @@ fn extract_article_body(html: &str) -> String {
             }
         }
     }
-    let cleaned = remove_blocks(html, &["script", "style", "nav", "header", "footer", "aside"]);
+    let cleaned = remove_blocks(
+        html,
+        &["script", "style", "nav", "header", "footer", "aside"],
+    );
     strip_html(&cleaned)
 }
 
-/// Fetch a URL and return the article body as plain text.
-async fn fetch_article_text(http: &reqwest::Client, url: &str) -> Option<String> {
-    let resp = tokio::time::timeout(
-        Duration::from_secs(10),
-        http.get(url).send(),
-    )
-    .await.ok()?.ok()?;
+#[derive(Debug, Clone)]
+struct ArticleFetch {
+    text: String,
+    resolved_link: Option<String>,
+    link_note: Option<String>,
+}
 
-    let html = tokio::time::timeout(
-        Duration::from_secs(10),
-        resp.text(),
-    )
-    .await.ok()?.ok()?;
+fn attr_value(tag: &str, attr: &str) -> Option<String> {
+    let lower = tag.to_lowercase();
+    let needle = format!("{attr}=");
+    let pos = lower.find(&needle)?;
+    let rest = &tag[pos + needle.len()..];
+    let mut chars = rest.chars();
+    let quote = chars.next()?;
+    if quote != '"' && quote != '\'' {
+        return None;
+    }
+    let value: String = chars.take_while(|c| *c != quote).collect();
+    let value = value.trim();
+    if value.is_empty() {
+        None
+    } else {
+        Some(value.to_owned())
+    }
+}
+
+fn link_rel_value(html: &str, rel_name: &str) -> Option<String> {
+    let lower = html.to_lowercase();
+    let mut offset = 0;
+    while let Some(pos) = lower[offset..].find("<link") {
+        let start = offset + pos;
+        let Some(end_rel) = lower[start..].find('>') else {
+            break;
+        };
+        let end = start + end_rel + 1;
+        let tag = &html[start..end];
+        let rel_matches = attr_value(tag, "rel")
+            .map(|rel| {
+                rel.split_whitespace()
+                    .any(|part| part.eq_ignore_ascii_case(rel_name))
+            })
+            .unwrap_or(false);
+        if rel_matches {
+            if let Some(href) = attr_value(tag, "href") {
+                return Some(href);
+            }
+        }
+        offset = end;
+    }
+    None
+}
+
+fn meta_property_value(html: &str, prop_name: &str) -> Option<String> {
+    let lower = html.to_lowercase();
+    let mut offset = 0;
+    while let Some(pos) = lower[offset..].find("<meta") {
+        let start = offset + pos;
+        let Some(end_rel) = lower[start..].find('>') else {
+            break;
+        };
+        let end = start + end_rel + 1;
+        let tag = &html[start..end];
+        let prop_matches = attr_value(tag, "property")
+            .or_else(|| attr_value(tag, "name"))
+            .map(|prop| prop.eq_ignore_ascii_case(prop_name))
+            .unwrap_or(false);
+        if prop_matches {
+            if let Some(content) = attr_value(tag, "content") {
+                return Some(content);
+            }
+        }
+        offset = end;
+    }
+    None
+}
+
+fn looks_like_rolling_url(url: &str) -> bool {
+    let u = url.to_lowercase();
+    [
+        "ticker",
+        "liveticker",
+        "liveblog",
+        "newsblog",
+        "live-blog",
+        "live-ticker",
+    ]
+    .iter()
+    .any(|needle| u.contains(needle))
+}
+
+fn significant_words(s: &str) -> Vec<String> {
+    normalize(s)
+        .split_whitespace()
+        .map(|w| w.trim_matches(|c: char| !c.is_alphanumeric()).to_owned())
+        .filter(|w| w.chars().count() >= 5)
+        .filter(|w| {
+            !matches!(
+                w.as_str(),
+                "berlin" | "polizei" | "meldung" | "update" | "heute"
+            )
+        })
+        .take(8)
+        .collect()
+}
+
+fn text_matches_title(text: &str, title: &str) -> bool {
+    let words = significant_words(title);
+    if words.len() < 2 {
+        return true;
+    }
+    let haystack = normalize(text);
+    let hits = words
+        .iter()
+        .filter(|w| haystack.contains(w.as_str()))
+        .count();
+    hits >= 2 || hits * 2 >= words.len()
+}
+
+fn resolve_article_link(
+    feed_url: &str,
+    html: &str,
+    article_text: &str,
+    title: &str,
+) -> (Option<String>, Option<String>) {
+    let canonical = link_rel_value(html, "canonical")
+        .or_else(|| meta_property_value(html, "og:url"))
+        .filter(|url| url.starts_with("http://") || url.starts_with("https://"));
+
+    let mut link = canonical.unwrap_or_else(|| feed_url.to_owned());
+    let rolling = looks_like_rolling_url(feed_url) || looks_like_rolling_url(&link);
+    let same_item = text_matches_title(article_text, title);
+    let mut note = None;
+
+    if rolling && !same_item {
+        note = Some("rolling source link may no longer show this item".to_owned());
+    } else if rolling {
+        note = Some("rolling source link".to_owned());
+    }
+
+    if link.trim().is_empty() {
+        link = feed_url.to_owned();
+    }
+    (Some(link), note)
+}
+
+/// Fetch a URL and return the article body plus resolved link metadata.
+async fn fetch_article(http: &reqwest::Client, url: &str, title: &str) -> Option<ArticleFetch> {
+    let resp = tokio::time::timeout(Duration::from_secs(10), http.get(url).send())
+        .await
+        .ok()?
+        .ok()?;
+
+    let html = tokio::time::timeout(Duration::from_secs(10), resp.text())
+        .await
+        .ok()?
+        .ok()?;
 
     // extract_article_body calls remove_blocks which is CPU-intensive on large HTML pages.
     // Run it on the blocking thread pool so it doesn't stall the async runtime.
+    let title = title.to_owned();
+    let feed_url = url.to_owned();
     let text = tokio::task::spawn_blocking(move || {
         let t = extract_article_body(&html);
         let t = t.trim().to_owned();
-        if t.is_empty() { None } else { Some(t) }
-    }).await.ok()??;
+        if t.is_empty() {
+            None
+        } else {
+            let (resolved_link, link_note) = resolve_article_link(&feed_url, &html, &t, &title);
+            Some(ArticleFetch {
+                text: t,
+                resolved_link,
+                link_note,
+            })
+        }
+    })
+    .await
+    .ok()??;
 
     Some(text)
 }
@@ -671,24 +896,34 @@ fn haversine_meters(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
 }
 
 // Distance tier boundaries (metres) used by distance_score() and geocoding early-exit.
-const DIST_SCORE_5: f64 =    200.0; // 🔴 very close
-const DIST_SCORE_4: f64 =    500.0; // 🟠
-const DIST_SCORE_3: f64 =  1_000.0; // 🟡
-const DIST_SCORE_2: f64 =  2_000.0; // 🟢
+const DIST_SCORE_5: f64 = 200.0; // 🔴 very close
+const DIST_SCORE_4: f64 = 500.0; // 🟠
+const DIST_SCORE_3: f64 = 1_000.0; // 🟡
+const DIST_SCORE_2: f64 = 2_000.0; // 🟢
 const DIST_SCORE_1: f64 = 10_000.0; // 🔵 city-wide
 
 fn format_distance(m: f64) -> String {
-    if m < 1_000.0 { format!("~{}m", m.round() as u32) }
-    else { format!("~{:.1}km", m / 1_000.0) }
+    if m < 1_000.0 {
+        format!("~{}m", m.round() as u32)
+    } else {
+        format!("~{:.1}km", m / 1_000.0)
+    }
 }
 
 fn distance_score(m: f64) -> i32 {
-    if m < DIST_SCORE_5 { 5 }
-    else if m < DIST_SCORE_4 { 4 }
-    else if m < DIST_SCORE_3 { 3 }
-    else if m < DIST_SCORE_2 { 2 }
-    else if m < DIST_SCORE_1 { 1 }
-    else { 0 }
+    if m < DIST_SCORE_5 {
+        5
+    } else if m < DIST_SCORE_4 {
+        4
+    } else if m < DIST_SCORE_3 {
+        3
+    } else if m < DIST_SCORE_2 {
+        2
+    } else if m < DIST_SCORE_1 {
+        1
+    } else {
+        0
+    }
 }
 
 fn score_color(score: i32) -> &'static str {
@@ -705,19 +940,53 @@ fn score_color(score: i32) -> &'static str {
 /// Extract candidate German street names from plain text.
 fn extract_street_candidates(text: &str) -> Vec<String> {
     const SUFFIXES: &[&str] = &[
-        "straße", "strasse", "str.", "allee", "weg", "platz", "ring",
-        "damm", "gasse", "chaussee", "ufer", "brücke", "brucke", "steg",
+        "straße", "strasse", "str.", "allee", "weg", "platz", "ring", "damm", "gasse", "chaussee",
+        "ufer", "brücke", "brucke", "steg",
     ];
     // Words that cannot be the first word of a street name
     const SKIP_LEADING: &[&str] = &[
-        "auf", "der", "die", "das", "dem", "den", "des", "ein", "eine", "einen",
-        "am", "im", "zur", "zum", "vom", "von", "an", "in", "zu", "bei", "nach",
-        "über", "unter", "vor", "durch", "entlang", "bis", "um", "seit", "ab",
-        "außer", "gegenüber", "nahe",
+        "auf",
+        "der",
+        "die",
+        "das",
+        "dem",
+        "den",
+        "des",
+        "ein",
+        "eine",
+        "einen",
+        "am",
+        "im",
+        "zur",
+        "zum",
+        "vom",
+        "von",
+        "an",
+        "in",
+        "zu",
+        "bei",
+        "nach",
+        "über",
+        "unter",
+        "vor",
+        "durch",
+        "entlang",
+        "bis",
+        "um",
+        "seit",
+        "ab",
+        "außer",
+        "gegenüber",
+        "nahe",
         // conjunctions — prevent "und Erreichbarkeit Platz" style false positives
-        "und", "oder", "sowie", "bzw",
+        "und",
+        "oder",
+        "sowie",
+        "bzw",
         // indefinite articles (cases not covered above)
-        "einem", "einer", "eines",
+        "einem",
+        "einer",
+        "eines",
     ];
 
     let words: Vec<&str> = text.split_whitespace().collect();
@@ -740,18 +1009,26 @@ fn extract_street_candidates(text: &str) -> Vec<String> {
             while !p.is_empty() {
                 let head = p[0].to_lowercase();
                 let head = head.trim_end_matches(',').trim_end_matches('.');
-                if SKIP_LEADING.contains(&head) { p = &p[1..]; } else { break; }
+                if SKIP_LEADING.contains(&head) {
+                    p = &p[1..];
+                } else {
+                    break;
+                }
             }
             p.to_vec()
         };
 
-        if parts.is_empty() { continue; }
+        if parts.is_empty() {
+            continue;
+        }
 
         // Skip bare suffix words with no name (e.g. just "Straße", "Platz", "Weg")
         if parts.len() == 1 {
             let bare = parts[0].to_lowercase();
             let bare = bare.trim_end_matches(',').trim_end_matches('.');
-            if SUFFIXES.contains(&bare) { continue; }
+            if SUFFIXES.contains(&bare) {
+                continue;
+            }
         }
 
         // Append house number (max 4 digits to avoid postal codes like "612101")
@@ -765,7 +1042,8 @@ fn extract_street_candidates(text: &str) -> Vec<String> {
 
         // Strip trailing punctuation from each part so "Luftbrücke," and
         // "Luftbrücke" produce the same candidate string and cache key.
-        let candidate = all_parts.iter()
+        let candidate = all_parts
+            .iter()
             .map(|w| w.trim_end_matches(|c: char| matches!(c, ',' | '.' | ';' | ':' | '!' | '?')))
             .collect::<Vec<_>>()
             .join(" ");
@@ -774,6 +1052,118 @@ fn extract_street_candidates(text: &str) -> Vec<String> {
         }
     }
     out
+}
+
+#[derive(Debug, Clone)]
+struct StreetEvidence {
+    candidate: String,
+    confidence: i32,
+}
+
+fn contains_any_normalized(text: &str, terms: &[&str]) -> bool {
+    let n = normalize(text);
+    terms.iter().any(|term| n.contains(&normalize(term)))
+}
+
+fn first_relevant_article_text(article: Option<&str>) -> &str {
+    let Some(article) = article else { return "" };
+    let lower = article.to_lowercase();
+    let mut cutoff = [
+        "impressum",
+        "kontakt",
+        "datenschutz",
+        "newsletter",
+        "pressekontakt",
+    ]
+    .iter()
+    .filter_map(|needle| lower.find(needle))
+    .min()
+    .unwrap_or(article.len());
+    while cutoff > 0 && !article.is_char_boundary(cutoff) {
+        cutoff -= 1;
+    }
+    &article[..cutoff]
+}
+
+fn street_confidence(section: &str, text: &str) -> i32 {
+    const EVENT_TERMS: &[&str] = &[
+        "brand",
+        "feuer",
+        "unfall",
+        "verletz",
+        "polizei",
+        "sperr",
+        "einsatz",
+        "warnung",
+        "raub",
+        "diebstahl",
+        "überfall",
+        "messer",
+        "schuss",
+        "verkehr",
+        "störung",
+        "rettung",
+        "evaku",
+        "gefähr",
+    ];
+    let mut score = match section {
+        "title" => 4,
+        "description" => 3,
+        _ => 2,
+    };
+    if contains_any_normalized(text, EVENT_TERMS) {
+        score += 2;
+    }
+    score
+}
+
+fn extract_street_evidence(
+    title: &str,
+    description: Option<&str>,
+    article: Option<&str>,
+) -> Vec<StreetEvidence> {
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    let sections = [
+        ("title", title),
+        ("description", description.unwrap_or("")),
+        ("article", first_relevant_article_text(article)),
+    ];
+
+    for (section, text) in sections {
+        if text.trim().is_empty() {
+            continue;
+        }
+        let confidence = street_confidence(section, text);
+        for candidate in extract_street_candidates(text) {
+            let key = candidate.to_lowercase();
+            if seen.insert(key) {
+                out.push(StreetEvidence {
+                    candidate,
+                    confidence,
+                });
+            }
+        }
+    }
+
+    out
+}
+
+fn short_location_label(display_name: &str) -> Option<String> {
+    let parts: Vec<&str> = display_name
+        .split(',')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .collect();
+    if parts.is_empty() {
+        return None;
+    }
+    let label = parts.iter().take(3).copied().collect::<Vec<_>>().join(", ");
+    if label.is_empty() {
+        None
+    } else {
+        Some(label)
+    }
 }
 
 pub(crate) fn url_encode(s: &str) -> String {
@@ -796,22 +1186,69 @@ pub(crate) fn url_encode(s: &str) -> String {
 /// Returns `Ok(Some(coords))` on hit, `Ok(None)` when Nominatim confirms the
 /// address doesn't exist, and `Err(())` for transient failures (network,
 /// timeout, parse). Only `Ok(_)` results should be cached.
-async fn geocode_location(http: &reqwest::Client, query: &str, city: &str) -> Result<Option<(f64, f64)>, ()> {
-    let full = if city.is_empty() { query.to_owned() } else { format!("{query}, {city}") };
+async fn geocode_location(
+    http: &reqwest::Client,
+    query: &str,
+    city: &str,
+) -> Result<Option<GeocodeHit>, ()> {
+    let full = if city.is_empty() {
+        query.to_owned()
+    } else {
+        format!("{query}, {city}")
+    };
     let q = url_encode(&full);
-    let url = format!("https://nominatim.openstreetmap.org/search?q={q}&format=json&limit=1");
+    let url = format!(
+        "https://nominatim.openstreetmap.org/search?q={q}&format=json&addressdetails=1&limit=5"
+    );
     let resp: reqwest::Response = tokio::time::timeout(
         NOMINATIM_TIMEOUT,
         http.get(&url).header("Accept-Language", "de").send(),
     )
-    .await.map_err(|_| ())?.map_err(|_| ())?;
+    .await
+    .map_err(|_| ())?
+    .map_err(|_| ())?;
     let body = tokio::time::timeout(NOMINATIM_TIMEOUT, resp.text())
-        .await.map_err(|_| ())?.map_err(|_| ())?;
+        .await
+        .map_err(|_| ())?
+        .map_err(|_| ())?;
     let arr: serde_json::Value = serde_json::from_str(&body).map_err(|_| ())?;
-    let Some(first) = arr.get(0) else { return Ok(None) };
-    let lat: f64 = first["lat"].as_str().ok_or(())?.parse().map_err(|_| ())?;
-    let lon: f64 = first["lon"].as_str().ok_or(())?.parse().map_err(|_| ())?;
-    Ok(Some((lat, lon)))
+    let Some(results) = arr.as_array() else {
+        return Ok(None);
+    };
+    let city_anchor = city
+        .split(',')
+        .next()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+
+    for result in results {
+        let display_name = result["display_name"].as_str().map(str::to_owned);
+        if let Some(anchor) = city_anchor {
+            let haystack = normalize(&format!(
+                "{} {}",
+                display_name.as_deref().unwrap_or(""),
+                result["address"]
+            ));
+            if !haystack.contains(&normalize(anchor)) {
+                continue;
+            }
+        }
+        let lat: f64 = match result["lat"].as_str().and_then(|s| s.parse().ok()) {
+            Some(v) => v,
+            None => continue,
+        };
+        let lon: f64 = match result["lon"].as_str().and_then(|s| s.parse().ok()) {
+            Some(v) => v,
+            None => continue,
+        };
+        return Ok(Some(GeocodeHit {
+            lat,
+            lon,
+            display_name,
+        }));
+    }
+
+    Ok(None)
 }
 
 // ── Nominatim rate limiter ────────────────────────────────────────────────────
@@ -830,22 +1267,28 @@ type NominatimLimiter = Arc<Semaphore>;
 /// Returns `(distance_m, street_name)` or `None`. Results are cached to avoid repeat lookups.
 async fn find_nearest_distance(
     http: &reqwest::Client,
-    text: &str,
+    title: &str,
+    description: Option<&str>,
+    article: Option<&str>,
     ref_lat: f64,
     ref_lon: f64,
     city: &str,
     cache: &GeocodeCache,
     limiter: &NominatimLimiter,
 ) -> Option<(f64, String)> {
-    let candidates = extract_street_candidates(text);
+    let candidates = extract_street_evidence(title, description, article);
     if candidates.is_empty() {
         return None;
     }
-    let mut best: Option<(f64, String)> = None;
+    let mut best: Option<(i32, f64, String)> = None;
 
-    for candidate in candidates.into_iter().take(MAX_GEOCODE_CANDIDATES) {
+    for evidence in candidates.into_iter().take(MAX_GEOCODE_CANDIDATES) {
+        if evidence.confidence < 3 {
+            continue;
+        }
+        let candidate = evidence.candidate;
         // Check cache first — Some(Some(coords)) = hit, Some(None) = confirmed miss.
-        let cached: Option<Option<(f64, f64)>> = cache.get(&candidate).map(|v| *v);
+        let cached: Option<Option<GeocodeHit>> = cache.get(&candidate).map(|v| v.clone());
         let coords = match cached {
             Some(v) => v,
             None => {
@@ -853,29 +1296,46 @@ async fn find_nearest_distance(
                 // pre-reserving time slots, so wait time stays bounded.
                 let _permit = limiter.acquire().await.unwrap();
                 // Re-check: another task may have geocoded this while we waited.
-                if let Some(v) = cache.get(&candidate).map(|v| *v) {
+                if let Some(v) = cache.get(&candidate).map(|v| v.clone()) {
                     v // cache hit — release permit immediately, no sleep needed
                 } else {
                     let result = geocode_location(http, &candidate, city).await;
                     sleep(NOMINATIM_INTERVAL).await; // enforce rate limit before releasing permit
                     match result {
-                        Ok(coords) => { cache.insert(candidate.clone(), coords); coords }
+                        Ok(coords) => {
+                            cache.insert(candidate.clone(), coords.clone());
+                            coords
+                        }
                         Err(()) => {
-                            warn!("geocode transient failure for {:?} — will retry next poll", candidate);
+                            warn!(
+                                "geocode transient failure for {:?} — will retry next poll",
+                                candidate
+                            );
                             None
                         }
                     }
                 }
             }
         };
-        if let Some((lat, lon)) = coords {
-            let dist = haversine_meters(ref_lat, ref_lon, lat, lon);
-            if dist < 20_000.0 && best.as_ref().map_or(true, |(d, _)| dist < *d) {
-                best = Some((dist, candidate));
+        if let Some(hit) = coords {
+            let dist = haversine_meters(ref_lat, ref_lon, hit.lat, hit.lon);
+            if dist < 20_000.0 {
+                let label = hit
+                    .display_name
+                    .as_deref()
+                    .and_then(short_location_label)
+                    .unwrap_or(candidate);
+                let replace = best.as_ref().map_or(true, |(best_conf, best_dist, _)| {
+                    evidence.confidence > *best_conf
+                        || (evidence.confidence == *best_conf && dist < *best_dist)
+                });
+                if replace {
+                    best = Some((evidence.confidence, dist, label));
+                }
             }
         }
     }
-    best
+    best.map(|(_, dist, label)| (dist, label))
 }
 
 // ── Filtering ─────────────────────────────────────────────────────────────────
@@ -894,7 +1354,11 @@ fn normalize(s: &str) -> String {
 /// Returns `None` if the item should be dropped.
 /// Returns `Some((implied_meters, matched_terms))` where `implied_meters` is the
 /// closest matching area group's distance, or `None` if no area groups are configured.
-fn keyword_check(item: &FeedItem, filter: &FilterConfig, required: &[String]) -> Option<(Option<(f64, String)>, Vec<String>)> {
+fn keyword_check(
+    item: &FeedItem,
+    filter: &FilterConfig,
+    required: &[String],
+) -> Option<(Option<(f64, String)>, Vec<String>)> {
     let text = normalize(&format!(
         "{} {} {}",
         item.title,
@@ -923,7 +1387,10 @@ fn keyword_check(item: &FeedItem, filter: &FilterConfig, required: &[String]) ->
     for group in &filter.area {
         if let Some(term) = group.terms.iter().find(|t| text.contains(&normalize(t))) {
             matched.push(format!("\"{}\" ({}m)", term, group.implied_meters as u32));
-            if best.as_ref().map_or(true, |(d, _)| group.implied_meters < *d) {
+            if best
+                .as_ref()
+                .map_or(true, |(d, _)| group.implied_meters < *d)
+            {
                 best = Some((group.implied_meters, term.clone()));
             }
         }
@@ -933,16 +1400,13 @@ fn keyword_check(item: &FeedItem, filter: &FilterConfig, required: &[String]) ->
     Some((best, matched))
 }
 
-
 // ── Seen-items store (append-only file) ───────────────────────────────────────
-
 
 // ── Message formatting ────────────────────────────────────────────────────────
 
-
 fn format_digest(items: &[db::DbItem], header: &str) -> (String, String) {
     let mut plain = vec![format!("📡 {header}\n")];
-    let mut html  = vec![format!("📡 <strong>{}</strong><br>", html_escape(header))];
+    let mut html = vec![format!("📡 <strong>{}</strong><br>", html_escape(header))];
 
     for item in items {
         let src = &item.source_name;
@@ -959,19 +1423,44 @@ fn format_digest(items: &[db::DbItem], header: &str) -> (String, String) {
                 _ => info_parts.push(format_distance(d)),
             }
         }
-        let info_plain = if info_parts.is_empty() { String::new() }
-                         else { format!(" [{}]", info_parts.join(" ")) };
-        let info_html  = if info_parts.is_empty() { String::new() }
-                         else { format!(" <em>[{}]</em>", html_escape(&info_parts.join(" "))) };
+        let info_plain = if info_parts.is_empty() {
+            String::new()
+        } else {
+            format!(" [{}]", info_parts.join(" "))
+        };
+        let info_html = if info_parts.is_empty() {
+            String::new()
+        } else {
+            format!(" <em>[{}]</em>", html_escape(&info_parts.join(" ")))
+        };
 
-        let link_p = item.link.as_deref().map(|l| format!(" — {l}")).unwrap_or_default();
-        let link_h = item.link.as_deref()
-            .map(|l| format!(" — <a href=\"{l}\">link</a>"))
+        let link_p = item
+            .link
+            .as_deref()
+            .map(|l| format!(" — {l}"))
+            .unwrap_or_default();
+        let link_h = item
+            .link
+            .as_deref()
+            .map(|l| format!(" — <a href=\"{}\">link</a>", html_escape(l)))
+            .unwrap_or_default();
+        let note_p = item
+            .link_note
+            .as_deref()
+            .map(|note| format!(" ({note})"))
+            .unwrap_or_default();
+        let note_h = item
+            .link_note
+            .as_deref()
+            .map(|note| format!(" <em>({})</em>", html_escape(note)))
             .unwrap_or_default();
         let color = score_color(item.score);
-        plain.push(format!("{color} [{src}] {}{info_plain}{link_p}", item.title));
+        plain.push(format!(
+            "{color} [{src}] {}{info_plain}{link_p}{note_p}",
+            item.title
+        ));
         html.push(format!(
-            "{color} <em>[{}]</em> {}{info_html}{link_h}<br>",
+            "{color} <em>[{}]</em> {}{info_html}{link_h}{note_h}<br>",
             html_escape(src),
             html_escape(&item.title)
         ));
@@ -989,7 +1478,10 @@ fn format_digest(items: &[db::DbItem], header: &str) -> (String, String) {
 pub(crate) async fn post_to_rooms(client: &Client, plain: &str, html: &str) -> bool {
     let mut all_ok = true;
     for room in client.joined_rooms() {
-        if let Err(e) = room.send(RoomMessageEventContent::text_html(plain, html)).await {
+        if let Err(e) = room
+            .send(RoomMessageEventContent::text_html(plain, html))
+            .await
+        {
             error!("Failed to post to {}: {e}", room.room_id());
             all_ok = false;
         }
@@ -999,8 +1491,13 @@ pub(crate) async fn post_to_rooms(client: &Client, plain: &str, html: &str) -> b
 
 // ── Polling loop ──────────────────────────────────────────────────────────────
 
+enum ProcessOutcome {
+    Queued(FeedItem),
+    Dropped { item: FeedItem, reason: String },
+    Retry { item: FeedItem, reason: String },
+}
+
 /// Process a single feed item: fetch article, keyword-check, geocode, score.
-/// Returns `Some(item)` if it should go to the digest, `None` if filtered out.
 async fn process_item(
     http: reqwest::Client,
     source: SourceConfig,
@@ -1010,18 +1507,34 @@ async fn process_item(
     geocode_city: Arc<str>,
     geocode_cache: GeocodeCache,
     limiter: NominatimLimiter,
-) -> (bool, FeedItem) {
+) -> ProcessOutcome {
     let source_name = source.name.clone();
 
     // Fetch article body (used for filtering + geocoding street extraction).
     // extract_article_body() isolates <article>/<main> to avoid navigation false-positives.
     let needs_article = source.filter || source.base_implied_meters.is_some();
+    let mut article_fetch_failed = false;
     if needs_article && item.article_text.is_none() {
         if let Some(ref url) = item.link {
             tracing::debug!("fetching article [{}] {:?}", source_name, item.title);
-            item.article_text = fetch_article_text(&http, url).await;
-            if item.article_text.is_none() {
-                tracing::debug!("article fetch failed/empty [{}] {:?}", source_name, item.title);
+            match fetch_article(&http, url, &item.title).await {
+                Some(article) => {
+                    item.article_text = Some(article.text);
+                    if let Some(link) = article.resolved_link {
+                        item.link = Some(link);
+                    }
+                    item.link_note = article.link_note;
+                }
+                None => {
+                    article_fetch_failed = true;
+                }
+            }
+            if article_fetch_failed {
+                tracing::debug!(
+                    "article fetch failed/empty [{}] {:?}",
+                    source_name,
+                    item.title
+                );
             }
         }
     }
@@ -1031,8 +1544,23 @@ async fn process_item(
     let kw_evidence: Option<(f64, String)> = if source.filter {
         match keyword_check(&item, &filter, effective_required) {
             None => {
-                tracing::debug!("DROP [{}] {:?}", source_name, item.title);
-                return (false, item);
+                let reason = "required/blocklist keyword filter did not pass";
+                if article_fetch_failed {
+                    tracing::debug!(
+                        "RETRY [{}] {:?}: article fetch failed before keyword decision",
+                        source_name,
+                        item.title
+                    );
+                    return ProcessOutcome::Retry {
+                        item,
+                        reason: "article fetch failed before keyword decision".to_owned(),
+                    };
+                }
+                tracing::debug!("DROP [{}] {:?}: {reason}", source_name, item.title);
+                return ProcessOutcome::Dropped {
+                    item,
+                    reason: reason.to_owned(),
+                };
             }
             Some((implied, matched)) => {
                 let implied = implied.or_else(|| {
@@ -1050,7 +1578,8 @@ async fn process_item(
                 if !matched.is_empty() {
                     info!(
                         "PASS [{}] {:?} keyword_implied={:?}m terms=[{}]",
-                        source_name, item.title,
+                        source_name,
+                        item.title,
                         implied.as_ref().map(|(m, _)| *m as u32),
                         matched.join(", ")
                     );
@@ -1059,7 +1588,9 @@ async fn process_item(
             }
         }
     } else {
-        source.base_implied_meters.map(|meters| (meters, source_name.clone()))
+        source
+            .base_implied_meters
+            .map(|meters| (meters, source_name.clone()))
     };
 
     // ── 2. Geocode → actual distance ──────────────────────────────────────────
@@ -1072,22 +1603,39 @@ async fn process_item(
         // let body = item.article_text.as_deref()
         //     .or(item.description.as_deref())
         //     .unwrap_or("");
-        let all_text = format!(
-            "{} {} {}",
-            item.title,
-            item.description.as_deref().unwrap_or(""),
-            item.article_text.as_deref().unwrap_or(""),
+        let candidates_count = extract_street_evidence(
+            &item.title,
+            item.description.as_deref(),
+            item.article_text.as_deref(),
+        )
+        .len();
+        info!(
+            "  geocoding [{}] {:?} ({} candidates)",
+            source_name, item.title, candidates_count
         );
-        let candidates_count = {
-            let t = format!("{} {} {}", item.title, item.description.as_deref().unwrap_or(""), item.article_text.as_deref().unwrap_or(""));
-            extract_street_candidates(&t).len()
-        };
-        info!("  geocoding [{}] {:?} ({} candidates)", source_name, item.title, candidates_count);
-        match find_nearest_distance(&http, &all_text, ref_lat, ref_lon, &geocode_city, &geocode_cache, &limiter).await {
-            Some((dist, ref street)) => {
-                info!("  📍 [{}] {:?} → {} at {}", source_name, street, item.title, format_distance(dist));
+        match find_nearest_distance(
+            &http,
+            &item.title,
+            item.description.as_deref(),
+            item.article_text.as_deref(),
+            ref_lat,
+            ref_lon,
+            &geocode_city,
+            &geocode_cache,
+            &limiter,
+        )
+        .await
+        {
+            Some((dist, ref label)) => {
+                info!(
+                    "  📍 [{}] {:?} → {} at {}",
+                    source_name,
+                    label,
+                    item.title,
+                    format_distance(dist)
+                );
                 item.distance_meters = Some(dist);
-                Some((dist, street.clone()))
+                Some((dist, label.clone()))
             }
             None => {
                 info!("  no street geocoded [{}] {:?}", source_name, item.title);
@@ -1101,7 +1649,11 @@ async fn process_item(
     // ── 3. Final score ────────────────────────────────────────────────────────
     let final_location = match (geocoded_evidence, kw_evidence) {
         (Some((d, street)), Some((k, label))) => {
-            if d <= k { Some((d, street)) } else { Some((k, label)) }
+            if d <= k {
+                Some((d, street))
+            } else {
+                Some((k, label))
+            }
         }
         (Some(v), None) => Some(v),
         (None, Some(v)) => Some(v),
@@ -1111,8 +1663,23 @@ async fn process_item(
     let score = final_meters.map(distance_score).unwrap_or(0);
 
     if source.filter && score < filter.digest_threshold {
-        tracing::debug!("DROP [{}] {:?} score={} below threshold", source_name, item.title, score);
-        return (false, item);
+        let reason = format!(
+            "score {score} below digest threshold {}",
+            filter.digest_threshold
+        );
+        if article_fetch_failed {
+            tracing::debug!(
+                "RETRY [{}] {:?}: article fetch failed and {reason}",
+                source_name,
+                item.title
+            );
+            return ProcessOutcome::Retry {
+                item,
+                reason: format!("article fetch failed and {reason}"),
+            };
+        }
+        tracing::debug!("DROP [{}] {:?}: {reason}", source_name, item.title);
+        return ProcessOutcome::Dropped { item, reason };
     }
 
     info!("QUEUE [{}] {:?} score={}", source_name, item.title, score);
@@ -1120,7 +1687,7 @@ async fn process_item(
     item.max_score = 5;
     item.distance_meters = final_meters;
     item.location_label = final_location.map(|(_, label)| label);
-    (true, item)
+    ProcessOutcome::Queued(item)
 }
 
 async fn poll_once(
@@ -1138,30 +1705,57 @@ async fn poll_once(
     let geocode_city: Arc<str> = Arc::from(filter.geocode_city.as_deref().unwrap_or(""));
     let limiter: NominatimLimiter = Arc::new(Semaphore::new(1));
 
-    // Fetch all feeds and collect new items, then process them in parallel.
-    // Seen-check is sequential to avoid races; article fetch + geocoding run concurrently.
+    // Fetch all feeds concurrently and collect new items, then process them in parallel.
+    // Seen-check stays sequential to avoid races; article fetch + geocoding run concurrently.
     let mut pending: Vec<(SourceConfig, FeedItem)> = Vec::new();
     let mut total_by_source: HashMap<String, usize> = HashMap::new();
+    let mut source_tasks: JoinSet<(SourceConfig, Vec<FeedItem>)> = JoinSet::new();
+    let bluesky_owned = bluesky.cloned();
 
     for source in sources {
-        let items = sources::build_adapter(source, bluesky).fetch_items(http).await;
+        let source = source.clone();
+        let http = http.clone();
+        let bluesky = bluesky_owned.clone();
+        source_tasks.spawn(async move {
+            let items = sources::build_adapter(&source, bluesky.as_ref())
+                .fetch_items(&http)
+                .await;
+            (source, items)
+        });
+    }
+
+    while let Some(res) = source_tasks.join_next().await {
+        let (source, items) = match res {
+            Ok(v) => v,
+            Err(e) => {
+                warn!("Source fetch task panicked: {e}");
+                continue;
+            }
+        };
         *total_by_source.entry(source.name.clone()).or_default() += items.len();
 
         for item in items {
             let is_new = test_mode || db.is_new(&item.guid).await.unwrap_or(true);
-            if is_new { pending.push((source.clone(), item)); }
+            if is_new {
+                pending.push((source.clone(), item));
+            }
         }
     }
 
     // Spawn one task per item — article fetches and geocoding run in parallel.
     // Geocoding tasks share the NominatimLimiter so total Nominatim traffic stays ≤ 1 req/s.
-    let mut tasks: JoinSet<(bool, FeedItem)> = JoinSet::new();
+    let mut tasks: JoinSet<ProcessOutcome> = JoinSet::new();
     let n_pending = pending.len();
     for (source, item) in pending {
         tasks.spawn(process_item(
-            http.clone(), source, item,
-            arc_filter.clone(), ref_point,
-            geocode_city.clone(), geocode_cache.clone(), limiter.clone(),
+            http.clone(),
+            source,
+            item,
+            arc_filter.clone(),
+            ref_point,
+            geocode_city.clone(),
+            geocode_cache.clone(),
+            limiter.clone(),
         ));
     }
     if n_pending > 0 {
@@ -1180,28 +1774,53 @@ async fn poll_once(
                 interval.tick().await;
                 let done = n_done_shared.load(std::sync::atomic::Ordering::Relaxed);
                 let cache_n = cache.len();
-                info!("  ... {}/{} items done, {} geocode cache entries", done, n_pending, cache_n);
+                info!(
+                    "  ... {}/{} items done, {} geocode cache entries",
+                    done, n_pending, cache_n
+                );
             }
         })
     };
 
     let mut passed_by_source: HashMap<String, usize> = HashMap::new();
     let mut dropped_by_source: HashMap<String, usize> = HashMap::new();
+    let mut retried_by_source: HashMap<String, usize> = HashMap::new();
+    let mut drop_reasons: HashMap<String, usize> = HashMap::new();
+    let mut retry_reasons: HashMap<String, usize> = HashMap::new();
 
     while let Some(res) = tasks.join_next().await {
         n_done_shared.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         match res {
-            Ok((true, item)) => {
-                *passed_by_source.entry(item.source_name.clone()).or_default() += 1;
+            Ok(ProcessOutcome::Queued(item)) => {
+                *passed_by_source
+                    .entry(item.source_name.clone())
+                    .or_default() += 1;
                 if !test_mode {
                     db.insert_queued(&item).await.ok();
                 }
             }
-            Ok((false, item)) => {
-                *dropped_by_source.entry(item.source_name.clone()).or_default() += 1;
+            Ok(ProcessOutcome::Dropped { item, reason }) => {
+                *dropped_by_source
+                    .entry(item.source_name.clone())
+                    .or_default() += 1;
+                *drop_reasons.entry(reason.clone()).or_default() += 1;
                 if !test_mode {
-                    db.insert_dropped(&item.guid, &item.source_name, &item.title, item.link.as_deref()).await.ok();
+                    db.insert_dropped(
+                        &item.guid,
+                        &item.source_name,
+                        &item.title,
+                        item.link.as_deref(),
+                        &reason,
+                    )
+                    .await
+                    .ok();
                 }
+            }
+            Ok(ProcessOutcome::Retry { item, reason }) => {
+                *retried_by_source
+                    .entry(item.source_name.clone())
+                    .or_default() += 1;
+                *retry_reasons.entry(reason).or_default() += 1;
             }
             Err(e) => warn!("Item task panicked: {e}"),
         }
@@ -1212,11 +1831,18 @@ async fn poll_once(
         let total = total_by_source.get(&source.name).copied().unwrap_or(0);
         let passed = passed_by_source.get(&source.name).copied().unwrap_or(0);
         let dropped = dropped_by_source.get(&source.name).copied().unwrap_or(0);
+        let retried = retried_by_source.get(&source.name).copied().unwrap_or(0);
         if source.filter {
-            info!("Source '{}': {total} in feed, {passed} passed, {dropped} dropped", source.name);
+            info!("Source '{}': {total} in feed, {passed} passed, {dropped} dropped, {retried} retry-later", source.name);
         } else {
             info!("Source '{}': {total} in feed, {passed} new", source.name);
         }
+    }
+    for (reason, count) in drop_reasons {
+        info!("Drop reason: {count} item(s): {reason}");
+    }
+    for (reason, count) in retry_reasons {
+        info!("Retry reason: {count} item(s): {reason}");
     }
 }
 
@@ -1233,7 +1859,18 @@ async fn poll_loop(
 ) {
     let interval = Duration::from_secs(interval_mins * 60);
     loop {
-        poll_once(&client, &http, &sources, &filter, ref_point, &db, &geocode_cache, bluesky.as_ref(), false).await;
+        poll_once(
+            &client,
+            &http,
+            &sources,
+            &filter,
+            ref_point,
+            &db,
+            &geocode_cache,
+            bluesky.as_ref(),
+            false,
+        )
+        .await;
         info!("Next poll in {interval_mins}m");
         sleep(interval).await;
     }
@@ -1254,10 +1891,12 @@ fn chunk_digest(items: &[db::DbItem]) -> Vec<Vec<db::DbItem>> {
     let mut current_bytes: usize = 0;
 
     for item in sorted {
-        let item_bytes = item.title.len() + item.source_name.len()
-            + item.link.as_deref().map_or(0, |l| l.len()) + 50;
-        let would_overflow = current_bytes + item_bytes > MAX_DIGEST_BYTES
-            || current.len() >= MAX_DIGEST_ITEMS;
+        let item_bytes = item.title.len()
+            + item.source_name.len()
+            + item.link.as_deref().map_or(0, |l| l.len())
+            + 50;
+        let would_overflow =
+            current_bytes + item_bytes > MAX_DIGEST_BYTES || current.len() >= MAX_DIGEST_ITEMS;
         if would_overflow && !current.is_empty() {
             chunks.push(std::mem::take(&mut current));
             current_bytes = 0;
@@ -1273,13 +1912,9 @@ fn chunk_digest(items: &[db::DbItem]) -> Vec<Vec<db::DbItem>> {
 
 // ── Digest loop ───────────────────────────────────────────────────────────────
 
-async fn digest_loop(
-    client: Client,
-    digest_times: Vec<String>,
-    db: Db,
-    min_score: i32,
-) {
-    let targets: Vec<NaiveTime> = digest_times.iter()
+async fn digest_loop(client: Client, digest_times: Vec<String>, db: Db, min_score: i32) {
+    let targets: Vec<NaiveTime> = digest_times
+        .iter()
         .filter_map(|s| {
             let mut p = s.splitn(2, ':');
             let h: u32 = p.next()?.parse().ok()?;
@@ -1296,8 +1931,15 @@ async fn digest_loop(
     loop {
         let now = Local::now();
         let today = now.date_naive();
-        let next_dt = targets.iter()
-            .map(|t| if now.time() < *t { today.and_time(*t) } else { (today + chrono::Duration::days(1)).and_time(*t) })
+        let next_dt = targets
+            .iter()
+            .map(|t| {
+                if now.time() < *t {
+                    today.and_time(*t)
+                } else {
+                    (today + chrono::Duration::days(1)).and_time(*t)
+                }
+            })
             .min()
             .unwrap();
         let secs = (next_dt - now.naive_local()).num_seconds().max(0) as u64;
@@ -1306,7 +1948,10 @@ async fn digest_loop(
 
         let items = match db.take_for_digest(min_score).await {
             Ok(v) => v,
-            Err(e) => { error!("Digest: failed to query DB: {e}"); continue; }
+            Err(e) => {
+                error!("Digest: failed to query DB: {e}");
+                continue;
+            }
         };
 
         if items.is_empty() {
@@ -1332,7 +1977,10 @@ async fn digest_loop(
                     error!("Digest: failed to mark items posted: {e}");
                 }
             } else {
-                warn!("Digest: post failed — requeueing {} item(s) for retry", guids.len());
+                warn!(
+                    "Digest: post failed — requeueing {} item(s) for retry",
+                    guids.len()
+                );
                 db.requeue_failed(&guids, "post_to_rooms failed").await.ok();
             }
             if total > 1 {
@@ -1366,7 +2014,8 @@ async fn main() -> Result<()> {
         &config.matrix,
         &store_dir.join("matrix_store"),
         config.security.encryption_strategy.into(),
-    ).await?;
+    )
+    .await?;
 
     let allowed_inviters: HashSet<OwnedUserId> = config
         .security
@@ -1474,7 +2123,9 @@ async fn main() -> Result<()> {
                     return;
                 };
                 tokio::spawn(mxbot_common::verify::handle_verification_request(
-                    client, Arc::clone(&state.reset_allowed), request,
+                    client,
+                    Arc::clone(&state.reset_allowed),
+                    request,
                 ));
             }
         }
@@ -1495,10 +2146,14 @@ async fn main() -> Result<()> {
                             .encryption()
                             .get_verification_request(&ev.sender, &ev.event_id)
                             .await
-                        else { return; };
+                        else {
+                            return;
+                        };
                         tokio::spawn(mxbot_common::verify::handle_verification_request(
-                    client, Arc::clone(&state.reset_allowed), request,
-                ));
+                            client,
+                            Arc::clone(&state.reset_allowed),
+                            request,
+                        ));
                     }
                     MessageType::Text(text) => {
                         if let Some(target) = text.body.trim().strip_prefix("!reset-trust ") {
@@ -1506,9 +2161,11 @@ async fn main() -> Result<()> {
                                 if let Ok(target_user) = target.trim().parse::<OwnedUserId>() {
                                     state.reset_allowed.lock().await.insert(target_user.clone());
                                     info!("Trust reset for {target_user} (by {})", ev.sender);
-                                    room.send(RoomMessageEventContent::text_plain(
-                                        format!("Trust reset for {target_user}. They may re-verify."),
-                                    )).await.ok();
+                                    room.send(RoomMessageEventContent::text_plain(format!(
+                                        "Trust reset for {target_user}. They may re-verify."
+                                    )))
+                                    .await
+                                    .ok();
                                 }
                             } else {
                                 warn!("!reset-trust from non-admin {} — ignored", ev.sender);
@@ -1525,14 +2182,22 @@ async fn main() -> Result<()> {
     info!("Performing initial sync...");
     {
         let filter = FilterDefinition::with_lazy_loading();
-        client.sync_once(SyncSettings::default().filter(filter.into())).await?;
+        client
+            .sync_once(SyncSettings::default().filter(filter.into()))
+            .await?;
     }
-    info!("Initial sync complete. {} source(s) configured.", config.sources.len());
+    info!(
+        "Initial sync complete. {} source(s) configured.",
+        config.sources.len()
+    );
 
     // Drain pending invites from prior sessions.
     let invited = client.invited_rooms();
     if !invited.is_empty() {
-        info!("Pending invite(s) found after initial sync — joining {} room(s)", invited.len());
+        info!(
+            "Pending invite(s) found after initial sync — joining {} room(s)",
+            invited.len()
+        );
         for room in invited {
             let room_id = room.room_id().to_owned();
             let via: Vec<OwnedServerName> = room_id
@@ -1559,7 +2224,6 @@ async fn main() -> Result<()> {
         warn!("{recovered} item(s) recovered from interrupted digest — will retry at next digest time");
     }
 
-
     let geocode_cache: GeocodeCache = Arc::new(DashMap::new());
     let http = reqwest::Client::builder()
         .user_agent("Mozilla/5.0 (compatible; radar-bot/0.1)")
@@ -1569,9 +2233,9 @@ async fn main() -> Result<()> {
     let ref_point: Option<(f64, f64)> = if let Some(ref addr) = config.filter.reference_address {
         info!("Geocoding reference address: {addr}");
         match geocode_location(&http, addr, "").await {
-            Ok(Some(coords)) => {
-                info!("Reference point: {:.5}, {:.5}", coords.0, coords.1);
-                Some(coords)
+            Ok(Some(hit)) => {
+                info!("Reference point: {:.5}, {:.5}", hit.lat, hit.lon);
+                Some((hit.lat, hit.lon))
             }
             Ok(None) | Err(()) => {
                 warn!("Could not geocode reference address '{addr}' — distance scoring disabled");
@@ -1589,24 +2253,29 @@ async fn main() -> Result<()> {
         std::process::abort();
     });
 
-    let bluesky_ctx: Option<sources::BlueskyContext> =
-        match (config.bluesky.identifier, config.bluesky.password) {
-            (Some(identifier), Some(password)) => {
-                info!("Bluesky credentials configured for {identifier}");
-                Some(sources::BlueskyContext {
-                    identifier,
-                    password,
-                    session: sources::bluesky::new_shared_session(),
-                })
+    let bluesky_ctx: Option<sources::BlueskyContext> = match (
+        config.bluesky.identifier,
+        config.bluesky.password,
+    ) {
+        (Some(identifier), Some(password)) => {
+            info!("Bluesky credentials configured for {identifier}");
+            Some(sources::BlueskyContext {
+                identifier,
+                password,
+                session: sources::bluesky::new_shared_session(),
+            })
+        }
+        _ => {
+            let has_bluesky = config
+                .sources
+                .iter()
+                .any(|s| matches!(s.source_type, sources::SourceType::Bluesky));
+            if has_bluesky {
+                warn!("Bluesky source(s) configured but [bluesky] identifier/password missing — searches will fail");
             }
-            _ => {
-                let has_bluesky = config.sources.iter().any(|s| matches!(s.source_type, sources::SourceType::Bluesky));
-                if has_bluesky {
-                    warn!("Bluesky source(s) configured but [bluesky] identifier/password missing — searches will fail");
-                }
-                None
-            }
-        };
+            None
+        }
+    };
     let dwd_region_keywords = if config.weather.alerts_enabled {
         derive_warning_region_keywords(&config.filter, &config.weather)
     } else {
@@ -1615,7 +2284,10 @@ async fn main() -> Result<()> {
     if config.weather.alerts_enabled && dwd_region_keywords.is_empty() {
         warn!("DWD weather warnings disabled — no weather.warning_region_keywords, geocode_city, or reference_address city found");
     } else if !dwd_region_keywords.is_empty() {
-        info!("DWD weather warning region keyword(s): {:?}", dwd_region_keywords);
+        info!(
+            "DWD weather warning region keyword(s): {:?}",
+            dwd_region_keywords
+        );
     }
 
     if test_mode {
@@ -1626,15 +2298,26 @@ async fn main() -> Result<()> {
             let cache_before = geocode_cache.len();
             info!("Test mode: run {run}/2 (geocode cache: {cache_before} entries before)");
             poll_once(
-                &client, &http, &config.sources, &config.filter, ref_point,
-                &db, &geocode_cache, bluesky_ctx.as_ref(), true,
-            ).await;
+                &client,
+                &http,
+                &config.sources,
+                &config.filter,
+                ref_point,
+                &db,
+                &geocode_cache,
+                bluesky_ctx.as_ref(),
+                true,
+            )
+            .await;
             let cache_after = geocode_cache.len();
             info!("Run {run}/2 done — geocode cache: {cache_before} → {cache_after} entries");
 
             // In test mode poll_once doesn't write to DB; query what would be queued by
             // re-running take_for_digest on an empty DB (no-op) — instead just note it.
-            let items = db.take_for_digest(config.filter.digest_threshold).await.unwrap_or_default();
+            let items = db
+                .take_for_digest(config.filter.digest_threshold)
+                .await
+                .unwrap_or_default();
             if !items.is_empty() {
                 let chunks = chunk_digest(&items);
                 let total = chunks.len();
@@ -1646,7 +2329,9 @@ async fn main() -> Result<()> {
                     };
                     let (plain, html) = format_digest(&chunk, &header);
                     post_to_rooms(&client, &plain, &html).await;
-                    if total > 1 { sleep(Duration::from_millis(500)).await; }
+                    if total > 1 {
+                        sleep(Duration::from_millis(500)).await;
+                    }
                 }
             } else {
                 info!("Run {run}/2: no items passed the filter");
@@ -1686,14 +2371,17 @@ async fn main() -> Result<()> {
 
     if config.weather.enabled {
         if let Some(pt) = ref_point {
-            let post_time_str = config.weather.post_time
+            let post_time_str = config
+                .weather
+                .post_time
                 .or_else(|| config.schedule.digest_times.first().cloned())
                 .unwrap_or_else(|| "08:00".to_owned());
             let post_time = {
                 let mut p = post_time_str.splitn(2, ':');
                 let h: u32 = p.next().and_then(|s| s.parse().ok()).unwrap_or(8);
                 let m: u32 = p.next().and_then(|s| s.parse().ok()).unwrap_or(0);
-                NaiveTime::from_hms_opt(h, m, 0).unwrap_or_else(|| NaiveTime::from_hms_opt(8, 0, 0).unwrap())
+                NaiveTime::from_hms_opt(h, m, 0)
+                    .unwrap_or_else(|| NaiveTime::from_hms_opt(8, 0, 0).unwrap())
             };
             tokio::spawn(weather::weather_loop(
                 client.clone(),
@@ -1724,7 +2412,10 @@ async fn main() -> Result<()> {
     // Continuous Matrix sync
     let filter = FilterDefinition::with_lazy_loading();
     loop {
-        match client.sync(SyncSettings::default().filter(filter.clone().into())).await {
+        match client
+            .sync(SyncSettings::default().filter(filter.clone().into()))
+            .await
+        {
             Ok(()) => warn!("Sync loop exited cleanly — reconnecting"),
             Err(e) => warn!("Sync loop error: {e} — reconnecting in 5s"),
         }

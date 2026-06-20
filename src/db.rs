@@ -15,6 +15,7 @@ pub struct DbItem {
     pub source_name: String,
     pub title: String,
     pub link: Option<String>,
+    pub link_note: Option<String>,
     pub score: i32,
     pub max_score: i32,
     pub distance_meters: Option<f64>,
@@ -32,8 +33,10 @@ impl Db {
         conn.pragma_update(None, "journal_mode", "WAL")?;
         // Wait up to 5 s instead of immediately returning SQLITE_BUSY.
         conn.pragma_update(None, "busy_timeout", 5_000i64)?;
-        conn.execute_batch(SCHEMA).context("Failed to initialise DB schema")?;
+        conn.execute_batch(SCHEMA)
+            .context("Failed to initialise DB schema")?;
         ensure_column(&conn, "items", "location_label", "TEXT")?;
+        ensure_column(&conn, "items", "link_note", "TEXT")?;
         Ok(Db(Arc::new(Mutex::new(conn))))
     }
 
@@ -58,22 +61,23 @@ impl Db {
     /// Persist a scored item that passed all filters. No-op if guid already exists.
     pub async fn insert_queued(&self, item: &FeedItem) -> Result<()> {
         let db = self.0.clone();
-        let guid         = item.guid.clone();
-        let source_name  = item.source_name.clone();
-        let title        = item.title.clone();
-        let link         = item.link.clone();
-        let score        = item.score;
-        let max_score    = item.max_score;
-        let distance_m   = item.distance_meters;
-        let location     = item.location_label.clone();
-        let now          = chrono::Utc::now().timestamp();
+        let guid = item.guid.clone();
+        let source_name = item.source_name.clone();
+        let title = item.title.clone();
+        let link = item.link.clone();
+        let link_note = item.link_note.clone();
+        let score = item.score;
+        let max_score = item.max_score;
+        let distance_m = item.distance_meters;
+        let location = item.location_label.clone();
+        let now = chrono::Utc::now().timestamp();
 
         tokio::task::spawn_blocking(move || {
             db.lock().unwrap().execute(
                 "INSERT OR IGNORE INTO items
-                 (guid, source_name, title, link, score, max_score, distance_m, location_label, discovered_at, state)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'queued')",
-                params![guid, source_name, title, link, score, max_score, distance_m, location, now],
+                 (guid, source_name, title, link, link_note, score, max_score, distance_m, location_label, discovered_at, state)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'queued')",
+                params![guid, source_name, title, link, link_note, score, max_score, distance_m, location, now],
             )?;
             Ok::<(), anyhow::Error>(())
         })
@@ -81,20 +85,28 @@ impl Db {
     }
 
     /// Persist a filtered-out item as 'dropped' so it is not reprocessed next poll.
-    pub async fn insert_dropped(&self, guid: &str, source_name: &str, title: &str, link: Option<&str>) -> Result<()> {
-        let db          = self.0.clone();
-        let guid        = guid.to_owned();
+    pub async fn insert_dropped(
+        &self,
+        guid: &str,
+        source_name: &str,
+        title: &str,
+        link: Option<&str>,
+        reason: &str,
+    ) -> Result<()> {
+        let db = self.0.clone();
+        let guid = guid.to_owned();
         let source_name = source_name.to_owned();
-        let title       = title.to_owned();
-        let link        = link.map(|s| s.to_owned());
-        let now         = chrono::Utc::now().timestamp();
+        let title = title.to_owned();
+        let link = link.map(|s| s.to_owned());
+        let reason = reason.to_owned();
+        let now = chrono::Utc::now().timestamp();
 
         tokio::task::spawn_blocking(move || {
             db.lock().unwrap().execute(
                 "INSERT OR IGNORE INTO items
-                 (guid, source_name, title, link, score, max_score, discovered_at, state)
-                 VALUES (?1, ?2, ?3, ?4, 0, 0, ?5, 'dropped')",
-                params![guid, source_name, title, link, now],
+                 (guid, source_name, title, link, score, max_score, discovered_at, state, error)
+                 VALUES (?1, ?2, ?3, ?4, 0, 0, ?5, 'dropped', ?6)",
+                params![guid, source_name, title, link, now, reason],
             )?;
             Ok::<(), anyhow::Error>(())
         })
@@ -110,7 +122,7 @@ impl Db {
     ///
     /// Caller MUST call mark_posted() or requeue_failed() for the returned items.
     pub async fn take_for_digest(&self, min_score: i32) -> Result<Vec<DbItem>> {
-        let db  = self.0.clone();
+        let db = self.0.clone();
         let now = chrono::Utc::now().timestamp();
 
         tokio::task::spawn_blocking(move || {
@@ -129,7 +141,7 @@ impl Db {
             )?;
 
             let mut stmt = tx.prepare(
-                "SELECT guid, source_name, title, link, score, max_score, distance_m, location_label
+                "SELECT guid, source_name, title, link, link_note, score, max_score, distance_m, location_label
                  FROM items WHERE state = 'processing'
                  ORDER BY score DESC",
             )?;
@@ -139,10 +151,11 @@ impl Db {
                     source_name:     row.get(1)?,
                     title:           row.get(2)?,
                     link:            row.get(3)?,
-                    score:           row.get(4)?,
-                    max_score:       row.get(5)?,
-                    distance_meters: row.get(6)?,
-                    location_label:  row.get(7)?,
+                    link_note:       row.get(4)?,
+                    score:           row.get(5)?,
+                    max_score:       row.get(6)?,
+                    distance_meters: row.get(7)?,
+                    location_label:  row.get(8)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -156,10 +169,12 @@ impl Db {
 
     /// Mark items as successfully posted. Call after post_to_rooms confirms delivery.
     pub async fn mark_posted(&self, guids: &[String]) -> Result<()> {
-        if guids.is_empty() { return Ok(()); }
-        let db   = self.0.clone();
+        if guids.is_empty() {
+            return Ok(());
+        }
+        let db = self.0.clone();
         let guids = guids.to_vec();
-        let now  = chrono::Utc::now().timestamp();
+        let now = chrono::Utc::now().timestamp();
 
         tokio::task::spawn_blocking(move || {
             let conn = db.lock().unwrap();
@@ -177,8 +192,10 @@ impl Db {
 
     /// Post failed: move items back to 'queued' so the next digest retries them.
     pub async fn requeue_failed(&self, guids: &[String], error: &str) -> Result<()> {
-        if guids.is_empty() { return Ok(()); }
-        let db    = self.0.clone();
+        if guids.is_empty() {
+            return Ok(());
+        }
+        let db = self.0.clone();
         let guids = guids.to_vec();
         let error = error.to_owned();
 
@@ -231,10 +248,10 @@ impl Db {
     }
 
     pub async fn mark_alert_seen(&self, id: &str, source: &str) -> Result<()> {
-        let db     = self.0.clone();
-        let id     = id.to_owned();
+        let db = self.0.clone();
+        let id = id.to_owned();
         let source = source.to_owned();
-        let now    = chrono::Utc::now().timestamp();
+        let now = chrono::Utc::now().timestamp();
         tokio::task::spawn_blocking(move || {
             db.lock().unwrap().execute(
                 "INSERT OR IGNORE INTO alerts (id, source, sent_at) VALUES (?1, ?2, ?3)",
@@ -250,7 +267,7 @@ impl Db {
     /// Delete posted/dropped items older than keep_days. Returns rows deleted.
     #[allow(dead_code)]
     pub async fn prune_old(&self, keep_days: u32) -> Result<u64> {
-        let db     = self.0.clone();
+        let db = self.0.clone();
         let cutoff = chrono::Utc::now().timestamp() - (keep_days as i64 * 86_400);
         tokio::task::spawn_blocking(move || {
             let n = db.lock().unwrap().execute(
@@ -273,7 +290,10 @@ fn ensure_column(conn: &Connection, table: &str, column: &str, definition: &str)
         .any(|name| name == column);
 
     if !exists {
-        conn.execute(&format!("ALTER TABLE {table} ADD COLUMN {column} {definition}"), [])?;
+        conn.execute(
+            &format!("ALTER TABLE {table} ADD COLUMN {column} {definition}"),
+            [],
+        )?;
     }
     Ok(())
 }
@@ -286,6 +306,7 @@ const SCHEMA: &str = "
         source_name      TEXT    NOT NULL,
         title            TEXT    NOT NULL,
         link             TEXT,
+        link_note        TEXT,
         score            INTEGER NOT NULL DEFAULT 0,
         max_score        INTEGER NOT NULL DEFAULT 0,
         distance_m       REAL,

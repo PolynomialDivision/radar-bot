@@ -147,12 +147,7 @@ async fn check_nina(client: &Client, http: &reqwest::Client, db: &Db, ags: &str)
 
         let desc = format_nina_description(data);
         let link = format!("https://warnung.bund.de/meldung/{id}");
-        let (plain, html) = format_alert(
-            "NINA/warnung.bund.de",
-            headline,
-            &desc,
-            Some(&link),
-        );
+        let (plain, html) = format_alert("NINA/warnung.bund.de", headline, &desc, Some(&link));
         if crate::post_to_rooms(client, &plain, &html).await {
             db.mark_alert_seen(&alert_key, "nina").await?;
             info!("ALERT sent [nina]: {headline}");
@@ -183,7 +178,9 @@ fn format_nina_description(data: &serde_json::Value) -> String {
         lines.push(format!("📍 {area}"));
     }
 
-    if let Some(valid) = format_rfc3339_validity(data["effective"].as_str(), data["expires"].as_str()) {
+    if let Some(valid) =
+        format_rfc3339_validity(data["effective"].as_str(), data["expires"].as_str())
+    {
         lines.push(format!("🕒 {valid}"));
     }
 
@@ -665,7 +662,9 @@ mod tests {
         assert!(desc.contains("📍 Berlin"));
         assert!(desc.contains("🕒"));
         assert!(desc.contains("ℹ️ Am Samstag wird eine extreme Wärmebelastung erwartet."));
-        assert!(desc.contains("✅ Hitzebelastung kann für den menschlichen Körper gefährlich werden."));
+        assert!(
+            desc.contains("✅ Hitzebelastung kann für den menschlichen Körper gefährlich werden.")
+        );
         assert!(!desc.contains("Noch ein Satz"));
     }
 
@@ -700,6 +699,9 @@ mod tests {
             "severity": "Severe"
         });
 
-        assert_ne!(nina_alert_key("warn-1", &first), nina_alert_key("warn-1", &updated));
+        assert_ne!(
+            nina_alert_key("warn-1", &first),
+            nina_alert_key("warn-1", &updated)
+        );
     }
 }

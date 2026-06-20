@@ -11,11 +11,7 @@ pub struct RssAdapter {
 
 impl RssAdapter {
     pub async fn fetch_items(&self, http: &reqwest::Client) -> Vec<FeedItem> {
-        let resp = tokio::time::timeout(
-            Duration::from_secs(30),
-            http.get(&self.url).send(),
-        )
-        .await;
+        let resp = tokio::time::timeout(Duration::from_secs(30), http.get(&self.url).send()).await;
 
         let xml = match resp {
             Ok(Ok(r)) => match r.text().await {
@@ -44,7 +40,10 @@ impl RssAdapter {
             items.retain(|item| item.published_at.map_or(true, |ts| ts >= cutoff));
             let dropped = before - items.len();
             if dropped > 0 {
-                warn!("RSS age filter [{}]: dropped {dropped} item(s) older than {max_age}h", self.name);
+                warn!(
+                    "RSS age filter [{}]: dropped {dropped} item(s) older than {max_age}h",
+                    self.name
+                );
             }
         }
 
