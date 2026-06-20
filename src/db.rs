@@ -396,6 +396,54 @@ impl Db {
         .await?
     }
 
+    /// Atomically replace an active-warning row with a new one for a different level,
+    /// transferring the Matrix event IDs so the same message can continue to be edited.
+    /// Used when a warning escalates or de-escalates: the old-level row is deleted and
+    /// a new-level row is inserted with the same event_ids_json.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn promote_dwd_active_warning(
+        &self,
+        old_id: &str,
+        new_id: &str,
+        headline: &str,
+        region: &str,
+        event: &str,
+        event_ids_json: &str,
+        start_ms: i64,
+        end_ms: i64,
+        original_plain: &str,
+        original_html: &str,
+    ) -> Result<()> {
+        let db = self.0.clone();
+        let old_id = old_id.to_owned();
+        let new_id = new_id.to_owned();
+        let headline = headline.to_owned();
+        let region = region.to_owned();
+        let event = event.to_owned();
+        let event_ids_json = event_ids_json.to_owned();
+        let original_plain = original_plain.to_owned();
+        let original_html = original_html.to_owned();
+        let now = chrono::Utc::now().timestamp();
+        tokio::task::spawn_blocking(move || {
+            let mut conn = db.lock().unwrap();
+            let tx = conn.transaction()?;
+            tx.execute("DELETE FROM dwd_active_warnings WHERE id = ?1", params![old_id])?;
+            tx.execute(
+                "INSERT INTO dwd_active_warnings
+                     (id, headline, region, event, seen_at,
+                      event_ids_json, start_ms, end_ms, original_plain, original_html)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                params![
+                    new_id, headline, region, event, now,
+                    event_ids_json, start_ms, end_ms, original_plain, original_html
+                ],
+            )?;
+            tx.commit()?;
+            Ok::<(), anyhow::Error>(())
+        })
+        .await?
+    }
+
     /// Remove the active-warning row once an all-clear has been delivered.
     /// The next occurrence of the same warning type is then treated as fresh.
     pub async fn mark_dwd_allclear_sent(&self, warning_id: &str) -> Result<()> {
