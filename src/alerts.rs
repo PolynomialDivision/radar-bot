@@ -222,7 +222,7 @@ fn format_nina_description(data: &serde_json::Value) -> String {
     }
 
     if let Some(advice) = concise_sentences(data["instruction"].as_str().unwrap_or(""), 2) {
-        lines.push(format!("✅ {advice}"));
+        lines.push(format!("💡 {advice}"));
     }
 
     lines.join("\n")
@@ -965,7 +965,7 @@ fn format_dwd_description_with_continuations(
         parts.push(format!("ℹ️ {details}"));
     }
     if let Some(advice) = concise_sentences(instruction, 1) {
-        parts.push(format!("✅ {advice}"));
+        parts.push(format!("💡 {advice}"));
     }
     for note in continuations {
         parts.push(note.clone());
@@ -1574,7 +1574,7 @@ mod tests {
         assert!(desc.contains("🕒"));
         assert!(desc.contains("ℹ️ Am Samstag wird eine extreme Wärmebelastung erwartet."));
         assert!(
-            desc.contains("✅ Hitzebelastung kann für den menschlichen Körper gefährlich werden.")
+            desc.contains("💡 Hitzebelastung kann für den menschlichen Körper gefährlich werden.")
         );
         assert!(!desc.contains("Noch ein Satz"));
     }
@@ -1730,13 +1730,13 @@ mod tests {
         let (plain, html) = format_alert(
             "DWD Weather Warnings",
             "Amtliche WARNUNG vor HITZE",
-            "📍 Berlin\n✅ Drink water",
+            "📍 Berlin\n💡 Drink water",
             Some("https://www.dwd.de/"),
         );
 
         assert!(plain.contains("🚨 Amtliche WARNUNG vor HITZE"));
-        assert!(plain.contains("📍 Berlin\n✅ Drink water\n🔗 https://www.dwd.de/"));
-        assert!(html.contains("📍 Berlin<br>✅ Drink water"));
+        assert!(plain.contains("📍 Berlin\n💡 Drink water\n🔗 https://www.dwd.de/"));
+        assert!(html.contains("📍 Berlin<br>💡 Drink water"));
         assert!(html.contains("🔗 <a href=\"https://www.dwd.de/\">https://www.dwd.de/</a>"));
         assert!(!html.contains("DWD level"));
     }
