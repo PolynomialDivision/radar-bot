@@ -56,8 +56,18 @@ impl Db {
         ensure_column(&conn, "dwd_active_warnings", "event_ids_json", "TEXT")?;
         ensure_column(&conn, "dwd_active_warnings", "original_plain", "TEXT")?;
         ensure_column(&conn, "dwd_active_warnings", "original_html", "TEXT")?;
-        ensure_column(&conn, "dwd_active_warnings", "start_ms", "INTEGER NOT NULL DEFAULT 0")?;
-        ensure_column(&conn, "dwd_active_warnings", "end_ms", "INTEGER NOT NULL DEFAULT 0")?;
+        ensure_column(
+            &conn,
+            "dwd_active_warnings",
+            "start_ms",
+            "INTEGER NOT NULL DEFAULT 0",
+        )?;
+        ensure_column(
+            &conn,
+            "dwd_active_warnings",
+            "end_ms",
+            "INTEGER NOT NULL DEFAULT 0",
+        )?;
         Ok(Db(Arc::new(Mutex::new(conn))))
     }
 
@@ -356,8 +366,16 @@ impl Db {
                      original_plain = excluded.original_plain,
                      original_html  = excluded.original_html",
                 params![
-                    id, headline, region, event, now,
-                    event_ids_json, start_ms, end_ms, original_plain, original_html
+                    id,
+                    headline,
+                    region,
+                    event,
+                    now,
+                    event_ids_json,
+                    start_ms,
+                    end_ms,
+                    original_plain,
+                    original_html
                 ],
             )?;
             Ok::<(), anyhow::Error>(())
@@ -427,15 +445,26 @@ impl Db {
         tokio::task::spawn_blocking(move || {
             let mut conn = db.lock().unwrap();
             let tx = conn.transaction()?;
-            tx.execute("DELETE FROM dwd_active_warnings WHERE id = ?1", params![old_id])?;
+            tx.execute(
+                "DELETE FROM dwd_active_warnings WHERE id = ?1",
+                params![old_id],
+            )?;
             tx.execute(
                 "INSERT INTO dwd_active_warnings
                      (id, headline, region, event, seen_at,
                       event_ids_json, start_ms, end_ms, original_plain, original_html)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
                 params![
-                    new_id, headline, region, event, now,
-                    event_ids_json, start_ms, end_ms, original_plain, original_html
+                    new_id,
+                    headline,
+                    region,
+                    event,
+                    now,
+                    event_ids_json,
+                    start_ms,
+                    end_ms,
+                    original_plain,
+                    original_html
                 ],
             )?;
             tx.commit()?;

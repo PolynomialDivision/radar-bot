@@ -16,6 +16,13 @@ use tracing::{error, info, warn};
 
 use crate::db::Db;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DwdEditResult {
+    Ok,
+    MissingOriginal,
+    Failed,
+}
+
 pub struct AlertConfig {
     /// AGS resolved at startup from ref_point. None = outside Germany, skip NINA.
     pub nina_ags: Option<String>,
@@ -256,7 +263,7 @@ async fn check_dwd_weather_warnings(
     struct ValidWarning {
         bucket: String,
         region: String,
-        event: String,
+        event_key: String,
         headline: String,
         start_ms: i64,
         end_ms: i64,
@@ -299,15 +306,13 @@ async fn check_dwd_weather_warnings(
                     .or_else(|| w["headline"].as_str())
                     .unwrap_or("Wetterwarnung")
                     .to_string();
-                let headline = w["headline"]
-                    .as_str()
-                    .unwrap_or(&event)
-                    .to_string();
+                let event_key = dwd_event_key(&event);
+                let headline = w["headline"].as_str().unwrap_or(&event).to_string();
                 let level = w["level"].as_i64().unwrap_or(0);
                 valid.push(ValidWarning {
                     bucket: bucket.to_string(),
                     region: region.to_string(),
-                    event,
+                    event_key,
                     headline,
                     start_ms,
                     end_ms,
@@ -318,14 +323,14 @@ async fn check_dwd_weather_warnings(
         }
     }
 
-    // Phase 2: group by (bucket, region, event) so simultaneous warnings for
+    // Phase 2: group by (bucket, region, event family) so simultaneous warnings for
     // the same event (e.g. Level 4 HITZE 11-19h + Level 2 HITZE 19h-next) are
     // shown as one message with a continuation note rather than two messages.
     // Within each group: highest level = primary; the rest = continuations.
     let mut groups: HashMap<(String, String, String), Vec<usize>> = HashMap::new();
     for (i, vw) in valid.iter().enumerate() {
         groups
-            .entry((vw.bucket.clone(), vw.region.clone(), vw.event.clone()))
+            .entry((vw.bucket.clone(), vw.region.clone(), vw.event_key.clone()))
             .or_default()
             .push(i);
     }
@@ -337,7 +342,7 @@ async fn check_dwd_weather_warnings(
     // for the old-level row that was just replaced.
     let mut promoted_keys: HashSet<String> = HashSet::new();
 
-    for ((bucket, region, event), indices) in &groups {
+    for ((bucket, region, event_key), indices) in &groups {
         // Sort: highest level first; within same level, earliest start first.
         let mut group: Vec<&ValidWarning> = indices.iter().map(|&i| &valid[i]).collect();
         group.sort_by(|a, b| b.level.cmp(&a.level).then(a.start_ms.cmp(&b.start_ms)));
@@ -352,41 +357,88 @@ async fn check_dwd_weather_warnings(
             let id = dwd_warning_stable_key(bucket, region, &vw.w);
             current_active.insert(id);
             active_level_by_event
-                .entry((bucket.clone(), region.clone(), event.clone()))
+                .entry((bucket.clone(), region.clone(), event_key.clone()))
                 .and_modify(|e| *e = (*e).max(vw.level))
                 .or_insert(vw.level);
         }
 
-        // Build continuation notes sorted by start time (already sorted above).
-        let cont_notes: Vec<String> = continuations
+        // Build secondary notes sorted by start time. The primary remains the worst
+        // active warning; lower overlapping/follow-up warnings are shown underneath.
+        let mut secondary: Vec<&ValidWarning> = continuations.to_vec();
+        secondary.sort_by(|a, b| a.start_ms.cmp(&b.start_ms).then(b.level.cmp(&a.level)));
+        let cont_notes: Vec<String> = secondary
             .iter()
-            .map(|vw| format_dwd_continuation(&vw.w))
+            .map(|vw| format_dwd_secondary_warning(&primary.w, &vw.w))
             .collect();
 
         if let Some(active) = active_map.get(&primary_id) {
             // Already posted. Edit in-place if the primary time window changed.
             if active.start_ms != primary.start_ms || active.end_ms != primary.end_ms {
-                let (new_plain, new_html, edited) = match active.event_ids_json.as_deref() {
+                let (new_plain, new_html, edit_result) = match active.event_ids_json.as_deref() {
                     Some(ids_json) => {
-                        let desc = format_dwd_description_with_continuations(region, &primary.w, &cont_notes);
+                        let desc = format_dwd_description_with_continuations(
+                            region,
+                            &primary.w,
+                            &cont_notes,
+                        );
                         let (p, h) = format_alert(
                             "DWD Weather Warnings",
                             &primary.headline,
                             &desc,
                             Some("https://www.dwd.de/DE/wetter/warnungen_gemeinden/warnWetter_node.html"),
                         );
-                        let ok = edit_dwd_warning_in_rooms(client, ids_json, &p, &h).await;
-                        (p, h, ok)
+                        let edit_result = edit_dwd_warning_in_rooms(client, ids_json, &p, &h).await;
+                        (p, h, edit_result)
                     }
                     // No event IDs stored (pre-upgrade row): can't edit.
-                    _ => (String::new(), String::new(), false),
+                    _ => (String::new(), String::new(), DwdEditResult::Failed),
                 };
-                let plain_opt = if edited { Some(new_plain.as_str()) } else { None };
-                let html_opt = if edited { Some(new_html.as_str()) } else { None };
-                db.update_dwd_active_warning(&primary_id, primary.start_ms, primary.end_ms, plain_opt, html_opt)
-                    .await?;
+                let edited = matches!(edit_result, DwdEditResult::Ok);
+                let plain_opt = if edited {
+                    Some(new_plain.as_str())
+                } else {
+                    None
+                };
+                let html_opt = if edited {
+                    Some(new_html.as_str())
+                } else {
+                    None
+                };
+                db.update_dwd_active_warning(
+                    &primary_id,
+                    primary.start_ms,
+                    primary.end_ms,
+                    plain_opt,
+                    html_opt,
+                )
+                .await?;
                 if edited {
                     info!("ALERT updated [dwd]: {} ({region})", primary.headline);
+                } else if matches!(edit_result, DwdEditResult::MissingOriginal) {
+                    if repost_dwd_active_warning(
+                        client,
+                        db,
+                        &primary_id,
+                        &primary.headline,
+                        region,
+                        event_key,
+                        primary.start_ms,
+                        primary.end_ms,
+                        &new_plain,
+                        &new_html,
+                    )
+                    .await?
+                    {
+                        info!(
+                            "ALERT reposted [dwd] after missing original: {} ({region})",
+                            primary.headline
+                        );
+                    } else {
+                        warn!(
+                            "ALERT repost failed [dwd], will retry: {} ({region})",
+                            primary.headline
+                        );
+                    }
                 }
             }
             continue;
@@ -402,16 +454,14 @@ async fn check_dwd_weather_warnings(
                 .map(|(kb, kr, ke, ol)| {
                     kb == bucket.as_str()
                         && kr == region.as_str()
-                        && ke == event.as_str()
+                        && dwd_event_key(ke) == event_key.as_str()
                         && ol != primary.level
                 })
                 .unwrap_or(false)
         });
 
         if let Some((old_id, old_warning)) = old_same_event {
-            let old_level = parse_stable_key(old_id)
-                .map(|(_, _, _, l)| l)
-                .unwrap_or(0);
+            let old_level = parse_stable_key(old_id).map(|(_, _, _, l)| l).unwrap_or(0);
             let desc = format_dwd_description_with_continuations(region, &primary.w, &cont_notes);
             let (new_plain, new_html) = format_alert(
                 "DWD Weather Warnings",
@@ -423,20 +473,75 @@ async fn check_dwd_weather_warnings(
             match old_warning.event_ids_json.as_deref() {
                 Some(ids_json) => {
                     // Edit the existing message: replace content with new level + append notice.
-                    let (edit_plain, edit_html) =
-                        append_level_change_to_warning(&new_plain, &new_html, old_level, primary.level);
-                    if edit_dwd_warning_in_rooms(client, ids_json, &edit_plain, &edit_html).await {
-                        // Store new_plain (without the footer) so future all-clear appends cleanly.
-                        db.promote_dwd_active_warning(
-                            old_id, &primary_id, &primary.headline, region, event,
-                            ids_json, primary.start_ms, primary.end_ms, &new_plain, &new_html,
-                        )
-                        .await?;
-                        promoted_keys.insert(old_id.clone());
-                        let dir = if primary.level > old_level { "⬆" } else { "⬇" };
-                        info!("LEVEL CHANGE {dir} [dwd]: {} ({region}) L{old_level} → L{}", primary.headline, primary.level);
-                    } else {
-                        warn!("LEVEL CHANGE failed [dwd], will retry: {} ({region})", primary.headline);
+                    let (edit_plain, edit_html) = append_level_change_to_warning(
+                        &new_plain,
+                        &new_html,
+                        old_level,
+                        primary.level,
+                        event_key,
+                    );
+                    match edit_dwd_warning_in_rooms(client, ids_json, &edit_plain, &edit_html).await
+                    {
+                        DwdEditResult::Ok => {
+                            // Store new_plain (without the footer) so future all-clear appends cleanly.
+                            db.promote_dwd_active_warning(
+                                old_id,
+                                &primary_id,
+                                &primary.headline,
+                                region,
+                                event_key,
+                                ids_json,
+                                primary.start_ms,
+                                primary.end_ms,
+                                &new_plain,
+                                &new_html,
+                            )
+                            .await?;
+                            promoted_keys.insert(old_id.clone());
+                            let dir = if primary.level > old_level {
+                                "⬆"
+                            } else {
+                                "⬇"
+                            };
+                            info!(
+                                "LEVEL CHANGE {dir} [dwd]: {} ({region}) L{old_level} → L{}",
+                                primary.headline, primary.level
+                            );
+                        }
+                        DwdEditResult::MissingOriginal => {
+                            if repost_dwd_active_warning(
+                                client,
+                                db,
+                                &primary_id,
+                                &primary.headline,
+                                region,
+                                event_key,
+                                primary.start_ms,
+                                primary.end_ms,
+                                &new_plain,
+                                &new_html,
+                            )
+                            .await?
+                            {
+                                db.mark_dwd_allclear_sent(old_id).await?;
+                                promoted_keys.insert(old_id.clone());
+                                info!(
+                                    "LEVEL CHANGE reposted [dwd] after missing original: {} ({region})",
+                                    primary.headline
+                                );
+                            } else {
+                                warn!(
+                                    "LEVEL CHANGE repost failed [dwd], will retry: {} ({region})",
+                                    primary.headline
+                                );
+                            }
+                        }
+                        DwdEditResult::Failed => {
+                            warn!(
+                                "LEVEL CHANGE failed [dwd], will retry: {} ({region})",
+                                primary.headline
+                            );
+                        }
                     }
                 }
                 None => {
@@ -448,14 +553,28 @@ async fn check_dwd_weather_warnings(
                         let ids_json = serde_json::to_string(&room_event_ids)
                             .unwrap_or_else(|_| String::from("{}"));
                         db.promote_dwd_active_warning(
-                            old_id, &primary_id, &primary.headline, region, event,
-                            &ids_json, primary.start_ms, primary.end_ms, &new_plain, &new_html,
+                            old_id,
+                            &primary_id,
+                            &primary.headline,
+                            region,
+                            event_key,
+                            &ids_json,
+                            primary.start_ms,
+                            primary.end_ms,
+                            &new_plain,
+                            &new_html,
                         )
                         .await?;
                         promoted_keys.insert(old_id.clone());
-                        info!("LEVEL CHANGE (post fallback) [dwd]: {} ({region})", primary.headline);
+                        info!(
+                            "LEVEL CHANGE (post fallback) [dwd]: {} ({region})",
+                            primary.headline
+                        );
                     } else {
-                        warn!("LEVEL CHANGE post failed [dwd], will retry: {} ({region})", primary.headline);
+                        warn!(
+                            "LEVEL CHANGE post failed [dwd], will retry: {} ({region})",
+                            primary.headline
+                        );
                     }
                 }
             }
@@ -470,16 +589,26 @@ async fn check_dwd_weather_warnings(
             );
             let (all_ok, room_event_ids) = post_dwd_warning_to_rooms(client, &plain, &html).await;
             if all_ok {
-                let ids_json = serde_json::to_string(&room_event_ids)
-                    .unwrap_or_else(|_| String::from("{}"));
+                let ids_json =
+                    serde_json::to_string(&room_event_ids).unwrap_or_else(|_| String::from("{}"));
                 db.mark_dwd_alert_posted(
-                    &primary_id, &primary.headline, region, event, &ids_json,
-                    primary.start_ms, primary.end_ms, &plain, &html,
+                    &primary_id,
+                    &primary.headline,
+                    region,
+                    event_key,
+                    &ids_json,
+                    primary.start_ms,
+                    primary.end_ms,
+                    &plain,
+                    &html,
                 )
                 .await?;
                 info!("ALERT sent [dwd]: {} ({region})", primary.headline);
             } else {
-                warn!("ALERT post failed [dwd], will retry next poll: {} ({region})", primary.headline);
+                warn!(
+                    "ALERT post failed [dwd], will retry next poll: {} ({region})",
+                    primary.headline
+                );
             }
         }
     }
@@ -493,9 +622,7 @@ async fn check_dwd_weather_warnings(
         // Also skip if a level-change is in progress but the edit failed last poll:
         // Phase 2 will retry it; firing an all-clear here would be wrong.
         if let Some((b, r, e, _)) = parse_stable_key(id) {
-            if active_level_by_event
-                .contains_key(&(b.to_owned(), r.to_owned(), e.to_owned()))
-            {
+            if active_level_by_event.contains_key(&(b.to_owned(), r.to_owned(), dwd_event_key(e))) {
                 continue;
             }
         }
@@ -510,17 +637,31 @@ async fn check_dwd_weather_warnings(
             }
             _ => {
                 let (plain, html) = format_dwd_allclear(&prev.headline, &prev.region);
-                crate::post_to_rooms(client, &plain, &html).await
+                if crate::post_to_rooms(client, &plain, &html).await {
+                    DwdEditResult::Ok
+                } else {
+                    DwdEditResult::Failed
+                }
             }
         };
-        if sent {
-            db.mark_dwd_allclear_sent(id).await?;
-            info!("ALL-CLEAR sent [dwd]: {} ({})", prev.headline, prev.region);
-        } else {
-            warn!(
-                "ALL-CLEAR send failed [dwd], will retry next poll: {} ({})",
-                prev.headline, prev.region
-            );
+        match sent {
+            DwdEditResult::Ok => {
+                db.mark_dwd_allclear_sent(id).await?;
+                info!("ALL-CLEAR sent [dwd]: {} ({})", prev.headline, prev.region);
+            }
+            DwdEditResult::MissingOriginal => {
+                db.mark_dwd_allclear_sent(id).await?;
+                info!(
+                    "ALL-CLEAR skipped [dwd], original message is gone: {} ({})",
+                    prev.headline, prev.region
+                );
+            }
+            DwdEditResult::Failed => {
+                warn!(
+                    "ALL-CLEAR send failed [dwd], will retry next poll: {} ({})",
+                    prev.headline, prev.region
+                );
+            }
         }
     }
 
@@ -550,11 +691,47 @@ fn matches_region(region: &str, keywords: &[String]) -> bool {
 
 fn dwd_warning_stable_key(bucket: &str, region: &str, w: &serde_json::Value) -> String {
     let event = w["event"].as_str().unwrap_or("warning");
+    let event_key = dwd_event_key(event);
     let level = w["level"].as_i64().unwrap_or(0);
     // Excludes start/end: DWD refreshes `start` to the request time on every poll
     // and `end` may be extended as the forecast evolves. Including them would treat
     // each refresh as a new warning and cause duplicate posts.
-    format!("dwd:{bucket}:{region}:{event}:{level}")
+    format!("dwd:{bucket}:{region}:{event_key}:{level}")
+}
+
+fn dwd_event_key(event: &str) -> String {
+    let event_upper = event.trim().to_uppercase();
+    let family = if contains_any(&event_upper, &["HITZE"]) {
+        Some("HITZE")
+    } else if contains_any(&event_upper, &["GEWITTER"]) {
+        Some("GEWITTER")
+    } else if contains_any(&event_upper, &["WIND", "STURM", "ORKAN", "BÖEN", "BOEEN"]) {
+        Some("WIND")
+    } else if contains_any(&event_upper, &["REGEN", "NIEDERSCHLAG"]) {
+        Some("REGEN")
+    } else if contains_any(
+        &event_upper,
+        &["SCHNEE", "GLÄTTE", "GLAETTE", "GLATTEIS", "EISREGEN"],
+    ) {
+        Some("SCHNEE_GLAETTE")
+    } else if contains_any(&event_upper, &["FROST"]) {
+        Some("FROST")
+    } else if contains_any(&event_upper, &["NEBEL"]) {
+        Some("NEBEL")
+    } else if contains_any(&event_upper, &["TAUWETTER"]) {
+        Some("TAUWETTER")
+    } else if contains_any(&event_upper, &["UV"]) {
+        Some("UV")
+    } else if contains_any(&event_upper, &["WALDBRAND", "GRASLAND", "FEUERINDEX"]) {
+        Some("FIRE_RISK")
+    } else {
+        None
+    };
+    family.map(str::to_owned).unwrap_or(event_upper)
+}
+
+fn contains_any(haystack: &str, needles: &[&str]) -> bool {
+    needles.iter().any(|needle| haystack.contains(needle))
 }
 
 async fn dwd_warning_area_contains_point(
@@ -707,7 +884,11 @@ fn format_dwd_description_with_continuations(
     let instruction = w["instruction"].as_str().unwrap_or("").trim();
 
     let mut parts = vec![
-        format!("{} {}", dwd_level_emoji(level), dwd_level_label(level)),
+        format!(
+            "{} {}",
+            dwd_level_emoji(level),
+            dwd_level_label_for_event(w["event"].as_str().unwrap_or(""), level)
+        ),
         format!("📍 {region}"),
     ];
     if let Some(valid) = format_dwd_validity(w) {
@@ -725,13 +906,25 @@ fn format_dwd_description_with_continuations(
     parts.join("\n")
 }
 
-/// One-line note for a lower-severity warning that follows the primary in time.
-/// Format: `(danach: ⚠️ Warnung bis So 19:00)`
-fn format_dwd_continuation(w: &serde_json::Value) -> String {
+/// One-line note for a lower-severity warning in the same event family.
+/// Overlapping warnings are shown as simultaneous; later warnings as follow-ups.
+fn format_dwd_secondary_warning(primary: &serde_json::Value, w: &serde_json::Value) -> String {
     let level = w["level"].as_i64().unwrap_or(0);
     let emoji = dwd_level_emoji(level);
-    let label = dwd_level_label(level);
-    let end_str = w["end"].as_i64()
+    let label = dwd_level_label_for_event(w["event"].as_str().unwrap_or(""), level);
+    let primary_start = primary["start"].as_i64().unwrap_or(0);
+    let primary_end = primary["end"].as_i64().unwrap_or(0);
+    let secondary_start = w["start"].as_i64().unwrap_or(0);
+    let secondary_end = w["end"].as_i64().unwrap_or(0);
+    let prefix = if secondary_end <= primary_start {
+        "davor"
+    } else if secondary_start < primary_end {
+        "gleichzeitig"
+    } else {
+        "danach"
+    };
+    let end_str = w["end"]
+        .as_i64()
         .and_then(|ms| chrono::DateTime::from_timestamp_millis(ms))
         .map(|dt| {
             let local = dt.with_timezone(&chrono::Local);
@@ -743,8 +936,8 @@ fn format_dwd_continuation(w: &serde_json::Value) -> String {
             }
         });
     match end_str {
-        Some(t) => format!("(danach: {emoji} {label} bis {t})"),
-        None => format!("(danach: {emoji} {label})"),
+        Some(t) => format!("({prefix}: {emoji} {label} bis {t})"),
+        None => format!("({prefix}: {emoji} {label})"),
     }
 }
 
@@ -753,6 +946,8 @@ fn dwd_level_emoji(level: i64) -> &'static str {
         1 => "🟡",
         2 => "⚠️",
         3 => "🟠",
+        50 => "🟠",
+        51 => "🔴",
         _ => "🔴", // 4, 5, or anything higher
     }
 }
@@ -762,8 +957,22 @@ fn dwd_level_label(level: i64) -> &'static str {
         1 => "Vorinformation",
         2 => "Warnung",
         3 => "Starke Warnung",
-        4 => "Extremwarnung",
-        _ => "Extremes Unwetter",
+        4 => "Unwetterwarnung",
+        5 => "Extreme Unwetterwarnung",
+        50 => "Starke Hitzewarnung",
+        51 => "Extreme Hitzewarnung",
+        _ => "Extremwarnung",
+    }
+}
+
+fn dwd_level_label_for_event(event: &str, level: i64) -> &'static str {
+    match dwd_event_key(event).as_str() {
+        "HITZE" => match level {
+            50 => "Starke Hitzewarnung",
+            51 => "Extreme Hitzewarnung",
+            _ => dwd_level_label(level),
+        },
+        _ => dwd_level_label(level),
     }
 }
 
@@ -1077,9 +1286,15 @@ async fn post_dwd_warning_to_rooms(
     let mut event_ids: HashMap<String, String> = HashMap::new();
     let mut all_ok = true;
     for room in client.joined_rooms() {
-        match room.send(RoomMessageEventContent::text_html(plain, html)).await {
+        match room
+            .send(RoomMessageEventContent::text_html(plain, html))
+            .await
+        {
             Ok(resp) => {
-                event_ids.insert(room.room_id().to_string(), resp.response.event_id.to_string());
+                event_ids.insert(
+                    room.room_id().to_string(),
+                    resp.response.event_id.to_string(),
+                );
             }
             Err(e) => {
                 error!("Failed to post DWD warning to {}: {e}", room.room_id());
@@ -1090,24 +1305,51 @@ async fn post_dwd_warning_to_rooms(
     (all_ok, event_ids)
 }
 
+#[allow(clippy::too_many_arguments)]
+async fn repost_dwd_active_warning(
+    client: &Client,
+    db: &Db,
+    id: &str,
+    headline: &str,
+    region: &str,
+    event: &str,
+    start_ms: i64,
+    end_ms: i64,
+    plain: &str,
+    html: &str,
+) -> Result<bool> {
+    let (all_ok, room_event_ids) = post_dwd_warning_to_rooms(client, plain, html).await;
+    if !all_ok {
+        return Ok(false);
+    }
+    let ids_json = serde_json::to_string(&room_event_ids).unwrap_or_else(|_| String::from("{}"));
+    db.mark_dwd_alert_posted(
+        id, headline, region, event, &ids_json, start_ms, end_ms, plain, html,
+    )
+    .await?;
+    Ok(true)
+}
+
 /// Edit the original DWD warning message in each room to append the all-clear notice.
 /// `event_ids_json` is a JSON object mapping room_id strings to event_id strings.
-/// Returns true if all edits succeeded.
+/// Returns whether all edits succeeded, failed transiently, or likely targeted
+/// messages that are gone from the room.
 async fn edit_dwd_warning_in_rooms(
     client: &Client,
     event_ids_json: &str,
     new_plain: &str,
     new_html: &str,
-) -> bool {
+) -> DwdEditResult {
     let map: HashMap<String, String> = match serde_json::from_str(event_ids_json) {
         Ok(m) => m,
         Err(e) => {
             warn!("Could not parse DWD event_ids_json for edit: {e}");
-            return false;
+            return DwdEditResult::Failed;
         }
     };
 
     let mut all_ok = true;
+    let mut missing_original = false;
     for room in client.joined_rooms() {
         let room_id = room.room_id().to_string();
         let Some(event_id_str) = map.get(&room_id) else {
@@ -1126,18 +1368,41 @@ async fn edit_dwd_warning_in_rooms(
         if let Err(e) = room.send(edited).await {
             error!("Failed to edit DWD warning in {room_id}: {e}");
             all_ok = false;
+            if looks_like_missing_matrix_event(&e.to_string()) {
+                missing_original = true;
+            }
         }
     }
-    all_ok
+    if all_ok {
+        DwdEditResult::Ok
+    } else if missing_original {
+        DwdEditResult::MissingOriginal
+    } else {
+        DwdEditResult::Failed
+    }
+}
+
+fn looks_like_missing_matrix_event(error: &str) -> bool {
+    let e = error.to_lowercase();
+    [
+        "not found",
+        "unknown event",
+        "event not found",
+        "m_not_found",
+        "redacted",
+        "deleted",
+        "cannot replace",
+    ]
+    .iter()
+    .any(|needle| e.contains(needle))
 }
 
 /// Append an all-clear notice to the original warning content.
 /// The `<hr>` separator is well-supported in Matrix HTML clients.
 fn append_allclear_to_warning(original_plain: &str, original_html: &str) -> (String, String) {
     let time = chrono::Local::now().format("%H:%M").to_string();
-    let new_plain = format!(
-        "{original_plain}\n\n---\n✅ Entwarnung ({time}): Diese Warnung gilt nicht mehr."
-    );
+    let new_plain =
+        format!("{original_plain}\n\n---\n✅ Entwarnung ({time}): Diese Warnung gilt nicht mehr.");
     let new_html = format!(
         "{original_html}<hr><em>✅ Entwarnung ({time}): Diese Warnung gilt nicht mehr.</em>"
     );
@@ -1150,18 +1415,18 @@ fn append_level_change_to_warning(
     original_html: &str,
     old_level: i64,
     new_level: i64,
+    event: &str,
 ) -> (String, String) {
     let time = chrono::Local::now().format("%H:%M").to_string();
     let emoji = dwd_level_emoji(new_level);
-    let label = dwd_level_label(new_level);
+    let label = dwd_level_label_for_event(event, new_level);
     let (arrow, verb) = if new_level > old_level {
         ("⬆️", "erhöht")
     } else {
         ("⬇️", "reduziert")
     };
-    let new_plain = format!(
-        "{original_plain}\n\n---\n{arrow} Warnstufe {verb} auf {emoji} {label} ({time})."
-    );
+    let new_plain =
+        format!("{original_plain}\n\n---\n{arrow} Warnstufe {verb} auf {emoji} {label} ({time}).");
     let new_html = format!(
         "{original_html}<hr><em>{arrow} Warnstufe {verb} auf {emoji} {label} ({time}).</em>"
     );
@@ -1230,6 +1495,8 @@ mod tests {
         let warning = json!({
             "start": 1781946000000i64,
             "end": 1781974800000i64,
+            "event": "EXTREME HITZE",
+            "level": 51,
             "description": "\nAm Samstag wird eine extreme Wärmebelastung erwartet.\nMit einer zusätzlichen Belastung aufgrund verringerter nächtlicher Abkühlung ist insbesondere im dicht bebauten Stadtgebiet von Berlin zu rechnen.\nNoch ein Satz, der nicht in die kurze Nachricht soll.\n",
             "instruction": "Hitzebelastung kann für den menschlichen Körper gefährlich werden. Vermeiden Sie nach Möglichkeit die Hitze, trinken Sie ausreichend Wasser und halten Sie die Innenräume kühl."
         });
@@ -1243,6 +1510,109 @@ mod tests {
             desc.contains("✅ Hitzebelastung kann für den menschlichen Körper gefährlich werden.")
         );
         assert!(!desc.contains("Noch ein Satz"));
+    }
+
+    #[test]
+    fn dwd_heat_levels_are_not_labeled_as_unwetter() {
+        assert_eq!(
+            dwd_level_label_for_event("STARKE HITZE", 50),
+            "Starke Hitzewarnung"
+        );
+        assert_eq!(
+            dwd_level_label_for_event("EXTREME HITZE", 51),
+            "Extreme Hitzewarnung"
+        );
+
+        let warning = json!({
+            "event": "STARKE HITZE",
+            "level": 50,
+            "start": 1781974800000i64,
+            "end": 1782061200000i64,
+            "description": "Am Samstag wird eine starke Wärmebelastung erwartet.",
+            "instruction": "Hitzebelastung kann gefährlich werden."
+        });
+        let desc = format_dwd_description_with_continuations("Berlin", &warning, &[]);
+
+        assert!(desc.contains("🟠 Starke Hitzewarnung"));
+        assert!(!desc.contains("Unwetter"));
+    }
+
+    #[test]
+    fn dwd_heat_events_share_lifecycle_key() {
+        assert_eq!(dwd_event_key("EXTREME HITZE"), "HITZE");
+        assert_eq!(dwd_event_key("STARKE HITZE"), "HITZE");
+
+        let extreme = json!({"event": "EXTREME HITZE", "level": 51});
+        let strong = json!({"event": "STARKE HITZE", "level": 50});
+
+        assert_eq!(
+            dwd_warning_stable_key("warnings", "Berlin", &extreme),
+            "dwd:warnings:Berlin:HITZE:51"
+        );
+        assert_eq!(
+            dwd_warning_stable_key("warnings", "Berlin", &strong),
+            "dwd:warnings:Berlin:HITZE:50"
+        );
+    }
+
+    #[test]
+    fn dwd_related_weather_events_share_lifecycle_families() {
+        assert_eq!(dwd_event_key("STURMBÖEN"), "WIND");
+        assert_eq!(dwd_event_key("SCHWERE STURMBÖEN"), "WIND");
+        assert_eq!(dwd_event_key("ORKANBÖEN"), "WIND");
+        assert_eq!(dwd_event_key("STARKREGEN"), "REGEN");
+        assert_eq!(dwd_event_key("DAUERREGEN"), "REGEN");
+        assert_eq!(dwd_event_key("SCHNEEFALL"), "SCHNEE_GLAETTE");
+        assert_eq!(dwd_event_key("GLATTEIS"), "SCHNEE_GLAETTE");
+        assert_eq!(dwd_event_key("FROST"), "FROST");
+        assert_eq!(dwd_event_key("NEBEL"), "NEBEL");
+        assert_eq!(dwd_event_key("TAUWETTER"), "TAUWETTER");
+        assert_eq!(dwd_event_key("UV-STRAHLUNG"), "UV");
+        assert_eq!(dwd_event_key("WALDBRANDGEFAHR"), "FIRE_RISK");
+        assert_eq!(dwd_event_key("UNBEKANNTE WARNART"), "UNBEKANNTE WARNART");
+    }
+
+    #[test]
+    fn dwd_edit_error_classifies_missing_original_events() {
+        assert!(looks_like_missing_matrix_event(
+            "M_NOT_FOUND: event not found"
+        ));
+        assert!(looks_like_missing_matrix_event("unknown event id"));
+        assert!(!looks_like_missing_matrix_event(
+            "temporary network timeout"
+        ));
+    }
+
+    #[test]
+    fn dwd_secondary_note_distinguishes_overlap_and_followup() {
+        let primary = json!({
+            "event": "EXTREME HITZE",
+            "level": 51,
+            "start": 1781946000000i64,
+            "end": 1781974800000i64
+        });
+        let before = json!({
+            "event": "STARKE HITZE",
+            "level": 50,
+            "start": 1781938800000i64,
+            "end": 1781946000000i64
+        });
+        let overlapping = json!({
+            "event": "STARKE HITZE",
+            "level": 50,
+            "start": 1781953200000i64,
+            "end": 1782061200000i64
+        });
+        let followup = json!({
+            "event": "STARKE HITZE",
+            "level": 50,
+            "start": 1781974800000i64,
+            "end": 1782061200000i64
+        });
+
+        assert!(format_dwd_secondary_warning(&primary, &before).contains("(davor:"));
+        assert!(format_dwd_secondary_warning(&primary, &overlapping).contains("(gleichzeitig:"));
+        assert!(format_dwd_secondary_warning(&primary, &followup).contains("(danach:"));
     }
 
     #[test]
@@ -1326,8 +1696,7 @@ mod tests {
 
     #[test]
     fn dwd_allclear_references_headline_and_region() {
-        let (plain, html) =
-            format_dwd_allclear("Amtliche WARNUNG vor HITZE", "Berlin, Stadt");
+        let (plain, html) = format_dwd_allclear("Amtliche WARNUNG vor HITZE", "Berlin, Stadt");
 
         assert!(plain.contains("✅ Entwarnung"));
         assert!(plain.contains("Amtliche WARNUNG vor HITZE"));
