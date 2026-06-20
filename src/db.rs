@@ -19,6 +19,9 @@ pub struct DwdActiveWarning {
     pub event_ids_json: Option<String>,
     pub original_plain: Option<String>,
     pub original_html: Option<String>,
+    /// DWD start/end timestamps (ms) as last seen. Used to detect time updates.
+    pub start_ms: i64,
+    pub end_ms: i64,
 }
 
 /// A row from the items table, sufficient to format and post a digest.
@@ -53,6 +56,8 @@ impl Db {
         ensure_column(&conn, "dwd_active_warnings", "event_ids_json", "TEXT")?;
         ensure_column(&conn, "dwd_active_warnings", "original_plain", "TEXT")?;
         ensure_column(&conn, "dwd_active_warnings", "original_html", "TEXT")?;
+        ensure_column(&conn, "dwd_active_warnings", "start_ms", "INTEGER NOT NULL DEFAULT 0")?;
+        ensure_column(&conn, "dwd_active_warnings", "end_ms", "INTEGER NOT NULL DEFAULT 0")?;
         Ok(Db(Arc::new(Mutex::new(conn))))
     }
 
@@ -285,7 +290,8 @@ impl Db {
         tokio::task::spawn_blocking(move || {
             let conn = db.lock().unwrap();
             let mut stmt = conn.prepare(
-                "SELECT id, headline, region, event_ids_json, original_plain, original_html
+                "SELECT id, headline, region, event_ids_json, original_plain, original_html,
+                        start_ms, end_ms
                  FROM dwd_active_warnings",
             )?;
             let rows = stmt
@@ -297,6 +303,8 @@ impl Db {
                         event_ids_json: row.get(3)?,
                         original_plain: row.get(4)?,
                         original_html: row.get(5)?,
+                        start_ms: row.get(6)?,
+                        end_ms: row.get(7)?,
                     })
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -305,57 +313,98 @@ impl Db {
         .await?
     }
 
-    /// Upsert a currently-active DWD warning.
+    /// Atomically insert a fresh DWD warning into `dwd_active_warnings`.
     ///
-    /// `event_ids_json` and `original_*` are only written when `Some`; existing
-    /// values are preserved via COALESCE so a "heartbeat" upsert without new post
-    /// data does not overwrite previously stored event IDs.
-    pub async fn upsert_dwd_active_warning(
+    /// The stable key (event+level+region, no timestamps) is used as the primary key,
+    /// so this is also the correct upsert when the same warning reappears after an all-clear.
+    /// No `alerts` row is written; presence in `dwd_active_warnings` IS the "seen" check.
+    pub async fn mark_dwd_alert_posted(
         &self,
         id: &str,
         headline: &str,
         region: &str,
         event: &str,
-        event_ids_json: Option<&str>,
-        original_plain: Option<&str>,
-        original_html: Option<&str>,
+        event_ids_json: &str,
+        start_ms: i64,
+        end_ms: i64,
+        original_plain: &str,
+        original_html: &str,
     ) -> Result<()> {
         let db = self.0.clone();
         let id = id.to_owned();
         let headline = headline.to_owned();
         let region = region.to_owned();
         let event = event.to_owned();
-        let event_ids_json = event_ids_json.map(str::to_owned);
-        let original_plain = original_plain.map(str::to_owned);
-        let original_html = original_html.map(str::to_owned);
+        let event_ids_json = event_ids_json.to_owned();
+        let original_plain = original_plain.to_owned();
+        let original_html = original_html.to_owned();
         let now = chrono::Utc::now().timestamp();
         tokio::task::spawn_blocking(move || {
             db.lock().unwrap().execute(
                 "INSERT INTO dwd_active_warnings
-                     (id, headline, region, event, seen_at, event_ids_json, original_plain, original_html)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                     (id, headline, region, event, seen_at,
+                      event_ids_json, start_ms, end_ms, original_plain, original_html)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
                  ON CONFLICT(id) DO UPDATE SET
                      headline       = excluded.headline,
                      region         = excluded.region,
                      event          = excluded.event,
                      seen_at        = excluded.seen_at,
-                     event_ids_json = COALESCE(excluded.event_ids_json, dwd_active_warnings.event_ids_json),
-                     original_plain = COALESCE(excluded.original_plain, dwd_active_warnings.original_plain),
-                     original_html  = COALESCE(excluded.original_html,  dwd_active_warnings.original_html)",
-                params![id, headline, region, event, now, event_ids_json, original_plain, original_html],
+                     event_ids_json = excluded.event_ids_json,
+                     start_ms       = excluded.start_ms,
+                     end_ms         = excluded.end_ms,
+                     original_plain = excluded.original_plain,
+                     original_html  = excluded.original_html",
+                params![
+                    id, headline, region, event, now,
+                    event_ids_json, start_ms, end_ms, original_plain, original_html
+                ],
             )?;
             Ok::<(), anyhow::Error>(())
         })
         .await?
     }
 
-    pub async fn remove_dwd_active_warning(&self, id: &str) -> Result<()> {
+    /// Update the stored time window and message content after a time-change edit.
+    ///
+    /// `plain` / `html` use COALESCE so passing `None` preserves the stored content
+    /// (used when we acknowledge a time change but have no event IDs to edit with).
+    pub async fn update_dwd_active_warning(
+        &self,
+        id: &str,
+        start_ms: i64,
+        end_ms: i64,
+        plain: Option<&str>,
+        html: Option<&str>,
+    ) -> Result<()> {
         let db = self.0.clone();
         let id = id.to_owned();
+        let plain = plain.map(str::to_owned);
+        let html = html.map(str::to_owned);
+        tokio::task::spawn_blocking(move || {
+            db.lock().unwrap().execute(
+                "UPDATE dwd_active_warnings
+                 SET start_ms       = ?2,
+                     end_ms         = ?3,
+                     original_plain = COALESCE(?4, original_plain),
+                     original_html  = COALESCE(?5, original_html)
+                 WHERE id = ?1",
+                params![id, start_ms, end_ms, plain, html],
+            )?;
+            Ok::<(), anyhow::Error>(())
+        })
+        .await?
+    }
+
+    /// Remove the active-warning row once an all-clear has been delivered.
+    /// The next occurrence of the same warning type is then treated as fresh.
+    pub async fn mark_dwd_allclear_sent(&self, warning_id: &str) -> Result<()> {
+        let db = self.0.clone();
+        let warning_id = warning_id.to_owned();
         tokio::task::spawn_blocking(move || {
             db.lock().unwrap().execute(
                 "DELETE FROM dwd_active_warnings WHERE id = ?1",
-                params![id],
+                params![warning_id],
             )?;
             Ok::<(), anyhow::Error>(())
         })
@@ -435,6 +484,8 @@ const SCHEMA: &str = "
         seen_at        INTEGER NOT NULL,
         event_ids_json TEXT,
         original_plain TEXT,
-        original_html  TEXT
+        original_html  TEXT,
+        start_ms       INTEGER NOT NULL DEFAULT 0,
+        end_ms         INTEGER NOT NULL DEFAULT 0
     );
 ";
