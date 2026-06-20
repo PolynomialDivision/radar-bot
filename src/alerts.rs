@@ -218,17 +218,14 @@ async fn check_dwd_weather_warnings(
                 }
 
                 let headline = w["headline"].as_str().unwrap_or(event);
-                let severity = w["level"]
-                    .as_i64()
-                    .map(|level| format!("DWD level {level}"));
                 let desc = format_dwd_description(region, w);
 
                 let (plain, html) = format_alert(
                     "DWD Weather Warnings",
                     headline,
-                    severity.as_deref(),
-                    &desc,
                     None,
+                    &desc,
+                    Some("https://www.dwd.de/DE/wetter/warnungen_gemeinden/warnWetter_node.html"),
                 );
                 if crate::post_to_rooms(client, &plain, &html).await {
                     db.mark_alert_seen(&id, "dwd").await?;
@@ -275,15 +272,68 @@ fn dwd_warning_id(bucket: &str, region: &str, w: &serde_json::Value) -> String {
 fn format_dwd_description(region: &str, w: &serde_json::Value) -> String {
     let description = w["description"].as_str().unwrap_or("").trim();
     let instruction = w["instruction"].as_str().unwrap_or("").trim();
-    match (description.is_empty(), instruction.is_empty()) {
-        (false, false) => format!("{region}\n{description}\n{instruction}"),
-        (false, true) => format!("{region}\n{description}"),
-        (true, false) => format!("{region}\n{instruction}"),
-        (true, true) => region.to_owned(),
+
+    let mut parts = vec![format!("Region: {region}")];
+    if let Some(valid) = format_dwd_validity(w) {
+        parts.push(format!("Valid: {valid}"));
     }
-    .chars()
-    .take(700)
-    .collect()
+    if let Some(details) = concise_sentences(description, 2) {
+        parts.push(format!("Details: {details}"));
+    }
+    if let Some(advice) = concise_sentences(instruction, 1) {
+        parts.push(format!("Advice: {advice}"));
+    }
+    parts.join("\n")
+}
+
+fn format_dwd_validity(w: &serde_json::Value) -> Option<String> {
+    let start = w["start"].as_i64()?;
+    let end = w["end"].as_i64()?;
+    let start = chrono::DateTime::from_timestamp_millis(start)?.with_timezone(&chrono::Local);
+    let end = chrono::DateTime::from_timestamp_millis(end)?.with_timezone(&chrono::Local);
+
+    if start.date_naive() == end.date_naive() {
+        Some(format!(
+            "{}-{}",
+            start.format("%a, %d %b %H:%M"),
+            end.format("%H:%M")
+        ))
+    } else {
+        Some(format!(
+            "{} - {}",
+            start.format("%a, %d %b %H:%M"),
+            end.format("%a, %d %b %H:%M")
+        ))
+    }
+}
+
+fn concise_sentences(text: &str, max_sentences: usize) -> Option<String> {
+    let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if text.is_empty() {
+        return None;
+    }
+
+    let mut sentences = Vec::new();
+    let mut start = 0usize;
+    for (idx, ch) in text.char_indices() {
+        if matches!(ch, '.' | '!' | '?') {
+            let end = idx + ch.len_utf8();
+            let sentence = text[start..end].trim();
+            if !sentence.is_empty() && !sentences.contains(&sentence) {
+                sentences.push(sentence);
+            }
+            start = end;
+            if sentences.len() >= max_sentences {
+                break;
+            }
+        }
+    }
+
+    if sentences.is_empty() {
+        Some(text)
+    } else {
+        Some(sentences.join(" "))
+    }
 }
 
 // ── USGS significant earthquakes ──────────────────────────────────────────────
@@ -487,12 +537,65 @@ fn format_alert(
     let sev = severity.map(|s| format!(" [{s}]")).unwrap_or_default();
     let link_plain = link.map(|l| format!("\n{l}")).unwrap_or_default();
     let link_html = link
-        .map(|l| format!("<br><a href=\"{l}\">{l}</a>"))
+        .map(|l| {
+            let escaped = alert_html_escape(l);
+            format!("<br><a href=\"{escaped}\">{escaped}</a>")
+        })
         .unwrap_or_default();
+    let event_html = alert_html_escape(event);
+    let description_html = alert_html_escape(description).replace('\n', "<br>");
+    let source_html = alert_html_escape(source);
 
     let plain = format!("EMERGENCY{sev}: {event}\n{description}{link_plain}\nSource: {source}");
     let html = format!(
-        "<b>🚨 EMERGENCY{sev}: {event}</b><br>{description}{link_html}<br><em>Source: {source}</em>"
+        "<b>🚨 EMERGENCY{sev}: {event_html}</b><br>{description_html}{link_html}<br><em>Source: {source_html}</em>"
     );
     (plain, html)
+}
+
+fn alert_html_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn dwd_description_is_structured_and_concise() {
+        let warning = json!({
+            "start": 1781946000000i64,
+            "end": 1781974800000i64,
+            "description": "\nAm Samstag wird eine extreme Wärmebelastung erwartet.\nMit einer zusätzlichen Belastung aufgrund verringerter nächtlicher Abkühlung ist insbesondere im dicht bebauten Stadtgebiet von Berlin zu rechnen.\nNoch ein Satz, der nicht in die kurze Nachricht soll.\n",
+            "instruction": "Hitzebelastung kann für den menschlichen Körper gefährlich werden. Vermeiden Sie nach Möglichkeit die Hitze, trinken Sie ausreichend Wasser und halten Sie die Innenräume kühl."
+        });
+
+        let desc = format_dwd_description("Berlin", &warning);
+
+        assert!(desc.contains("Region: Berlin"));
+        assert!(desc.contains("Valid:"));
+        assert!(desc.contains("Details: Am Samstag wird eine extreme Wärmebelastung erwartet."));
+        assert!(desc.contains("Advice: Hitzebelastung kann für den menschlichen Körper gefährlich werden."));
+        assert!(!desc.contains("Noch ein Satz"));
+    }
+
+    #[test]
+    fn alert_html_preserves_lines_and_adds_link() {
+        let (plain, html) = format_alert(
+            "DWD Weather Warnings",
+            "Amtliche WARNUNG vor HITZE",
+            None,
+            "Region: Berlin\nAdvice: Drink water",
+            Some("https://www.dwd.de/"),
+        );
+
+        assert!(plain.contains("Region: Berlin\nAdvice: Drink water\nhttps://www.dwd.de/"));
+        assert!(html.contains("Region: Berlin<br>Advice: Drink water"));
+        assert!(html.contains("<a href=\"https://www.dwd.de/\">https://www.dwd.de/</a>"));
+        assert!(!html.contains("DWD level"));
+    }
 }
