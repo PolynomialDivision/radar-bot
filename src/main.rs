@@ -376,104 +376,111 @@ fn decode_entities(s: &str) -> String {
     out
 }
 
-// ── RSS / Atom parser ─────────────────────────────────────────────────────────
-
-fn extract_between<'a>(s: &'a str, open: &str, close: &str) -> Option<&'a str> {
-    let start = s.find(open)? + open.len();
-    let end = s[start..].find(close).map(|i| start + i)?;
-    Some(&s[start..end])
-}
-
-fn extract_tag<'a>(xml: &'a str, tag: &str) -> Option<&'a str> {
-    extract_between(xml, &format!("<{tag}>"), &format!("</{tag}>"))
-}
-
-fn unwrap_cdata(raw: &str) -> &str {
-    let s = raw.trim();
-    if s.starts_with("<![CDATA[") && s.ends_with("]]>") {
-        &s[9..s.len() - 3]
-    } else {
-        s
-    }
-}
-
-fn extract_text(xml: &str, tag: &str) -> Option<String> {
-    let raw = extract_tag(xml, tag)?;
-    let text = strip_html(unwrap_cdata(raw)).trim().to_owned();
-    if text.is_empty() { None } else { Some(text) }
-}
-
-/// Extract href="..." from an Atom <link> element.
-fn extract_atom_link(xml: &str) -> Option<String> {
-    let mut pos = 0;
-    while let Some(rel) = xml[pos..].find("<link") {
-        let start = pos + rel;
-        let end = xml[start..].find('>').map(|i| start + i + 1).unwrap_or(xml.len());
-        let element = &xml[start..end];
-        if let Some(href_pos) = element.find("href=\"") {
-            let val_start = href_pos + 6;
-            if let Some(val_end) = element[val_start..].find('"').map(|i| val_start + i) {
-                return Some(element[val_start..val_end].to_owned());
-            }
-        }
-        pos = end;
-    }
-    None
-}
+// ── RSS / Atom / JSON Feed parser ─────────────────────────────────────────────
 
 pub(crate) fn parse_feed(xml: &str, source_name: &str) -> Vec<FeedItem> {
-    // RSS 2.0 feeds often declare xmlns:atom="..." for <atom:link rel="self"> — only
-    // treat as Atom when the root element is <feed>, not <rss>
-    let is_atom = !xml.contains("<rss") && xml.contains("http://www.w3.org/2005/Atom");
-    // Match "<item" not "<item>" to handle attributes like <item rdf:about="...">
-    let (open_tag, close_tag) = if is_atom { ("<entry", "</entry>") } else { ("<item", "</item>") };
-
-    let mut items = Vec::new();
-    let mut pos = 0;
-
-    while let Some(rel) = xml[pos..].find(open_tag) {
-        let start = pos + rel;
-        let end = match xml[start..].find(close_tag) {
-            Some(i) => start + i + close_tag.len(),
-            None => break,
-        };
-        let block = &xml[start..end];
-        pos = end;
-
-        let title = match extract_text(block, "title") {
-            Some(t) => t,
-            None => continue,
-        };
-
-        let link = if is_atom {
-            extract_atom_link(block).or_else(|| extract_text(block, "link"))
-        } else {
-            extract_text(block, "link")
-        };
-
-        let description = if is_atom {
-            extract_text(block, "summary").or_else(|| extract_text(block, "content"))
-        } else {
-            extract_text(block, "description")
-                .or_else(|| extract_text(block, "content:encoded"))
-        };
-
-        let guid = if is_atom { extract_text(block, "id") } else { extract_text(block, "guid") }
-            .or_else(|| link.clone())
-            .unwrap_or_else(|| format!("{source_name}::{title}"));
-
-        let published_at = if is_atom {
-            extract_text(block, "published").or_else(|| extract_text(block, "updated"))
-        } else {
-            extract_text(block, "pubDate")
+    match feed_rs::parser::parse(xml.as_bytes()) {
+        Ok(feed) => {
+            let items: Vec<FeedItem> = feed
+                .entries
+                .into_iter()
+                .filter_map(|entry| normalize_feed_entry(entry, source_name))
+                .collect();
+            if !items.is_empty() {
+                return items;
+            }
+            warn!("Feed parser returned no entries for '{source_name}'");
         }
-        .as_deref()
-        .and_then(parse_feed_date);
-
-        items.push(FeedItem { guid, title, link, description, article_text: None, source_name: source_name.to_owned(), score: 0, max_score: 0, distance_meters: None, published_at });
+        Err(e) => {
+            warn!("Feed parser failed for '{source_name}': {e}");
+        }
     }
 
-    items
+    Vec::new()
+}
+
+fn normalize_feed_entry(entry: feed_rs::model::Entry, source_name: &str) -> Option<FeedItem> {
+    let title = entry
+        .title
+        .as_ref()
+        .map(|t| text_to_plain(&t.content))
+        .filter(|t| !t.is_empty())
+        .or_else(|| {
+            entry
+                .summary
+                .as_ref()
+                .map(|s| {
+                    text_to_plain(&s.content)
+                        .chars()
+                        .take(120)
+                        .collect::<String>()
+                })
+                .filter(|s| !s.is_empty())
+        })
+        .or_else(|| {
+            entry
+                .content
+                .as_ref()
+                .and_then(|c| c.body.as_ref())
+                .map(|body| {
+                    text_to_plain(body)
+                        .chars()
+                        .take(120)
+                        .collect::<String>()
+                })
+                .filter(|s| !s.is_empty())
+        })?;
+
+    let link = preferred_entry_link(&entry);
+    let description = entry
+        .summary
+        .as_ref()
+        .map(|s| text_to_plain(&s.content))
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            entry
+                .content
+                .as_ref()
+                .and_then(|c| c.body.as_ref())
+                .map(|body| text_to_plain(body))
+                .filter(|s| !s.is_empty())
+        });
+
+    let guid = if entry.id.trim().is_empty() {
+        link.clone()
+            .unwrap_or_else(|| format!("{source_name}::{title}"))
+    } else {
+        entry.id
+    };
+
+    let published_at = entry.published.or(entry.updated).map(|dt| dt.timestamp());
+
+    Some(FeedItem {
+        guid,
+        title,
+        link,
+        description,
+        article_text: None,
+        source_name: source_name.to_owned(),
+        score: 0,
+        max_score: 0,
+        distance_meters: None,
+        published_at,
+    })
+}
+
+fn preferred_entry_link(entry: &feed_rs::model::Entry) -> Option<String> {
+    entry
+        .links
+        .iter()
+        .find(|link| link.rel.as_deref().map_or(true, |rel| rel == "alternate"))
+        .or_else(|| entry.links.first())
+        .map(|link| link.href.trim().to_owned())
+        .filter(|href| !href.is_empty())
+}
+
+fn text_to_plain(s: &str) -> String {
+    strip_html(s).trim().to_owned()
 }
 
 /// Parse RFC 2822 (RSS pubDate) or RFC 3339/ISO 8601 (Atom) date strings to Unix timestamp.
@@ -490,6 +497,66 @@ pub(crate) fn parse_feed_date(s: &str) -> Option<i64> {
         return Some(dt.timestamp());
     }
     None
+}
+
+#[cfg(test)]
+mod feed_tests {
+    use super::*;
+
+    #[test]
+    fn parses_rss_with_namespaced_content() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0" xmlns:content="http://purl.org/rss/1.0/modules/content/">
+  <channel>
+    <title>Local</title>
+    <link>https://example.test/</link>
+    <description>Local feed</description>
+    <item>
+      <title><![CDATA[Incident &amp; update]]></title>
+      <link>https://example.test/news/1</link>
+      <guid isPermaLink="false">abc-1</guid>
+      <pubDate>Mon, 15 Jan 2024 10:30:00 +0000</pubDate>
+      <description><![CDATA[Short <b>summary</b>]]></description>
+      <content:encoded><![CDATA[Full <strong>article</strong> body]]></content:encoded>
+    </item>
+  </channel>
+</rss>"#;
+
+        let items = parse_feed(xml, "Test RSS");
+
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].guid, "abc-1");
+        assert_eq!(items[0].title, "Incident & update");
+        assert_eq!(items[0].link.as_deref(), Some("https://example.test/news/1"));
+        assert_eq!(items[0].description.as_deref(), Some("Short summary"));
+        assert_eq!(items[0].published_at, Some(1_705_314_600));
+    }
+
+    #[test]
+    fn parses_atom_link_href_and_updated_date() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom">
+  <title>Atom Feed</title>
+  <id>feed-id</id>
+  <updated>2024-01-15T10:00:00Z</updated>
+  <entry>
+    <title>Atom entry</title>
+    <id>tag:example.test,2024:entry-1</id>
+    <updated>2024-01-15T11:30:00+01:00</updated>
+    <link rel="alternate" href="https://example.test/atom/1" />
+    <summary type="html">Atom &lt;b&gt;summary&lt;/b&gt;</summary>
+  </entry>
+</feed>"#;
+
+        let items = parse_feed(xml, "Test Atom");
+
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].guid, "tag:example.test,2024:entry-1");
+        assert_eq!(items[0].title, "Atom entry");
+        assert_eq!(items[0].link.as_deref(), Some("https://example.test/atom/1"));
+        assert_eq!(items[0].description.as_deref(), Some("Atom summary"));
+        assert_eq!(items[0].published_at, Some(1_705_314_600));
+    }
 }
 
 // ── Article fetcher ───────────────────────────────────────────────────────────
