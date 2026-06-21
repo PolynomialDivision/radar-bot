@@ -150,7 +150,7 @@ struct SourceConfig {
     /// Max posts per poll for Bluesky (default 25, API max 100).
     #[serde(default)]
     limit: Option<usize>,
-    /// Only fetch posts newer than this many hours (Bluesky only, default 24).
+    /// Only keep feed/search items newer than this many hours where supported.
     #[serde(default)]
     max_age_hours: Option<u64>,
     // ── Shared ────────────────────────────────────────────────────────────────
@@ -178,12 +178,26 @@ struct AreaGroup {
     terms: Vec<String>,
 }
 
+/// Explicit local places with coordinates. These improve relevance for articles
+/// that mention stations, squares, venues, or neighbourhood nicknames instead
+/// of street addresses.
+#[derive(Deserialize, Clone)]
+struct PlaceConfig {
+    name: String,
+    lat: f64,
+    lon: f64,
+    #[serde(default)]
+    aliases: Vec<String>,
+}
+
 /// Filtering and scoring configuration.
 ///   - blocklist match → always drop
 ///   - required: at least one must match (or list is empty)
 ///   - area groups: find closest matching group → implied distance fallback
 ///   - geocoding can override with an actual distance (always takes the closer result)
-///   - distance_score(final_meters) < digest_threshold → drop
+///   - distance_score(final_meters) >= digest_threshold → queue for digest
+///   - candidate_min_score <= distance_score < digest_threshold → keep briefly
+///     as a candidate that duplicate clustering can promote later
 #[derive(Deserialize, Default, Clone)]
 struct FilterConfig {
     #[serde(default)]
@@ -192,8 +206,16 @@ struct FilterConfig {
     blocklist: Vec<String>,
     #[serde(default = "default_digest_threshold")]
     digest_threshold: i32,
+    #[serde(default = "default_candidate_min_score")]
+    candidate_min_score: i32,
+    #[serde(default = "default_candidate_min_sources")]
+    candidate_min_sources: usize,
+    #[serde(default = "default_candidate_retention_hours")]
+    candidate_retention_hours: u64,
     #[serde(default)]
     area: Vec<AreaGroup>,
+    #[serde(default)]
+    places: Vec<PlaceConfig>,
     /// Full address used as the reference point for distance scoring.
     /// Geocoded once at startup via Nominatim.
     reference_address: Option<String>,
@@ -205,6 +227,15 @@ struct FilterConfig {
 
 fn default_digest_threshold() -> i32 {
     1
+}
+fn default_candidate_min_score() -> i32 {
+    1
+}
+fn default_candidate_min_sources() -> usize {
+    2
+}
+fn default_candidate_retention_hours() -> u64 {
+    24
 }
 
 #[derive(Deserialize, Clone)]
@@ -273,6 +304,7 @@ struct BotState {
     allowed_inviters: HashSet<OwnedUserId>,
     admin_users: HashSet<OwnedUserId>,
     reset_allowed: Arc<Mutex<HashSet<OwnedUserId>>>,
+    db: Db,
 }
 
 // ── Feed item ─────────────────────────────────────────────────────────────────
@@ -657,6 +689,55 @@ mod feed_tests {
         assert!(clustered[0].source_name.contains("Source B"));
     }
 
+    #[tokio::test]
+    async fn candidate_clustering_promotes_multi_source_weak_items() {
+        let path = std::env::temp_dir().join(format!(
+            "radar-bot-candidate-test-{}-{}.db",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let db = Db::open(&path).expect("open temp db");
+
+        let a = FeedItem {
+            guid: "candidate-a".to_owned(),
+            title: "Brand in der Rigaer Straße".to_owned(),
+            link: Some("https://a.test/1".to_owned()),
+            link_note: None,
+            description: None,
+            article_text: None,
+            source_name: "Source A".to_owned(),
+            score: 2,
+            max_score: 5,
+            distance_meters: Some(1500.0),
+            location_label: Some("Rigaer Straße".to_owned()),
+            published_at: None,
+        };
+        let mut b = a.clone();
+        b.guid = "candidate-b".to_owned();
+        b.source_name = "Source B".to_owned();
+        b.title = "Feuerwehreinsatz Rigaer Straße nach Brand".to_owned();
+        b.link = Some("https://b.test/2".to_owned());
+
+        db.insert_candidate(&a, "score 2 below digest threshold 3")
+            .await
+            .expect("insert candidate a");
+        db.insert_candidate(&b, "score 2 below digest threshold 3")
+            .await
+            .expect("insert candidate b");
+
+        let promoted = promote_candidate_clusters(&db, 3, 2, 24)
+            .await
+            .expect("promote candidates");
+        let items = db.take_for_digest(3).await.expect("take digest");
+
+        assert_eq!(promoted, 2);
+        assert_eq!(items.len(), 2);
+        assert!(items.iter().all(|item| item.score >= 3));
+
+        drop(db);
+        let _ = std::fs::remove_file(path);
+    }
+
     #[test]
     fn rolling_link_gets_note_when_title_no_longer_matches() {
         let html = r#"
@@ -678,6 +759,75 @@ mod feed_tests {
     }
 
     #[test]
+    fn google_news_link_resolves_to_external_publisher_when_available() {
+        let html = r#"
+            <html><head><link rel="canonical" href="https://news.google.com/rss/articles/abc" /></head>
+            <body><a href="https://www.google.com/url?url=https%3A%2F%2Fpublisher.test%2Farticle%2F1">Publisher</a></body></html>
+        "#;
+        let (link, note) = resolve_article_link(
+            "https://news.google.com/rss/articles/abc",
+            html,
+            "Brand in der Rigaer Straße mit Feuerwehreinsatz",
+            "Brand in der Rigaer Straße",
+        );
+
+        assert_eq!(link.as_deref(), Some("https://publisher.test/article/1"));
+        assert_eq!(note, None);
+    }
+
+    #[test]
+    fn article_extraction_prefers_article_like_content_over_navigation() {
+        let html = r#"
+            <html><body>
+                <div class="nav">Start Politik Sport Wetter Navigation Werbung</div>
+                <div class="article-body">
+                    <p>Brand in der Rigaer Straße. Die Feuerwehr war am Abend im Einsatz.</p>
+                    <p>Mehrere Menschen bemerkten Rauch in einem Wohnhaus nahe der Kreuzung.</p>
+                    <p>Die Polizei sperrte den Bereich zeitweise ab und leitete den Verkehr um.</p>
+                    <p>Weitere Details sollen im Laufe des Tages bekannt gegeben werden.</p>
+                </div>
+                <footer>Impressum Datenschutz Kontakt Newsletter</footer>
+            </body></html>
+        "#;
+
+        let body = extract_article_body(html);
+
+        assert!(body.contains("Brand in der Rigaer Straße"));
+        assert!(!body.contains("Impressum Datenschutz"));
+    }
+
+    #[test]
+    fn configured_place_distance_matches_alias() {
+        let filter = FilterConfig {
+            places: vec![PlaceConfig {
+                name: "RAW-Gelände".to_owned(),
+                lat: 52.5070,
+                lon: 13.4540,
+                aliases: vec!["RAW Gelände".to_owned(), "RAW".to_owned()],
+            }],
+            ..Default::default()
+        };
+        let item = FeedItem {
+            guid: "place".to_owned(),
+            title: "Feuerwehreinsatz am RAW".to_owned(),
+            link: None,
+            link_note: None,
+            description: None,
+            article_text: None,
+            source_name: "Test".to_owned(),
+            score: 0,
+            max_score: 0,
+            distance_meters: None,
+            location_label: None,
+            published_at: None,
+        };
+
+        let hit = find_configured_place_distance(&item, &filter, Some((52.5070, 13.4540)));
+
+        assert_eq!(hit.map(|(_, label)| label), Some("RAW-Gelände".to_owned()));
+    }
+
+    #[test]
     fn street_evidence_ignores_boilerplate_after_impressum() {
         let evidence = extract_street_evidence(
             "Brand in der Rigaer Straße",
@@ -693,16 +843,61 @@ mod feed_tests {
 
 // ── Article fetcher ───────────────────────────────────────────────────────────
 
-/// Return the inner HTML of the first `<tag_name …>…</tag_name>` block.
-fn find_tag_inner<'a>(html: &'a str, tag_name: &str) -> Option<&'a str> {
+fn tag_blocks<'a>(html: &'a str, tag_name: &str) -> Vec<(&'a str, &'a str)> {
     let lower = html.to_lowercase();
     let open_str = format!("<{tag_name}");
     let close_str = format!("</{tag_name}>");
-    let s = lower.find(&open_str)?;
-    let gt = html[s..].find('>')?;
-    let content_start = s + gt + 1;
-    let e = lower[content_start..].find(&close_str)?;
-    Some(&html[content_start..content_start + e])
+    let mut out = Vec::new();
+    let mut offset = 0;
+
+    while let Some(pos) = lower[offset..].find(&open_str) {
+        let start = offset + pos;
+        let Some(gt_rel) = html[start..].find('>') else {
+            break;
+        };
+        let content_start = start + gt_rel + 1;
+        let Some(close_rel) = lower[content_start..].find(&close_str) else {
+            break;
+        };
+        let content_end = content_start + close_rel;
+        let tag = &html[start..content_start];
+        let inner = &html[content_start..content_end];
+        out.push((tag, inner));
+        offset = content_end + close_str.len();
+    }
+
+    out
+}
+
+fn article_container_score(tag: &str, text: &str) -> i32 {
+    let tag = tag.to_lowercase();
+    let mut score = 0;
+    for needle in [
+        "article",
+        "articlebody",
+        "story",
+        "content",
+        "main",
+        "post",
+        "entry",
+        "body",
+        "meldung",
+        "text",
+    ] {
+        if tag.contains(needle) {
+            score += 4;
+        }
+    }
+    for needle in [
+        "nav", "menu", "footer", "header", "aside", "comment", "related", "teaser", "ad", "advert",
+        "social",
+    ] {
+        if tag.contains(needle) {
+            score -= 5;
+        }
+    }
+    let words = text.split_whitespace().count() as i32;
+    score + (words / 80).min(8)
 }
 
 /// Remove all `<tag>…</tag>` blocks from html (nav, header, footer, aside, script, style).
@@ -731,19 +926,34 @@ fn remove_blocks(html: &str, tags: &[&str]) -> String {
 /// Extract only the article body from a full HTML page.
 /// Tries semantic containers first, then strips navigation blocks.
 fn extract_article_body(html: &str) -> String {
-    for tag in &["article", "main"] {
-        if let Some(inner) = find_tag_inner(html, tag) {
-            let t = strip_html(inner);
-            if t.trim().len() > 200 {
-                return t;
+    let cleaned = remove_blocks(
+        html,
+        &[
+            "script", "style", "nav", "header", "footer", "aside", "noscript",
+        ],
+    );
+
+    let mut best: Option<(i32, String)> = None;
+    for tag_name in &["article", "main", "section", "div"] {
+        for (tag, inner) in tag_blocks(&cleaned, tag_name) {
+            let text = strip_html(inner);
+            let text = text.trim();
+            if text.len() < 200 {
+                continue;
+            }
+            let score = article_container_score(tag, text);
+            if score > 0
+                && best.as_ref().map_or(true, |(best_score, best_text)| {
+                    score > *best_score || (score == *best_score && text.len() > best_text.len())
+                })
+            {
+                best = Some((score, text.to_owned()));
             }
         }
     }
-    let cleaned = remove_blocks(
-        html,
-        &["script", "style", "nav", "header", "footer", "aside"],
-    );
-    strip_html(&cleaned)
+
+    best.map(|(_, text)| text)
+        .unwrap_or_else(|| strip_html(&cleaned))
 }
 
 #[derive(Debug, Clone)]
@@ -822,6 +1032,71 @@ fn meta_property_value(html: &str, prop_name: &str) -> Option<String> {
     None
 }
 
+fn looks_like_google_url(url: &str) -> bool {
+    let u = url.to_lowercase();
+    u.contains("://news.google.") || u.contains("://www.google.") || u.contains("://google.")
+}
+
+fn decode_url_parameter(url: &str, keys: &[&str]) -> Option<String> {
+    let query_start = url.find('?')?;
+    for part in url[query_start + 1..].split('&') {
+        let (key, value) = part.split_once('=')?;
+        if keys.iter().any(|wanted| key.eq_ignore_ascii_case(wanted)) {
+            let decoded = percent_decode(value.replace('+', " ").as_str());
+            if decoded.starts_with("http://") || decoded.starts_with("https://") {
+                return Some(decoded);
+            }
+        }
+    }
+    None
+}
+
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let Ok(hex) = std::str::from_utf8(&bytes[i + 1..i + 3]) {
+                if let Ok(v) = u8::from_str_radix(hex, 16) {
+                    out.push(v);
+                    i += 3;
+                    continue;
+                }
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn external_href_from_google_html(html: &str) -> Option<String> {
+    let lower = html.to_lowercase();
+    let mut offset = 0;
+    while let Some(pos) = lower[offset..].find("<a") {
+        let start = offset + pos;
+        let Some(end_rel) = lower[start..].find('>') else {
+            break;
+        };
+        let end = start + end_rel + 1;
+        let tag = &html[start..end];
+        if let Some(href) = attr_value(tag, "href") {
+            let href = decode_entities(&href);
+            let candidate = decode_url_parameter(&href, &["url", "q"]).unwrap_or(href);
+            if (candidate.starts_with("http://") || candidate.starts_with("https://"))
+                && !looks_like_google_url(&candidate)
+            {
+                if !looks_like_google_url(&candidate) {
+                    return Some(candidate);
+                }
+            }
+        }
+        offset = end;
+    }
+    None
+}
+
 fn looks_like_rolling_url(url: &str) -> bool {
     let u = url.to_lowercase();
     [
@@ -875,6 +1150,11 @@ fn resolve_article_link(
         .filter(|url| url.starts_with("http://") || url.starts_with("https://"));
 
     let mut link = canonical.unwrap_or_else(|| feed_url.to_owned());
+    if looks_like_google_url(&link) || looks_like_google_url(feed_url) {
+        if let Some(external) = external_href_from_google_html(html) {
+            link = external;
+        }
+    }
     let rolling = looks_like_rolling_url(feed_url) || looks_like_rolling_url(&link);
     let same_item = text_matches_title(article_text, title);
     let mut note = None;
@@ -1390,6 +1670,38 @@ async fn find_nearest_distance(
     }
 }
 
+fn find_configured_place_distance(
+    item: &FeedItem,
+    filter: &FilterConfig,
+    ref_point: Option<(f64, f64)>,
+) -> Option<(f64, String)> {
+    let (ref_lat, ref_lon) = ref_point?;
+    let text = normalize(&format!(
+        "{} {} {}",
+        item.title,
+        item.description.as_deref().unwrap_or(""),
+        first_relevant_article_text(item.article_text.as_deref())
+    ));
+
+    let mut best: Option<(f64, String)> = None;
+    for place in &filter.places {
+        let mut terms = Vec::with_capacity(place.aliases.len() + 1);
+        terms.push(place.name.as_str());
+        terms.extend(place.aliases.iter().map(String::as_str));
+
+        if terms.iter().any(|term| text.contains(&normalize(term))) {
+            let dist = haversine_meters(ref_lat, ref_lon, place.lat, place.lon);
+            if best
+                .as_ref()
+                .map_or(true, |(best_dist, _)| dist < *best_dist)
+            {
+                best = Some((dist, place.name.clone()));
+            }
+        }
+    }
+    best
+}
+
 // ── Filtering ─────────────────────────────────────────────────────────────────
 
 fn normalize(s: &str) -> String {
@@ -1656,6 +1968,89 @@ fn cluster_digest_items(items: Vec<db::DbItem>) -> Vec<DigestItem> {
         .collect()
 }
 
+fn cluster_db_items(items: Vec<db::DbItem>) -> Vec<Vec<db::DbItem>> {
+    let mut sorted = items;
+    sorted.sort_by(|a, b| b.score.cmp(&a.score));
+
+    let mut clusters: Vec<Vec<db::DbItem>> = Vec::new();
+    for item in sorted {
+        if let Some(cluster) = clusters
+            .iter_mut()
+            .find(|cluster| likely_same_incident(&item, cluster))
+        {
+            cluster.push(item);
+        } else {
+            clusters.push(vec![item]);
+        }
+    }
+    clusters
+}
+
+async fn promote_candidate_clusters(
+    db: &Db,
+    min_score: i32,
+    candidate_min_sources: usize,
+    candidate_retention_hours: u64,
+) -> Result<usize> {
+    let retention_secs = (candidate_retention_hours.max(1) as i64) * 3600;
+    let expired = db.prune_old_candidates(retention_secs).await?;
+    if expired > 0 {
+        info!("Expired {expired} old news candidate(s) before digest");
+    }
+
+    let pending = db.list_pending_for_clustering(retention_secs).await?;
+    if pending.is_empty() {
+        return Ok(0);
+    }
+
+    let candidate_guids: HashSet<String> = pending
+        .iter()
+        .filter(|p| p.state == "candidate")
+        .map(|p| p.item.guid.clone())
+        .collect();
+    if candidate_guids.is_empty() {
+        return Ok(0);
+    }
+
+    let clusters = cluster_db_items(pending.into_iter().map(|p| p.item).collect());
+    let mut to_promote = Vec::new();
+    for cluster in clusters {
+        let best_score = cluster.iter().map(|item| item.score).max().unwrap_or(0);
+        let sources: Vec<String> = cluster
+            .iter()
+            .map(|item| item.source_name.clone())
+            .collect();
+        let unique_sources = unique_source_names(&sources);
+        let corroborated = unique_sources.len() >= candidate_min_sources.max(2);
+        let strong_after_boost = if unique_sources.len() > 1 {
+            (best_score + 1).min(5) >= min_score
+        } else {
+            best_score >= min_score
+        };
+
+        if corroborated && strong_after_boost {
+            to_promote.extend(
+                cluster
+                    .iter()
+                    .filter(|item| candidate_guids.contains(&item.guid))
+                    .map(|item| item.guid.clone()),
+            );
+        }
+    }
+
+    let promoted = db
+        .promote_candidates(
+            &to_promote,
+            min_score,
+            "promoted by duplicate-source clustering",
+        )
+        .await?;
+    if promoted > 0 {
+        info!("Promoted {promoted} news candidate(s) after duplicate-source clustering");
+    }
+    Ok(promoted)
+}
+
 // ── Posting ───────────────────────────────────────────────────────────────────
 
 /// Returns true if all rooms received the message. On false the caller should
@@ -1678,6 +2073,7 @@ pub(crate) async fn post_to_rooms(client: &Client, plain: &str, html: &str) -> b
 
 enum ProcessOutcome {
     Queued(FeedItem),
+    Candidate { item: FeedItem, reason: String },
     Dropped { item: FeedItem, reason: String },
     Retry { item: FeedItem, reason: String },
 }
@@ -1837,21 +2233,28 @@ async fn process_item(
         None
     };
 
+    let place_evidence = find_configured_place_distance(&item, &filter, ref_point);
+    if let Some((dist, label)) = &place_evidence {
+        info!(
+            "  📍 [{}] configured place {:?} → {} at {}",
+            source_name,
+            label,
+            item.title,
+            format_distance(*dist)
+        );
+    }
+
     // ── 3. Final score ────────────────────────────────────────────────────────
-    let final_location = match (geocoded_evidence, kw_evidence) {
-        (Some((d, street)), Some((k, label))) => {
-            if d <= k {
-                Some((d, street))
-            } else {
-                Some((k, label))
-            }
-        }
-        (Some(v), None) => Some(v),
-        (None, Some(v)) => Some(v),
-        (None, None) => None,
-    };
+    let final_location = [geocoded_evidence, place_evidence, kw_evidence]
+        .into_iter()
+        .flatten()
+        .min_by(|(a, _), (b, _)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     let final_meters = final_location.as_ref().map(|(meters, _)| *meters);
     let score = final_meters.map(distance_score).unwrap_or(0);
+    item.score = score;
+    item.max_score = 5;
+    item.distance_meters = final_meters;
+    item.location_label = final_location.map(|(_, label)| label);
 
     if source.filter && score < filter.digest_threshold {
         let reason = format!(
@@ -1869,15 +2272,15 @@ async fn process_item(
                 reason: format!("article fetch failed and {reason}"),
             };
         }
+        if score >= filter.candidate_min_score && score > 0 {
+            tracing::debug!("CANDIDATE [{}] {:?}: {reason}", source_name, item.title);
+            return ProcessOutcome::Candidate { item, reason };
+        }
         tracing::debug!("DROP [{}] {:?}: {reason}", source_name, item.title);
         return ProcessOutcome::Dropped { item, reason };
     }
 
     info!("QUEUE [{}] {:?} score={}", source_name, item.title, score);
-    item.score = score;
-    item.max_score = 5;
-    item.distance_meters = final_meters;
-    item.location_label = final_location.map(|(_, label)| label);
     ProcessOutcome::Queued(item)
 }
 
@@ -1974,8 +2377,10 @@ async fn poll_once(
     };
 
     let mut passed_by_source: HashMap<String, usize> = HashMap::new();
+    let mut candidate_by_source: HashMap<String, usize> = HashMap::new();
     let mut dropped_by_source: HashMap<String, usize> = HashMap::new();
     let mut retried_by_source: HashMap<String, usize> = HashMap::new();
+    let mut candidate_reasons: HashMap<String, usize> = HashMap::new();
     let mut drop_reasons: HashMap<String, usize> = HashMap::new();
     let mut retry_reasons: HashMap<String, usize> = HashMap::new();
 
@@ -1988,6 +2393,15 @@ async fn poll_once(
                     .or_default() += 1;
                 if !test_mode {
                     db.insert_queued(&item).await.ok();
+                }
+            }
+            Ok(ProcessOutcome::Candidate { item, reason }) => {
+                *candidate_by_source
+                    .entry(item.source_name.clone())
+                    .or_default() += 1;
+                *candidate_reasons.entry(reason.clone()).or_default() += 1;
+                if !test_mode {
+                    db.insert_candidate(&item, &reason).await.ok();
                 }
             }
             Ok(ProcessOutcome::Dropped { item, reason }) => {
@@ -2018,16 +2432,34 @@ async fn poll_once(
     }
     ticker.abort();
 
+    let mut source_stats = Vec::new();
     for source in sources {
         let total = total_by_source.get(&source.name).copied().unwrap_or(0);
         let passed = passed_by_source.get(&source.name).copied().unwrap_or(0);
+        let candidates = candidate_by_source.get(&source.name).copied().unwrap_or(0);
         let dropped = dropped_by_source.get(&source.name).copied().unwrap_or(0);
         let retried = retried_by_source.get(&source.name).copied().unwrap_or(0);
         if source.filter {
-            info!("Source '{}': {total} in feed, {passed} passed, {dropped} dropped, {retried} retry-later", source.name);
+            info!("Source '{}': {total} in feed, {passed} passed, {candidates} candidate, {dropped} dropped, {retried} retry-later", source.name);
         } else {
             info!("Source '{}': {total} in feed, {passed} new", source.name);
         }
+        source_stats.push(db::SourcePollStat {
+            source_name: source.name.clone(),
+            total,
+            queued: passed,
+            candidate: candidates,
+            dropped,
+            retry_later: retried,
+        });
+    }
+    if !test_mode {
+        if let Err(e) = db.record_source_stats(source_stats).await {
+            warn!("Failed to record source stats: {e}");
+        }
+    }
+    for (reason, count) in candidate_reasons {
+        info!("Candidate reason: {count} item(s): {reason}");
     }
     for (reason, count) in drop_reasons {
         info!("Drop reason: {count} item(s): {reason}");
@@ -2104,7 +2536,14 @@ fn chunk_digest(items: &[DigestItem]) -> Vec<Vec<DigestItem>> {
 
 // ── Digest loop ───────────────────────────────────────────────────────────────
 
-async fn digest_loop(client: Client, digest_times: Vec<String>, db: Db, min_score: i32) {
+async fn digest_loop(
+    client: Client,
+    digest_times: Vec<String>,
+    db: Db,
+    min_score: i32,
+    candidate_min_sources: usize,
+    candidate_retention_hours: u64,
+) {
     let targets: Vec<NaiveTime> = digest_times
         .iter()
         .filter_map(|s| {
@@ -2137,6 +2576,17 @@ async fn digest_loop(client: Client, digest_times: Vec<String>, db: Db, min_scor
         let secs = (next_dt - now.naive_local()).num_seconds().max(0) as u64;
         info!("Next digest in {secs}s (at {})", next_dt.format("%H:%M"));
         sleep(Duration::from_secs(secs)).await;
+
+        if let Err(e) = promote_candidate_clusters(
+            &db,
+            min_score,
+            candidate_min_sources,
+            candidate_retention_hours,
+        )
+        .await
+        {
+            warn!("Digest: candidate promotion failed, continuing with queued items: {e}");
+        }
 
         let items = match db.take_for_digest(min_score).await {
             Ok(v) => v,
@@ -2242,11 +2692,14 @@ async fn main() -> Result<()> {
         info!("Admin users: {admin_users:?}");
     }
 
+    let db = Db::open(&store_dir.join("items.db"))?;
+
     let bot_state = BotState {
         bot_user_id: user_id,
         allowed_inviters,
         admin_users,
         reset_allowed: Arc::new(Mutex::new(HashSet::new())),
+        db: db.clone(),
     };
 
     // Invite handler
@@ -2355,7 +2808,8 @@ async fn main() -> Result<()> {
                         ));
                     }
                     MessageType::Text(text) => {
-                        if let Some(target) = text.body.trim().strip_prefix("!reset-trust ") {
+                        let body = text.body.trim();
+                        if let Some(target) = body.strip_prefix("!reset-trust ") {
                             if state.admin_users.contains(&ev.sender) {
                                 if let Ok(target_user) = target.trim().parse::<OwnedUserId>() {
                                     state.reset_allowed.lock().await.insert(target_user.clone());
@@ -2368,6 +2822,54 @@ async fn main() -> Result<()> {
                                 }
                             } else {
                                 warn!("!reset-trust from non-admin {} — ignored", ev.sender);
+                            }
+                        } else if body.starts_with("!source-stats") {
+                            if !state.admin_users.contains(&ev.sender) {
+                                warn!("!source-stats from non-admin {} — ignored", ev.sender);
+                                return;
+                            }
+                            let hours = body
+                                .split_whitespace()
+                                .nth(1)
+                                .and_then(|s| s.parse::<u32>().ok())
+                                .unwrap_or(24)
+                                .clamp(1, 24 * 30);
+                            match state.db.source_stats_summary(hours).await {
+                                Ok(stats) if stats.is_empty() => {
+                                    room.send(RoomMessageEventContent::text_plain(format!(
+                                        "No source stats recorded in the last {hours}h."
+                                    )))
+                                    .await
+                                    .ok();
+                                }
+                                Ok(stats) => {
+                                    let mut lines =
+                                        vec![format!("Source stats, last {hours}h:")];
+                                    for stat in stats {
+                                        lines.push(format!(
+                                            "{}: {} total, {} queued, {} candidate, {} dropped, {} retry",
+                                            stat.source_name,
+                                            stat.total,
+                                            stat.queued,
+                                            stat.candidate,
+                                            stat.dropped,
+                                            stat.retry_later
+                                        ));
+                                    }
+                                    room.send(RoomMessageEventContent::text_plain(
+                                        lines.join("\n"),
+                                    ))
+                                    .await
+                                    .ok();
+                                }
+                                Err(e) => {
+                                    warn!("!source-stats failed: {e}");
+                                    room.send(RoomMessageEventContent::text_plain(
+                                        "Source stats query failed.",
+                                    ))
+                                    .await
+                                    .ok();
+                                }
                             }
                         }
                     }
@@ -2414,8 +2916,6 @@ async fn main() -> Result<()> {
             }
         }
     }
-
-    let db = Db::open(&store_dir.join("items.db"))?;
 
     // Crash recovery: anything left in 'processing' from last run goes back to 'queued'.
     let recovered = db.recover_processing().await?;
@@ -2545,6 +3045,8 @@ async fn main() -> Result<()> {
         config.schedule.digest_times.clone(),
         db.clone(),
         config.filter.digest_threshold,
+        config.filter.candidate_min_sources,
+        config.filter.candidate_retention_hours,
     ));
 
     if config.emergency.enabled {

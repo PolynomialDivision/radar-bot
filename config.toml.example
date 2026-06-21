@@ -9,7 +9,9 @@ device_id = "your_device_id_here"
 # Users allowed to invite the bot to Matrix rooms. Empty = accept from anyone.
 allowed_inviters = ["@you:matrix.org"]
 
-# Users allowed to run !reset-trust @user:server.
+# Users allowed to run admin commands:
+#   !reset-trust @user:server
+#   !source-stats [hours]
 admin_users = ["@you:matrix.org"]
 
 # Which devices receive room keys:
@@ -41,6 +43,14 @@ required = ["Yourcity"]
 
 # Minimum distance score (1–5) to include in the daily digest.
 digest_threshold = 2
+
+# Weak local items are kept temporarily as candidates instead of being dropped
+# immediately. If another source reports the same incident, duplicate clustering
+# can promote them into the next digest. This improves recall without lowering
+# the final digest threshold for single-source items.
+candidate_min_score = 1
+candidate_min_sources = 2
+candidate_retention_hours = 24
 
 # Your reference address — geocoded once at startup. All distances are measured from here.
 reference_address = "Yourstreet 1, 10000 Yourcity"
@@ -87,6 +97,16 @@ terms = [
     "NearbyStreet",
     "LocalLandmark",
 ]
+
+# Explicit local places with coordinates. Use this for stations, venues, squares,
+# parks, housing projects, and local nicknames that Nominatim may not geocode from
+# article text. If an item mentions any alias, the bot scores it by distance to
+# this coordinate.
+[[filter.places]]
+name = "Local Station"
+lat = 52.50000
+lon = 13.40000
+aliases = ["Local U-Bahn", "Local S-Bahn", "Station Nickname"]
 
 # ── Sources ───────────────────────────────────────────────────────────────────
 # Each source needs a name and a type (default: "rss"). Shared optional fields:

@@ -46,6 +46,33 @@ pub struct DbItem {
     pub location_label: Option<String>,
 }
 
+/// A digest candidate or queued item used for pre-digest clustering.
+#[derive(Debug, Clone)]
+pub struct PendingItem {
+    pub item: DbItem,
+    pub state: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct SourcePollStat {
+    pub source_name: String,
+    pub total: usize,
+    pub queued: usize,
+    pub candidate: usize,
+    pub dropped: usize,
+    pub retry_later: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct SourceStatSummary {
+    pub source_name: String,
+    pub total: i64,
+    pub queued: i64,
+    pub candidate: i64,
+    pub dropped: i64,
+    pub retry_later: i64,
+}
+
 // ── Db handle ─────────────────────────────────────────────────────────────────
 
 #[derive(Clone)]
@@ -61,6 +88,7 @@ impl Db {
             .context("Failed to initialise DB schema")?;
         ensure_column(&conn, "items", "location_label", "TEXT")?;
         ensure_column(&conn, "items", "link_note", "TEXT")?;
+        ensure_items_state_allows_candidates(&conn)?;
         ensure_column(&conn, "dwd_active_warnings", "event_ids_json", "TEXT")?;
         ensure_column(&conn, "dwd_active_warnings", "original_plain", "TEXT")?;
         ensure_column(&conn, "dwd_active_warnings", "original_html", "TEXT")?;
@@ -102,6 +130,21 @@ impl Db {
 
     /// Persist a scored item that passed all filters. No-op if guid already exists.
     pub async fn insert_queued(&self, item: &FeedItem) -> Result<()> {
+        self.insert_item_with_state(item, "queued", None).await
+    }
+
+    /// Persist a weak-but-local item so duplicate clustering can promote it later.
+    pub async fn insert_candidate(&self, item: &FeedItem, reason: &str) -> Result<()> {
+        self.insert_item_with_state(item, "candidate", Some(reason))
+            .await
+    }
+
+    async fn insert_item_with_state(
+        &self,
+        item: &FeedItem,
+        state: &'static str,
+        reason: Option<&str>,
+    ) -> Result<()> {
         let db = self.0.clone();
         let guid = item.guid.clone();
         let source_name = item.source_name.clone();
@@ -112,14 +155,15 @@ impl Db {
         let max_score = item.max_score;
         let distance_m = item.distance_meters;
         let location = item.location_label.clone();
+        let reason = reason.map(str::to_owned);
         let now = chrono::Utc::now().timestamp();
 
         tokio::task::spawn_blocking(move || {
             db.lock().unwrap().execute(
                 "INSERT OR IGNORE INTO items
-                 (guid, source_name, title, link, link_note, score, max_score, distance_m, location_label, discovered_at, state)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'queued')",
-                params![guid, source_name, title, link, link_note, score, max_score, distance_m, location, now],
+                 (guid, source_name, title, link, link_note, score, max_score, distance_m, location_label, discovered_at, state, error)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                params![guid, source_name, title, link, link_note, score, max_score, distance_m, location, now, state, reason],
             )?;
             Ok::<(), anyhow::Error>(())
         })
@@ -157,10 +201,169 @@ impl Db {
 
     // ── Digest phase ──────────────────────────────────────────────────────────
 
+    /// Return queued and candidate rows recent enough to participate in pre-digest clustering.
+    pub async fn list_pending_for_clustering(
+        &self,
+        candidate_retention_secs: i64,
+    ) -> Result<Vec<PendingItem>> {
+        let db = self.0.clone();
+        let cutoff = chrono::Utc::now().timestamp() - candidate_retention_secs;
+
+        tokio::task::spawn_blocking(move || {
+            let conn = db.lock().unwrap();
+            let mut stmt = conn.prepare(
+                "SELECT guid, source_name, title, link, link_note, score, max_score, distance_m, location_label, state
+                 FROM items
+                 WHERE state = 'queued'
+                    OR (state = 'candidate' AND discovered_at >= ?1)
+                 ORDER BY score DESC",
+            )?;
+            let rows = stmt
+                .query_map(params![cutoff], |row| {
+                    Ok(PendingItem {
+                        item: DbItem {
+                            guid:            row.get(0)?,
+                            source_name:     row.get(1)?,
+                            title:           row.get(2)?,
+                            link:            row.get(3)?,
+                            link_note:       row.get(4)?,
+                            score:           row.get(5)?,
+                            max_score:       row.get(6)?,
+                            distance_meters: row.get(7)?,
+                            location_label:  row.get(8)?,
+                        },
+                        state: row.get(9)?,
+                    })
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok::<Vec<PendingItem>, anyhow::Error>(rows)
+        })
+        .await?
+    }
+
+    pub async fn promote_candidates(
+        &self,
+        guids: &[String],
+        min_score: i32,
+        reason: &str,
+    ) -> Result<usize> {
+        if guids.is_empty() {
+            return Ok(0);
+        }
+        let db = self.0.clone();
+        let guids = guids.to_vec();
+        let reason = reason.to_owned();
+
+        tokio::task::spawn_blocking(move || {
+            let conn = db.lock().unwrap();
+            let mut n = 0;
+            for guid in &guids {
+                n += conn.execute(
+                    "UPDATE items
+                     SET state = 'queued',
+                         score = MAX(score, ?1),
+                         error = ?2
+                     WHERE guid = ?3 AND state = 'candidate'",
+                    params![min_score, reason, guid],
+                )?;
+            }
+            Ok::<usize, anyhow::Error>(n)
+        })
+        .await?
+    }
+
+    pub async fn prune_old_candidates(&self, candidate_retention_secs: i64) -> Result<usize> {
+        let db = self.0.clone();
+        let cutoff = chrono::Utc::now().timestamp() - candidate_retention_secs;
+        tokio::task::spawn_blocking(move || {
+            let n = db.lock().unwrap().execute(
+                "UPDATE items
+                 SET state = 'dropped', error = 'candidate expired before corroboration'
+                 WHERE state = 'candidate' AND discovered_at < ?1",
+                params![cutoff],
+            )?;
+            Ok::<usize, anyhow::Error>(n)
+        })
+        .await?
+    }
+
+    pub async fn record_source_stats(&self, stats: Vec<SourcePollStat>) -> Result<()> {
+        if stats.is_empty() {
+            return Ok(());
+        }
+        let db = self.0.clone();
+        let now = chrono::Utc::now().timestamp();
+        let cutoff = now - 30 * 86_400;
+
+        tokio::task::spawn_blocking(move || {
+            let mut conn = db.lock().unwrap();
+            let tx = conn.transaction()?;
+            for stat in stats {
+                tx.execute(
+                    "INSERT INTO source_poll_stats
+                     (ts, source_name, total, queued, candidate, dropped, retry_later)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    params![
+                        now,
+                        stat.source_name,
+                        stat.total as i64,
+                        stat.queued as i64,
+                        stat.candidate as i64,
+                        stat.dropped as i64,
+                        stat.retry_later as i64
+                    ],
+                )?;
+            }
+            tx.execute(
+                "DELETE FROM source_poll_stats WHERE ts < ?1",
+                params![cutoff],
+            )?;
+            tx.commit()?;
+            Ok::<(), anyhow::Error>(())
+        })
+        .await?
+    }
+
+    pub async fn source_stats_summary(&self, hours: u32) -> Result<Vec<SourceStatSummary>> {
+        let db = self.0.clone();
+        let hours = hours.clamp(1, 24 * 30);
+        let cutoff = chrono::Utc::now().timestamp() - hours as i64 * 3600;
+
+        tokio::task::spawn_blocking(move || {
+            let conn = db.lock().unwrap();
+            let mut stmt = conn.prepare(
+                "SELECT source_name,
+                        COALESCE(SUM(total), 0),
+                        COALESCE(SUM(queued), 0),
+                        COALESCE(SUM(candidate), 0),
+                        COALESCE(SUM(dropped), 0),
+                        COALESCE(SUM(retry_later), 0)
+                 FROM source_poll_stats
+                 WHERE ts >= ?1
+                 GROUP BY source_name
+                 ORDER BY SUM(queued) DESC, SUM(candidate) DESC, SUM(total) DESC
+                 LIMIT 25",
+            )?;
+            let rows = stmt
+                .query_map(params![cutoff], |row| {
+                    Ok(SourceStatSummary {
+                        source_name: row.get(0)?,
+                        total: row.get(1)?,
+                        queued: row.get(2)?,
+                        candidate: row.get(3)?,
+                        dropped: row.get(4)?,
+                        retry_later: row.get(5)?,
+                    })
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok::<Vec<SourceStatSummary>, anyhow::Error>(rows)
+        })
+        .await?
+    }
+
     /// Atomically:
-    ///   1. Drop all queued items below min_score.
-    ///   2. Move remaining queued items → 'processing'.
-    ///   3. Return them sorted by score descending.
+    ///   1. Move queued items → 'processing'.
+    ///   2. Return them sorted by score descending.
     ///
     /// Caller MUST call mark_posted() or requeue_failed() for the returned items.
     pub async fn take_for_digest(&self, min_score: i32) -> Result<Vec<DbItem>> {
@@ -172,14 +375,14 @@ impl Db {
             let tx = conn.transaction()?;
 
             tx.execute(
-                "UPDATE items SET state = 'dropped'
+                "UPDATE items SET state = 'dropped', error = 'queued item below digest threshold'
                  WHERE state = 'queued' AND score < ?1",
                 params![min_score],
             )?;
             tx.execute(
                 "UPDATE items SET state = 'processing', last_attempt_at = ?1
-                 WHERE state = 'queued'",
-                params![now],
+                 WHERE state = 'queued' AND score >= ?2",
+                params![now, min_score],
             )?;
 
             let mut stmt = tx.prepare(
@@ -618,6 +821,56 @@ fn ensure_column(conn: &Connection, table: &str, column: &str, definition: &str)
     Ok(())
 }
 
+fn ensure_items_state_allows_candidates(conn: &Connection) -> Result<()> {
+    let sql: String = conn.query_row(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'items'",
+        [],
+        |row| row.get(0),
+    )?;
+    if sql.contains("'candidate'") {
+        return Ok(());
+    }
+
+    conn.execute_batch(
+        "
+        PRAGMA foreign_keys = OFF;
+        BEGIN TRANSACTION;
+        ALTER TABLE items RENAME TO items_old;
+        CREATE TABLE items (
+            guid             TEXT    PRIMARY KEY,
+            source_name      TEXT    NOT NULL,
+            title            TEXT    NOT NULL,
+            link             TEXT,
+            link_note        TEXT,
+            score            INTEGER NOT NULL DEFAULT 0,
+            max_score        INTEGER NOT NULL DEFAULT 0,
+            distance_m       REAL,
+            location_label   TEXT,
+            discovered_at    INTEGER NOT NULL,
+            state            TEXT    NOT NULL DEFAULT 'queued'
+                             CHECK(state IN ('queued','candidate','processing','posted','dropped')),
+            last_attempt_at  INTEGER,
+            posted_at        INTEGER,
+            error            TEXT
+        );
+        INSERT INTO items
+            (guid, source_name, title, link, link_note, score, max_score, distance_m,
+             location_label, discovered_at, state, last_attempt_at, posted_at, error)
+        SELECT
+            guid, source_name, title, link, link_note, score, max_score, distance_m,
+            location_label, discovered_at, state, last_attempt_at, posted_at, error
+        FROM items_old;
+        DROP TABLE items_old;
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_source_guid ON items(source_name, guid);
+        CREATE INDEX IF NOT EXISTS idx_state ON items(state);
+        COMMIT;
+        PRAGMA foreign_keys = ON;
+        ",
+    )
+    .context("Failed to migrate items table for candidate state")?;
+    Ok(())
+}
+
 // ── Schema ────────────────────────────────────────────────────────────────────
 
 const SCHEMA: &str = "
@@ -633,7 +886,7 @@ const SCHEMA: &str = "
         location_label   TEXT,
         discovered_at    INTEGER NOT NULL,
         state            TEXT    NOT NULL DEFAULT 'queued'
-                         CHECK(state IN ('queued','processing','posted','dropped')),
+                         CHECK(state IN ('queued','candidate','processing','posted','dropped')),
         last_attempt_at  INTEGER,
         posted_at        INTEGER,
         error            TEXT
@@ -642,6 +895,17 @@ const SCHEMA: &str = "
     -- feeds that reuse short numeric IDs across different sources.
     CREATE UNIQUE INDEX IF NOT EXISTS idx_source_guid  ON items(source_name, guid);
     CREATE        INDEX IF NOT EXISTS idx_state        ON items(state);
+    CREATE TABLE IF NOT EXISTS source_poll_stats (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        ts          INTEGER NOT NULL,
+        source_name TEXT    NOT NULL,
+        total       INTEGER NOT NULL,
+        queued      INTEGER NOT NULL,
+        candidate   INTEGER NOT NULL,
+        dropped     INTEGER NOT NULL,
+        retry_later INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_source_poll_stats_ts ON source_poll_stats(ts);
     CREATE TABLE IF NOT EXISTS alerts (
         id       TEXT    PRIMARY KEY,
         source   TEXT    NOT NULL,

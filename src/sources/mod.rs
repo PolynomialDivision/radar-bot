@@ -3,6 +3,7 @@ pub mod rss;
 
 use crate::{FeedItem, SourceConfig};
 use serde::Deserialize;
+use tracing::warn;
 
 // ── Source type discriminator ─────────────────────────────────────────────────
 //
@@ -69,7 +70,7 @@ pub fn build_adapter(source: &SourceConfig, bluesky: Option<&BlueskyContext>) ->
         }),
         SourceType::GoogleNews => SourceAdapter::Rss(rss::RssAdapter {
             name: source.name.clone(),
-            url: google_news_rss_url(source.query.as_deref().unwrap_or_default()),
+            url: google_news_rss_url(&source.name, source.query.as_deref().unwrap_or_default()),
             max_age_hours: source.max_age_hours,
         }),
         SourceType::Bluesky => {
@@ -95,7 +96,11 @@ pub fn build_adapter(source: &SourceConfig, bluesky: Option<&BlueskyContext>) ->
     }
 }
 
-fn google_news_rss_url(query: &str) -> String {
+fn google_news_rss_url(source_name: &str, query: &str) -> String {
+    if query.trim().is_empty() {
+        warn!("Google News source '{source_name}' has no query configured — skipping");
+        return String::new();
+    }
     let q = crate::url_encode(query);
     format!("https://news.google.com/rss/search?q={q}&hl=de&gl=DE&ceid=DE:de")
 }
@@ -106,7 +111,7 @@ mod tests {
 
     #[test]
     fn google_news_source_builds_german_rss_search_url() {
-        let url = google_news_rss_url(r#""Frankfurter Allee" Berlin Unfall"#);
+        let url = google_news_rss_url("Google News Test", r#""Frankfurter Allee" Berlin Unfall"#);
 
         assert_eq!(
             url,

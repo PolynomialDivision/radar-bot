@@ -11,6 +11,14 @@ pub struct RssAdapter {
 
 impl RssAdapter {
     pub async fn fetch_items(&self, http: &reqwest::Client) -> Vec<FeedItem> {
+        if self.url.trim().is_empty() {
+            warn!(
+                "RSS source '{}' has no URL configured — skipping",
+                self.name
+            );
+            return vec![];
+        }
+
         let resp = tokio::time::timeout(Duration::from_secs(30), http.get(&self.url).send()).await;
 
         let xml = match resp {
