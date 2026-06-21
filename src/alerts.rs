@@ -521,7 +521,7 @@ async fn check_dwd_weather_warnings(
         secondary.sort_by(|a, b| a.start_ms.cmp(&b.start_ms).then(b.level.cmp(&a.level)));
         let cont_notes: Vec<String> = secondary
             .iter()
-            .map(|vw| format_dwd_secondary_warning(&primary.w, &vw.w))
+            .filter_map(|vw| format_dwd_secondary_warning(&primary.w, &vw.w))
             .collect();
 
         if let Some(active) = active_map.get(&primary_id) {
@@ -693,7 +693,11 @@ async fn check_dwd_weather_warnings(
                             &new_html,
                             old_level,
                             primary.level,
-                            event_key,
+                            primary
+                                .w
+                                .get("event")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or(event_key),
                         )
                     };
                     match edit_alert_message_in_rooms(client, ids_json, &edit_plain, &edit_html)
@@ -1153,18 +1157,28 @@ fn format_dwd_description_with_continuations(
     parts.join("\n")
 }
 
-/// One-line note for a lower-severity warning in the same event family.
-/// Overlapping warnings are shown as simultaneous; later warnings as follow-ups.
-fn format_dwd_secondary_warning(primary: &serde_json::Value, w: &serde_json::Value) -> String {
+/// One-line note for a secondary warning in the same event family.
+/// Lower-level warnings fully covered by the primary are omitted. If a lower
+/// warning overlaps but continues after the primary, only the remaining
+/// follow-up part is shown as `danach`.
+fn format_dwd_secondary_warning(
+    primary: &serde_json::Value,
+    w: &serde_json::Value,
+) -> Option<String> {
     let level = w["level"].as_i64().unwrap_or(0);
     let emoji = dwd_level_emoji(level);
-    let label = dwd_level_label_for_warning(w);
+    let label = dwd_secondary_label_for_warning(w);
     let primary_start = primary["start"].as_i64().unwrap_or(0);
     let primary_end = primary["end"].as_i64().unwrap_or(0);
     let secondary_start = w["start"].as_i64().unwrap_or(0);
     let secondary_end = w["end"].as_i64().unwrap_or(0);
-    let prefix = if secondary_end <= primary_start {
-        "davor"
+
+    let prefix = if secondary_start < primary_end && secondary_end <= primary_end {
+        return None;
+    } else if secondary_start < primary_end && secondary_end > primary_end {
+        "danach"
+    } else if secondary_end <= primary_start {
+        return None;
     } else if secondary_start < primary_end {
         "gleichzeitig"
     } else {
@@ -1183,8 +1197,8 @@ fn format_dwd_secondary_warning(primary: &serde_json::Value, w: &serde_json::Val
             }
         });
     match end_str {
-        Some(t) => format!("({prefix}: {emoji} {label} bis {t})"),
-        None => format!("({prefix}: {emoji} {label})"),
+        Some(t) => Some(format!("({prefix}: {emoji} {label} bis {t})")),
+        None => Some(format!("({prefix}: {emoji} {label})")),
     }
 }
 
@@ -1234,6 +1248,26 @@ fn dwd_level_label_for_warning(w: &serde_json::Value) -> &'static str {
         w["event"].as_str().unwrap_or(""),
         w["level"].as_i64().unwrap_or(0),
     )
+}
+
+fn dwd_secondary_label_for_warning(w: &serde_json::Value) -> &'static str {
+    let event = w["event"].as_str().unwrap_or("");
+    let level = w["level"].as_i64().unwrap_or(0);
+    match dwd_event_key(event).as_str() {
+        "GEWITTER" => match level {
+            3 => "Starke Gewitterwarnung",
+            4 => "Unwetterwarnung Gewitter",
+            5 => "Extreme Gewitterwarnung",
+            _ => dwd_level_label_for_warning(w),
+        },
+        "REGEN" => match level {
+            3 => "Starkregenwarnung",
+            4 => "Unwetterwarnung Starkregen",
+            5 => "Extreme Starkregenwarnung",
+            _ => dwd_level_label_for_warning(w),
+        },
+        _ => dwd_level_label_for_warning(w),
+    }
 }
 
 /// Parse a stable key back into its components.
@@ -1709,15 +1743,23 @@ fn append_level_change_to_warning(
     let time = chrono::Local::now().format("%H:%M").to_string();
     let emoji = dwd_level_emoji(new_level);
     let label = dwd_level_label_for_event(event, new_level);
+    let event = event.trim();
+    let event_note = if event.is_empty() {
+        String::new()
+    } else {
+        format!("; jetzt: {event}")
+    };
     let (arrow, verb) = if new_level > old_level {
         ("⬆️", "erhöht")
     } else {
         ("⬇️", "reduziert")
     };
-    let new_plain =
-        format!("{original_plain}\n\n---\n{arrow} Warnstufe {verb} auf {emoji} {label} ({time}).");
+    let new_plain = format!(
+        "{original_plain}\n\n---\n{arrow} Warnung aktualisiert: Warnstufe {verb} auf {emoji} {label}{event_note} ({time})."
+    );
+    let event_note_html = alert_html_escape(&event_note);
     let new_html = format!(
-        "{original_html}<hr><em>{arrow} Warnstufe {verb} auf {emoji} {label} ({time}).</em>"
+        "{original_html}<br><br><hr><em>{arrow} Warnung aktualisiert: Warnstufe {verb} auf {emoji} {label}{event_note_html} ({time}).</em>"
     );
     (new_plain, new_html)
 }
@@ -1924,9 +1966,40 @@ mod tests {
             "end": 1782061200000i64
         });
 
-        assert!(format_dwd_secondary_warning(&primary, &before).contains("(davor:"));
-        assert!(format_dwd_secondary_warning(&primary, &overlapping).contains("(gleichzeitig:"));
-        assert!(format_dwd_secondary_warning(&primary, &followup).contains("(danach:"));
+        assert!(format_dwd_secondary_warning(&primary, &before).is_none());
+        assert!(format_dwd_secondary_warning(&primary, &overlapping)
+            .unwrap()
+            .contains("(danach:"));
+        assert!(format_dwd_secondary_warning(&primary, &followup)
+            .unwrap()
+            .contains("(danach:"));
+    }
+
+    #[test]
+    fn dwd_secondary_note_hides_superseded_thunderstorm_warnings() {
+        let primary = json!({
+            "event": "SCHWERES GEWITTER mit HEFTIGEM STARKREGEN und HAGEL",
+            "level": 4,
+            "start": 1782034800000i64,
+            "end": 1782037800000i64
+        });
+        let covered = json!({
+            "event": "STARKES GEWITTER",
+            "level": 3,
+            "start": 1782029460000i64,
+            "end": 1782037800000i64
+        });
+        let continues_after = json!({
+            "event": "STARKES GEWITTER",
+            "level": 3,
+            "start": 1782029460000i64,
+            "end": 1782039600000i64
+        });
+
+        assert!(format_dwd_secondary_warning(&primary, &covered).is_none());
+        let note = format_dwd_secondary_warning(&primary, &continues_after).unwrap();
+        assert!(note.starts_with("(danach:"));
+        assert!(note.contains("🟠 Starke Gewitterwarnung"));
     }
 
     #[test]
@@ -2059,6 +2132,26 @@ mod tests {
         assert!(plain.contains("✅ Entwarnung"));
         assert!(html.contains("✅ Entwarnung"));
         assert!(plain.contains("gilt nicht mehr"));
+    }
+
+    #[test]
+    fn dwd_level_change_footer_is_separated_and_mentions_new_event() {
+        let orig_plain = "🚨 Amtliche WARNUNG vor STARKEM GEWITTER\nSource: DWD Weather Warnings";
+        let orig_html =
+            "<b>🚨 Amtliche WARNUNG vor STARKEM GEWITTER</b><br><em>Source: DWD Weather Warnings</em>";
+
+        let (plain, html) = append_level_change_to_warning(
+            orig_plain,
+            orig_html,
+            3,
+            4,
+            "SCHWERES GEWITTER mit HEFTIGEM STARKREGEN und HAGEL",
+        );
+
+        assert!(plain.contains("\n\n---\n⬆️ Warnung aktualisiert"));
+        assert!(plain.contains("jetzt: SCHWERES GEWITTER mit HEFTIGEM STARKREGEN und HAGEL"));
+        assert!(html.contains("</em><br><br><hr><em>⬆️ Warnung aktualisiert"));
+        assert!(html.contains("HEFTIGEM STARKREGEN"));
     }
 
     #[test]
