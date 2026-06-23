@@ -828,6 +828,67 @@ mod feed_tests {
     }
 
     #[test]
+    fn configured_place_alias_does_not_match_inside_words() {
+        let filter = FilterConfig {
+            places: vec![PlaceConfig {
+                name: "RAW-Gelände".to_owned(),
+                lat: 52.5070,
+                lon: 13.4540,
+                aliases: vec!["RAW Gelände".to_owned(), "RAW".to_owned()],
+            }],
+            ..Default::default()
+        };
+        let item = FeedItem {
+            guid: "place".to_owned(),
+            title: "The chaotic sprawl of pixels resolved".to_owned(),
+            link: None,
+            link_note: None,
+            description: Some("No local venue is mentioned here.".to_owned()),
+            article_text: None,
+            source_name: "Test".to_owned(),
+            score: 0,
+            max_score: 0,
+            distance_meters: None,
+            location_label: None,
+            published_at: None,
+        };
+
+        let hit = find_configured_place_distance(&item, &filter, Some((52.5070, 13.4540)));
+
+        assert!(hit.is_none());
+    }
+
+    #[test]
+    fn keyword_area_matches_berlin_prefixed_district_name() {
+        let filter = FilterConfig {
+            area: vec![AreaGroup {
+                implied_meters: 1500.0,
+                terms: vec!["Friedrichshain".to_owned()],
+            }],
+            ..Default::default()
+        };
+        let item = FeedItem {
+            guid: "district".to_owned(),
+            title: "Einsatz in Berlin-Friedrichshain".to_owned(),
+            link: None,
+            link_note: None,
+            description: None,
+            article_text: None,
+            source_name: "Test".to_owned(),
+            score: 0,
+            max_score: 0,
+            distance_meters: None,
+            location_label: None,
+            published_at: None,
+        };
+
+        let hit = keyword_check(&item, &filter, &[]).expect("keyword check should pass");
+
+        assert_eq!(hit.0, Some((1500.0, "Friedrichshain".to_owned())));
+        assert_eq!(hit.1, vec!["\"Friedrichshain\" (1500m)"]);
+    }
+
+    #[test]
     fn street_evidence_ignores_boilerplate_after_impressum() {
         let evidence = extract_street_evidence(
             "Brand in der Rigaer Straße",
@@ -1689,7 +1750,10 @@ fn find_configured_place_distance(
         terms.push(place.name.as_str());
         terms.extend(place.aliases.iter().map(String::as_str));
 
-        if terms.iter().any(|term| text.contains(&normalize(term))) {
+        if terms
+            .iter()
+            .any(|term| contains_normalized_term(&text, &normalize(term)))
+        {
             let dist = haversine_meters(ref_lat, ref_lon, place.lat, place.lon);
             if best
                 .as_ref()
@@ -1700,6 +1764,28 @@ fn find_configured_place_distance(
         }
     }
     best
+}
+
+fn contains_normalized_term(text: &str, term: &str) -> bool {
+    if term.trim().is_empty() {
+        return false;
+    }
+
+    let mut search_start = 0;
+    while let Some(offset) = text[search_start..].find(term) {
+        let start = search_start + offset;
+        let end = start + term.len();
+
+        let before = text[..start].chars().next_back();
+        let after = text[end..].chars().next();
+        if !before.is_some_and(char::is_alphanumeric) && !after.is_some_and(char::is_alphanumeric) {
+            return true;
+        }
+
+        search_start = end;
+    }
+
+    false
 }
 
 // ── Filtering ─────────────────────────────────────────────────────────────────
