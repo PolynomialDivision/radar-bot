@@ -7,7 +7,7 @@ use anyhow::{Context, Result};
 use matrix_sdk::{
     ruma::{
         events::room::message::{ReplacementMetadata, RoomMessageEventContent},
-        OwnedEventId,
+        OwnedEventId, OwnedTransactionId,
     },
     Client,
 };
@@ -776,7 +776,7 @@ async fn check_dwd_weather_warnings(
                     // No event IDs (pre-upgrade row) — can't edit. Post fresh and
                     // clean up the stale row so no spurious all-clear fires.
                     let (all_ok, room_event_ids) =
-                        post_alert_to_rooms(client, &new_plain, &new_html).await;
+                        post_alert_to_rooms(client, &primary_id, &new_plain, &new_html).await;
                     if all_ok {
                         let ids_json = serde_json::to_string(&room_event_ids)
                             .unwrap_or_else(|_| String::from("{}"));
@@ -815,7 +815,8 @@ async fn check_dwd_weather_warnings(
                 &desc,
                 Some("https://www.dwd.de/DE/wetter/warnungen_gemeinden/warnWetter_node.html"),
             );
-            let (all_ok, room_event_ids) = post_alert_to_rooms(client, &plain, &html).await;
+            let (all_ok, room_event_ids) =
+                post_alert_to_rooms(client, &primary_id, &plain, &html).await;
             if all_ok {
                 let ids_json =
                     serde_json::to_string(&room_event_ids).unwrap_or_else(|_| String::from("{}"));
@@ -1584,14 +1585,17 @@ fn xml_tag(xml: &str, tag: &str) -> Option<String> {
 /// Collects event IDs from all rooms so they can be stored for future edits.
 async fn post_alert_to_rooms(
     client: &Client,
+    alert_key: &str,
     plain: &str,
     html: &str,
 ) -> (bool, HashMap<String, String>) {
     let mut event_ids: HashMap<String, String> = HashMap::new();
     let mut all_ok = true;
     for room in client.joined_rooms() {
+        let txn_id = stable_alert_transaction_id(alert_key, room.room_id().as_str());
         match room
             .send(RoomMessageEventContent::text_html(plain, html))
+            .with_transaction_id(txn_id)
             .await
         {
             Ok(resp) => {
@@ -1609,6 +1613,20 @@ async fn post_alert_to_rooms(
     (all_ok, event_ids)
 }
 
+fn stable_alert_transaction_id(alert_key: &str, room_id: &str) -> OwnedTransactionId {
+    let mut hash = 0xcbf29ce484222325u64;
+    for byte in alert_key
+        .as_bytes()
+        .iter()
+        .chain([b'|'].iter())
+        .chain(room_id.as_bytes().iter())
+    {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    OwnedTransactionId::from(format!("radar-alert-{hash:016x}"))
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn repost_dwd_active_warning(
     client: &Client,
@@ -1622,7 +1640,7 @@ async fn repost_dwd_active_warning(
     plain: &str,
     html: &str,
 ) -> Result<bool> {
-    let (all_ok, room_event_ids) = post_alert_to_rooms(client, plain, html).await;
+    let (all_ok, room_event_ids) = post_alert_to_rooms(client, id, plain, html).await;
     if !all_ok {
         return Ok(false);
     }
@@ -1643,7 +1661,7 @@ async fn post_nina_warning_to_rooms(
     plain: &str,
     html: &str,
 ) -> Result<bool> {
-    let (all_ok, room_event_ids) = post_alert_to_rooms(client, plain, html).await;
+    let (all_ok, room_event_ids) = post_alert_to_rooms(client, id, plain, html).await;
     if !all_ok {
         return Ok(false);
     }
@@ -1844,6 +1862,20 @@ mod tests {
         assert!(!is_nina_dwd_weather_warning(
             "mow.DE-BE-B-SE017-20260620-017-000"
         ));
+    }
+
+    #[test]
+    fn alert_transaction_id_is_stable_per_alert_and_room() {
+        let a = stable_alert_transaction_id("dwd:warnings:Berlin:WIND:3", "!room:matrix.org");
+        let b = stable_alert_transaction_id("dwd:warnings:Berlin:WIND:3", "!room:matrix.org");
+        let other_alert =
+            stable_alert_transaction_id("dwd:warnings:Berlin:GEWITTER:3", "!room:matrix.org");
+        let other_room =
+            stable_alert_transaction_id("dwd:warnings:Berlin:WIND:3", "!other:matrix.org");
+
+        assert_eq!(a, b);
+        assert_ne!(a, other_alert);
+        assert_ne!(a, other_room);
     }
 
     #[test]
