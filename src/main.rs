@@ -689,6 +689,68 @@ mod feed_tests {
         assert!(clustered[0].source_name.contains("Source B"));
     }
 
+    #[test]
+    fn clustering_collapses_translated_same_source_event_announcement() {
+        let a = db::DbItem {
+            guid: "de".to_owned(),
+            source_name: "Bluesky Rigaer".to_owned(),
+            title: "💥Ankündigung! Montag 06.07.2026💥".to_owned(),
+            link: Some("https://bsky.app/profile/example/post/de".to_owned()),
+            link_note: None,
+            score: 3,
+            max_score: 5,
+            distance_meters: Some(559.0),
+            location_label: Some("Rigaer 94".to_owned()),
+        };
+        let b = db::DbItem {
+            guid: "en".to_owned(),
+            source_name: "Bluesky Rigaer".to_owned(),
+            title: "💥Announcement! Monday 06.07.2026💥".to_owned(),
+            link: Some("https://bsky.app/profile/example/post/en".to_owned()),
+            link_note: None,
+            score: 3,
+            max_score: 5,
+            distance_meters: Some(559.0),
+            location_label: Some("Rigaer 94".to_owned()),
+        };
+
+        let clustered = cluster_digest_items(vec![a, b]);
+
+        assert_eq!(clustered.len(), 1);
+        assert_eq!(clustered[0].guids, vec!["de", "en"]);
+        assert_eq!(clustered[0].source_count, 1);
+    }
+
+    #[test]
+    fn clustering_keeps_same_source_event_without_shared_date_separate() {
+        let a = db::DbItem {
+            guid: "a".to_owned(),
+            source_name: "Bluesky Rigaer".to_owned(),
+            title: "Ankündigung! Montag 06.07.2026".to_owned(),
+            link: Some("https://bsky.app/profile/example/post/a".to_owned()),
+            link_note: None,
+            score: 3,
+            max_score: 5,
+            distance_meters: Some(559.0),
+            location_label: Some("Rigaer 94".to_owned()),
+        };
+        let b = db::DbItem {
+            guid: "b".to_owned(),
+            source_name: "Bluesky Rigaer".to_owned(),
+            title: "Announcement! Monday 13.07.2026".to_owned(),
+            link: Some("https://bsky.app/profile/example/post/b".to_owned()),
+            link_note: None,
+            score: 3,
+            max_score: 5,
+            distance_meters: Some(559.0),
+            location_label: Some("Rigaer 94".to_owned()),
+        };
+
+        let clustered = cluster_digest_items(vec![a, b]);
+
+        assert_eq!(clustered.len(), 2);
+    }
+
     #[tokio::test]
     async fn candidate_clustering_promotes_multi_source_weak_items() {
         let path = std::env::temp_dir().join(format!(
@@ -1992,10 +2054,121 @@ fn title_overlap(a: &str, b: &str) -> usize {
     a_words.intersection(&b_words).count()
 }
 
+fn normalized_source_name(name: &str) -> String {
+    normalize(name).trim().to_owned()
+}
+
+fn same_source_family(a: &db::DbItem, b: &db::DbItem) -> bool {
+    normalized_source_name(&a.source_name) == normalized_source_name(&b.source_name)
+}
+
+fn title_terms(s: &str) -> Vec<String> {
+    let mut terms = Vec::new();
+    let mut current = String::new();
+    for ch in normalize(s).chars() {
+        if ch.is_alphanumeric() {
+            current.push(ch);
+        } else if !current.is_empty() {
+            terms.push(std::mem::take(&mut current));
+        }
+    }
+    if !current.is_empty() {
+        terms.push(current);
+    }
+    terms
+}
+
+fn contains_any_term(terms: &[String], needles: &[&str]) -> bool {
+    terms
+        .iter()
+        .any(|term| needles.iter().any(|needle| term == needle))
+}
+
+fn title_date_signals(s: &str) -> HashSet<String> {
+    let terms = title_terms(s);
+    let mut dates = HashSet::new();
+
+    for window in terms.windows(3) {
+        let [day, month, year] = window else {
+            continue;
+        };
+        if day.len() <= 2
+            && month.len() <= 2
+            && year.len() == 4
+            && day.chars().all(|c| c.is_ascii_digit())
+            && month.chars().all(|c| c.is_ascii_digit())
+            && year.chars().all(|c| c.is_ascii_digit())
+        {
+            dates.insert(format!("{:0>2}.{:0>2}.{}", day, month, year));
+        }
+    }
+
+    dates
+}
+
+fn title_event_class(s: &str) -> Option<&'static str> {
+    let terms = title_terms(s);
+    if contains_any_term(
+        &terms,
+        &[
+            "ankündigung",
+            "ankuendigung",
+            "announcement",
+            "announce",
+            "announcing",
+        ],
+    ) {
+        return Some("announcement");
+    }
+    if contains_any_term(
+        &terms,
+        &["demo", "demonstration", "kundgebung", "protest", "rally"],
+    ) {
+        return Some("protest");
+    }
+    if contains_any_term(
+        &terms,
+        &[
+            "veranstaltung",
+            "event",
+            "termin",
+            "date",
+            "konzert",
+            "concert",
+        ],
+    ) {
+        return Some("event");
+    }
+    None
+}
+
+fn translated_event_duplicate(a: &db::DbItem, b: &db::DbItem) -> bool {
+    if !same_source_family(a, b) || !locations_compatible(a, b) {
+        return false;
+    }
+
+    let Some(class_a) = title_event_class(&a.title) else {
+        return false;
+    };
+    let Some(class_b) = title_event_class(&b.title) else {
+        return false;
+    };
+    if class_a != class_b {
+        return false;
+    }
+
+    let dates_a = title_date_signals(&a.title);
+    let dates_b = title_date_signals(&b.title);
+    !dates_a.is_empty() && !dates_b.is_empty() && !dates_a.is_disjoint(&dates_b)
+}
+
 fn likely_same_incident(item: &db::DbItem, cluster: &[db::DbItem]) -> bool {
     cluster.iter().any(|other| {
         let same_link = item.link.is_some() && item.link == other.link;
         if same_link {
+            return true;
+        }
+        if translated_event_duplicate(item, other) {
             return true;
         }
         locations_compatible(item, other) && title_overlap(&item.title, &other.title) >= 2
