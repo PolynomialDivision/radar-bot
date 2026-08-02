@@ -8,7 +8,7 @@ use db::Db;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::sync::{Mutex, Semaphore};
+use tokio::sync::Semaphore;
 
 use anyhow::{Context, Result};
 use chrono::{Local, NaiveTime};
@@ -16,18 +16,16 @@ use matrix_sdk::{
     config::SyncSettings,
     ruma::{
         api::client::filter::FilterDefinition,
-        events::{
-            key::verification::request::ToDeviceKeyVerificationRequestEvent,
-            room::{
-                member::StrippedRoomMemberEvent,
-                message::{MessageType, OriginalSyncRoomMessageEvent, RoomMessageEventContent},
-            },
+        events::room::{
+            member::StrippedRoomMemberEvent,
+            message::{MessageType, OriginalSyncRoomMessageEvent, RoomMessageEventContent},
         },
         OwnedServerName, OwnedUserId, RoomOrAliasId,
     },
     Client, Room, RoomState,
 };
 use mxbot_common::config::{MatrixConfig, SecurityConfig};
+use mxbot_common::verify::VerificationService;
 
 #[derive(Debug, Clone)]
 struct GeocodeHit {
@@ -303,7 +301,7 @@ struct BotState {
     bot_user_id: OwnedUserId,
     allowed_inviters: HashSet<OwnedUserId>,
     admin_users: HashSet<OwnedUserId>,
-    reset_allowed: Arc<Mutex<HashSet<OwnedUserId>>>,
+    verification: VerificationService,
     db: Db,
 }
 
@@ -2945,6 +2943,13 @@ async fn main() -> Result<()> {
         .filter_map(|s| s.parse().ok())
         .collect();
 
+    let verification = VerificationService::allowlisted_tofu_from_config(
+        client.clone(),
+        &config.security.verification,
+        &config.security.allowed_inviters,
+    );
+    verification.install_handlers();
+
     if admin_users.is_empty() {
         warn!("No admin_users configured — !reset-trust command is disabled");
     } else {
@@ -2957,7 +2962,7 @@ async fn main() -> Result<()> {
         bot_user_id: user_id,
         allowed_inviters,
         admin_users,
-        reset_allowed: Arc::new(Mutex::new(HashSet::new())),
+        verification,
         db: db.clone(),
     };
 
@@ -3019,70 +3024,23 @@ async fn main() -> Result<()> {
         }
     });
 
-    // To-device verification
+    // In-room messages: verification requests are handled by mxbot-common.
     client.add_event_handler({
         let state = bot_state.clone();
-        move |ev: ToDeviceKeyVerificationRequestEvent, client: Client| {
-            let state = state.clone();
-            async move {
-                let Some(request) = client
-                    .encryption()
-                    .get_verification_request(&ev.sender, &ev.content.transaction_id)
-                    .await
-                else {
-                    warn!("Verification request object not found");
-                    return;
-                };
-                tokio::spawn(mxbot_common::verify::handle_verification_request(
-                    client,
-                    Arc::clone(&state.reset_allowed),
-                    request,
-                ));
-            }
-        }
-    });
-
-    // In-room messages: verification + !reset-trust
-    client.add_event_handler({
-        let state = bot_state.clone();
-        move |ev: OriginalSyncRoomMessageEvent, room: Room, client: Client| {
+        move |ev: OriginalSyncRoomMessageEvent, room: Room| {
             let state = state.clone();
             async move {
                 if ev.sender == state.bot_user_id || room.state() != RoomState::Joined {
                     return;
                 }
                 match &ev.content.msgtype {
-                    MessageType::VerificationRequest(_) => {
-                        let Some(request) = client
-                            .encryption()
-                            .get_verification_request(&ev.sender, &ev.event_id)
-                            .await
-                        else {
-                            return;
-                        };
-                        tokio::spawn(mxbot_common::verify::handle_verification_request(
-                            client,
-                            Arc::clone(&state.reset_allowed),
-                            request,
-                        ));
-                    }
+                    MessageType::VerificationRequest(_) => {}
                     MessageType::Text(text) => {
                         let body = text.body.trim();
-                        if let Some(target) = body.strip_prefix("!reset-trust ") {
-                            if state.admin_users.contains(&ev.sender) {
-                                if let Ok(target_user) = target.trim().parse::<OwnedUserId>() {
-                                    state.reset_allowed.lock().await.insert(target_user.clone());
-                                    info!("Trust reset for {target_user} (by {})", ev.sender);
-                                    room.send(RoomMessageEventContent::text_plain(format!(
-                                        "Trust reset for {target_user}. They may re-verify."
-                                    )))
-                                    .await
-                                    .ok();
-                                }
-                            } else {
-                                warn!("!reset-trust from non-admin {} — ignored", ev.sender);
-                            }
-                        } else if body.starts_with("!source-stats") {
+                        if state.verification.handle_admin_command(&ev.sender, &state.admin_users, body).await {
+                            return;
+                        }
+                        if body.starts_with("!source-stats") {
                             if !state.admin_users.contains(&ev.sender) {
                                 warn!("!source-stats from non-admin {} — ignored", ev.sender);
                                 return;
