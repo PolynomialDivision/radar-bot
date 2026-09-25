@@ -625,6 +625,7 @@ impl Db {
     /// The stable key (event+level+region, no timestamps) is used as the primary key,
     /// so this is also the correct upsert when the same warning reappears after an all-clear.
     /// No `alerts` row is written; presence in `dwd_active_warnings` IS the "seen" check.
+    #[allow(clippy::too_many_arguments)]
     pub async fn mark_dwd_alert_posted(
         &self,
         id: &str,

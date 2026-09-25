@@ -41,6 +41,7 @@ pub struct AlertConfig {
 /// Derive the NINA AGS (Amtlicher Gemeindeschlüssel) from coordinates:
 ///   1. Nominatim reverse geocode → city name + country check
 ///   2. NINA completion search → AGS string
+///
 /// Returns None if the location is outside Germany or any lookup fails.
 pub async fn lookup_nina_ags(http: &reqwest::Client, ref_point: (f64, f64)) -> Option<String> {
     let (lat, lon) = ref_point;
@@ -115,7 +116,7 @@ pub async fn alert_loop(client: Bot, http: reqwest::Client, db: Db, config: Aler
         }
         if !config.dwd_region_keywords.is_empty() {
             let reconcile_active_messages = last_dwd_reconcile
-                .map_or(true, |last| last.elapsed() >= DWD_ACTIVE_RECONCILE_INTERVAL);
+                .is_none_or(|last| last.elapsed() >= DWD_ACTIVE_RECONCILE_INTERVAL);
             if let Err(e) = check_dwd_weather_warnings(
                 &client,
                 &http,
@@ -1187,7 +1188,7 @@ fn format_dwd_secondary_warning(
     };
     let end_str = w["end"]
         .as_i64()
-        .and_then(|ms| chrono::DateTime::from_timestamp_millis(ms))
+        .and_then(chrono::DateTime::from_timestamp_millis)
         .map(|dt| {
             let local = dt.with_timezone(&chrono::Local);
             let today = chrono::Local::now().date_naive();
@@ -1453,7 +1454,7 @@ async fn check_usgs(
         // USGS time is milliseconds since epoch.
         if f["properties"]["time"]
             .as_i64()
-            .map_or(false, |t| t < cutoff_ms)
+            .is_some_and(|t| t < cutoff_ms)
         {
             continue;
         }
@@ -1522,7 +1523,7 @@ async fn check_gdacs(
         }
 
         // Skip events older than 48 hours to avoid backlog spam on first run.
-        if item.published_at.map_or(false, |t| t < cutoff) {
+        if item.published_at.is_some_and(|t| t < cutoff) {
             continue;
         }
 
@@ -1618,7 +1619,7 @@ fn stable_alert_transaction_id(alert_key: &str, room_id: &str) -> OwnedTransacti
     for byte in alert_key
         .as_bytes()
         .iter()
-        .chain([b'|'].iter())
+        .chain(b"|".iter())
         .chain(room_id.as_bytes().iter())
     {
         hash ^= u64::from(*byte);

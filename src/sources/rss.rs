@@ -45,7 +45,7 @@ impl RssAdapter {
             let cutoff = chrono::Utc::now().timestamp() - (max_age as i64 * 3600);
             let before = items.len();
             // Items with no date are kept (fail open — better to over-include than silently drop).
-            items.retain(|item| item.published_at.map_or(true, |ts| ts >= cutoff));
+            items.retain(|item| item.published_at.is_none_or(|ts| ts >= cutoff));
             let dropped = before - items.len();
             if dropped > 0 {
                 warn!(
