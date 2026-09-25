@@ -6,26 +6,23 @@ mod weather;
 use dashmap::DashMap;
 use db::Db;
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::Semaphore;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use chrono::{Local, NaiveTime};
-use matrix_sdk::{
-    config::SyncSettings,
-    ruma::{
-        api::client::filter::FilterDefinition,
-        events::room::{
-            member::StrippedRoomMemberEvent,
-            message::{MessageType, OriginalSyncRoomMessageEvent, RoomMessageEventContent},
+use mxbot_common::{
+    admin::Dispatch,
+    config::{MatrixConfig, SecurityConfig},
+    matrix_sdk::{
+        deserialized_responses::EncryptionInfo,
+        ruma::events::room::message::{
+            MessageType, OriginalSyncRoomMessageEvent, RoomMessageEventContent,
         },
-        OwnedServerName, OwnedUserId, RoomOrAliasId,
+        Room, RoomState,
     },
-    Client, Room, RoomState,
+    Bot,
 };
-use mxbot_common::config::{MatrixConfig, SecurityConfig};
-use mxbot_common::verify::VerificationService;
 
 #[derive(Debug, Clone)]
 struct GeocodeHit {
@@ -43,7 +40,7 @@ enum DistanceLookup {
     TransientFailure,
 }
 use serde::{Deserialize, Serialize};
-use tokio::{fs, task::JoinSet, time::sleep, time::Duration};
+use tokio::{task::JoinSet, time::sleep, time::Duration};
 use tracing::{error, info, warn};
 
 // ── Config ────────────────────────────────────────────────────────────────────
@@ -292,17 +289,6 @@ fn derive_warning_region_keywords(filter: &FilterConfig, weather: &WeatherConfig
         })
         .map(|city| vec![city.to_owned()])
         .unwrap_or_default()
-}
-
-// ── Bot state ─────────────────────────────────────────────────────────────────
-
-#[derive(Clone)]
-struct BotState {
-    bot_user_id: OwnedUserId,
-    allowed_inviters: HashSet<OwnedUserId>,
-    admin_users: HashSet<OwnedUserId>,
-    verification: VerificationService,
-    db: Db,
 }
 
 // ── Feed item ─────────────────────────────────────────────────────────────────
@@ -2312,9 +2298,9 @@ async fn promote_candidate_clusters(
 
 /// Returns true if all rooms received the message. On false the caller should
 /// requeue the items so they appear in the next digest.
-pub(crate) async fn post_to_rooms(client: &Client, plain: &str, html: &str) -> bool {
+pub(crate) async fn post_to_rooms(bot: &Bot, plain: &str, html: &str) -> bool {
     let mut all_ok = true;
-    for room in client.joined_rooms() {
+    for room in bot.broadcast_rooms() {
         if let Err(e) = room
             .send(RoomMessageEventContent::text_html(plain, html))
             .await
@@ -2542,7 +2528,7 @@ async fn process_item(
 }
 
 async fn poll_once(
-    _client: &Client,
+    _client: &Bot,
     http: &reqwest::Client,
     sources: &[SourceConfig],
     filter: &FilterConfig,
@@ -2727,7 +2713,7 @@ async fn poll_once(
 }
 
 async fn poll_loop(
-    client: Client,
+    client: Bot,
     http: reqwest::Client,
     sources: Vec<SourceConfig>,
     filter: FilterConfig,
@@ -2794,7 +2780,7 @@ fn chunk_digest(items: &[DigestItem]) -> Vec<Vec<DigestItem>> {
 // ── Digest loop ───────────────────────────────────────────────────────────────
 
 async fn digest_loop(
-    client: Client,
+    client: Bot,
     digest_times: Vec<String>,
     db: Db,
     min_score: i32,
@@ -2896,243 +2882,99 @@ async fn digest_loop(
     }
 }
 
-// ── Verification (same pattern as all other bots) ─────────────────────────────
-
 // ── main ──────────────────────────────────────────────────────────────────────
+
+/// Admin-only `!source-stats [hours]`.
+async fn source_stats_reply(db: &Db, body: &str) -> String {
+    let hours = body
+        .split_whitespace()
+        .nth(1)
+        .and_then(|s| s.parse::<u32>().ok())
+        .unwrap_or(24)
+        .clamp(1, 24 * 30);
+    match db.source_stats_summary(hours).await {
+        Ok(stats) if stats.is_empty() => {
+            format!("No source stats recorded in the last {hours}h.")
+        }
+        Ok(stats) => {
+            let mut lines = vec![format!("Source stats, last {hours}h:")];
+            for stat in stats {
+                lines.push(format!(
+                    "{}: {} total, {} queued, {} candidate, {} dropped, {} retry",
+                    stat.source_name,
+                    stat.total,
+                    stat.queued,
+                    stat.candidate,
+                    stat.dropped,
+                    stat.retry_later
+                ));
+            }
+            lines.join("\n")
+        }
+        Err(e) => {
+            warn!("!source-stats failed: {e}");
+            "Source stats query failed.".to_owned()
+        }
+    }
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt::init();
+    mxbot_common::logging::init("radar_bot");
 
-    let args: Vec<String> = std::env::args().collect();
-    let config_path = args.get(1).map(|s| s.as_str()).unwrap_or("config.toml");
-    let test_mode = args.iter().any(|a| a == "--test");
+    let test_mode = std::env::args().any(|a| a == "--test");
+    let config: Config =
+        mxbot_common::config::load_toml(&mxbot_common::config::config_path_from_args())?;
 
-    let config_str = fs::read_to_string(config_path)
-        .await
-        .with_context(|| format!("Cannot read config: {config_path}"))?;
-    let config: Config = toml::from_str(&config_str).context("TOML parse error")?;
-
-    let store_dir = PathBuf::from("store");
-    // radar-bot keeps its sqlite matrix store at store/matrix_store/ to leave
-    // room alongside store/items.db. Pass the full path to build_and_restore.
-    let (client, user_id) = mxbot_common::session::build_and_restore(
-        &config.matrix,
-        &store_dir.join("matrix_store"),
-        config.security.encryption_strategy.into(),
-    )
-    .await?;
-
-    let allowed_inviters: HashSet<OwnedUserId> = config
-        .security
-        .allowed_inviters
-        .iter()
-        .filter_map(|s| s.parse().ok())
-        .collect();
-
-    if allowed_inviters.is_empty() {
-        warn!("No allowed_inviters configured — bot accepts invites from anyone");
-    } else {
-        info!("Allowed inviters: {allowed_inviters:?}");
-    }
-
-    let admin_users: HashSet<OwnedUserId> = config
-        .security
-        .admin_users
-        .iter()
-        .filter_map(|s| s.parse().ok())
-        .collect();
-
-    let verification = VerificationService::allowlisted_tofu_from_config(
-        client.clone(),
-        &config.security.verification,
-        &config.security.allowed_inviters,
-    );
-    verification.install_handlers();
-
-    if admin_users.is_empty() {
-        warn!("No admin_users configured — !reset-trust command is disabled");
-    } else {
-        info!("Admin users: {admin_users:?}");
-    }
+    // radar-bot keeps its Matrix sqlite store in store/matrix_store/, next to
+    // store/items.db.
+    let store_dir = mxbot_common::config::store_path_from_env();
+    let bot = Bot::builder("radar-bot", env!("CARGO_PKG_VERSION"))
+        .store_path(&store_dir)
+        .matrix_store_path(store_dir.join("matrix_store"))
+        .admin_help("!source-stats [hours] — per-source item counts")
+        .start(&config.matrix, &config.security)
+        .await?;
 
     let db = Db::open(&store_dir.join("items.db"))?;
 
-    let bot_state = BotState {
-        bot_user_id: user_id,
-        allowed_inviters,
-        admin_users,
-        verification,
-        db: db.clone(),
-    };
-
-    // Invite handler
-    client.add_event_handler({
-        let state = bot_state.clone();
-        move |ev: StrippedRoomMemberEvent, room: Room, client: Client| {
-            let state = state.clone();
+    bot.client.add_event_handler({
+        let bot = bot.clone();
+        let db = db.clone();
+        move |ev: OriginalSyncRoomMessageEvent, room: Room, encryption: Option<EncryptionInfo>| {
+            let bot = bot.clone();
+            let db = db.clone();
             async move {
-                if ev.state_key != state.bot_user_id { return; }
-                if !state.allowed_inviters.is_empty()
-                    && !state.allowed_inviters.contains(&ev.sender)
-                {
-                    warn!("Rejecting invite from {} (not in allowed_inviters)", ev.sender);
-                    room.leave().await.ok();
+                if ev.sender == bot.user_id || room.state() != RoomState::Joined {
                     return;
                 }
-                info!("Accepted invite from {} to {}", ev.sender, room.room_id());
-                let room_id = room.room_id().to_owned();
-                let mut via: Vec<OwnedServerName> = vec![ev.sender.server_name().to_owned()];
-                if let Some(s) = room_id.server_name() {
-                    let s = s.to_owned();
-                    if !via.contains(&s) {
-                        via.push(s);
-                    }
+                if bot.admin.handle(&room, &ev, encryption.as_ref()).await == Dispatch::Handled {
+                    return;
                 }
-                let room_or_alias = match RoomOrAliasId::parse(room_id.as_str()) {
-                    Ok(id) => id,
-                    Err(e) => {
-                        error!("Invalid room ID {room_id}: {e}");
+                let MessageType::Text(text) = &ev.content.msgtype else {
+                    return;
+                };
+                let body = text.body.trim();
+                if body.starts_with("!source-stats") {
+                    if !bot.is_admin(&ev.sender) {
+                        warn!("!source-stats from non-admin {} — ignored", ev.sender);
                         return;
                     }
-                };
-                tokio::spawn(async move {
-                    let mut delay = 2u64;
-                    const MAX_ATTEMPTS: u32 = 8;
-                    for attempt in 1..=MAX_ATTEMPTS {
-                        match client.join_room_by_id_or_alias(&room_or_alias, &via).await {
-                            Ok(_) => {
-                                info!("Joined {room_id}");
-                                return;
-                            }
-                            Err(ref e) if mxbot_common::verify::is_join_terminal(e) => {
-                                warn!("Join failed (terminal) for {room_id}: {e}");
-                                return;
-                            }
-                            Err(e) if attempt == MAX_ATTEMPTS => {
-                                warn!("Join failed after {MAX_ATTEMPTS} attempts for {room_id}: {e}");
-                            }
-                            Err(e) => {
-                                warn!("Join attempt {attempt}/{MAX_ATTEMPTS} failed for {room_id}: {e}; retry in {delay}s");
-                                sleep(Duration::from_secs(delay)).await;
-                                delay = (delay * 2).min(300);
-                            }
-                        }
-                    }
-                });
-            }
-        }
-    });
-
-    // In-room messages: verification requests are handled by mxbot-common.
-    client.add_event_handler({
-        let state = bot_state.clone();
-        move |ev: OriginalSyncRoomMessageEvent, room: Room| {
-            let state = state.clone();
-            async move {
-                if ev.sender == state.bot_user_id || room.state() != RoomState::Joined {
-                    return;
-                }
-                match &ev.content.msgtype {
-                    MessageType::VerificationRequest(_) => {}
-                    MessageType::Text(text) => {
-                        let body = text.body.trim();
-                        if state.verification.handle_admin_command(&ev.sender, &state.admin_users, body).await {
-                            return;
-                        }
-                        if body.starts_with("!source-stats") {
-                            if !state.admin_users.contains(&ev.sender) {
-                                warn!("!source-stats from non-admin {} — ignored", ev.sender);
-                                return;
-                            }
-                            let hours = body
-                                .split_whitespace()
-                                .nth(1)
-                                .and_then(|s| s.parse::<u32>().ok())
-                                .unwrap_or(24)
-                                .clamp(1, 24 * 30);
-                            match state.db.source_stats_summary(hours).await {
-                                Ok(stats) if stats.is_empty() => {
-                                    room.send(RoomMessageEventContent::text_plain(format!(
-                                        "No source stats recorded in the last {hours}h."
-                                    )))
-                                    .await
-                                    .ok();
-                                }
-                                Ok(stats) => {
-                                    let mut lines =
-                                        vec![format!("Source stats, last {hours}h:")];
-                                    for stat in stats {
-                                        lines.push(format!(
-                                            "{}: {} total, {} queued, {} candidate, {} dropped, {} retry",
-                                            stat.source_name,
-                                            stat.total,
-                                            stat.queued,
-                                            stat.candidate,
-                                            stat.dropped,
-                                            stat.retry_later
-                                        ));
-                                    }
-                                    room.send(RoomMessageEventContent::text_plain(
-                                        lines.join("\n"),
-                                    ))
-                                    .await
-                                    .ok();
-                                }
-                                Err(e) => {
-                                    warn!("!source-stats failed: {e}");
-                                    room.send(RoomMessageEventContent::text_plain(
-                                        "Source stats query failed.",
-                                    ))
-                                    .await
-                                    .ok();
-                                }
-                            }
-                        }
-                    }
-                    _ => {}
+                    let reply = source_stats_reply(&db, body).await;
+                    room.send(RoomMessageEventContent::text_plain(reply))
+                        .await
+                        .ok();
                 }
             }
         }
     });
 
-    // Initial sync
     info!("Performing initial sync...");
-    {
-        let filter = FilterDefinition::with_lazy_loading();
-        client
-            .sync_once(SyncSettings::default().filter(filter.into()))
-            .await?;
-    }
+    bot.initial_sync().await;
     info!(
         "Initial sync complete. {} source(s) configured.",
         config.sources.len()
     );
-
-    // Drain pending invites from prior sessions.
-    let invited = client.invited_rooms();
-    if !invited.is_empty() {
-        info!(
-            "Pending invite(s) found after initial sync — joining {} room(s)",
-            invited.len()
-        );
-        for room in invited {
-            let room_id = room.room_id().to_owned();
-            let via: Vec<OwnedServerName> = room_id
-                .server_name()
-                .map(|s| vec![s.to_owned()])
-                .unwrap_or_default();
-            match RoomOrAliasId::parse(room_id.as_str()) {
-                Ok(room_or_alias) => {
-                    match client.join_room_by_id_or_alias(&room_or_alias, &via).await {
-                        Ok(_) => info!("Joined pending invite room {room_id}"),
-                        Err(e) => warn!("Failed to join pending invite room {room_id}: {e}"),
-                    }
-                }
-                Err(e) => warn!("Invalid room ID in pending invite {room_id}: {e}"),
-            }
-        }
-    }
 
     // Crash recovery: anything left in 'processing' from last run goes back to 'queued'.
     let recovered = db.recover_processing().await?;
@@ -3214,7 +3056,7 @@ async fn main() -> Result<()> {
             let cache_before = geocode_cache.len();
             info!("Test mode: run {run}/2 (geocode cache: {cache_before} entries before)");
             poll_once(
-                &client,
+                &bot,
                 &http,
                 &config.sources,
                 &config.filter,
@@ -3245,7 +3087,7 @@ async fn main() -> Result<()> {
                         format!("Test digest (run {run}/2)")
                     };
                     let (plain, html) = format_digest(&chunk, &header);
-                    post_to_rooms(&client, &plain, &html).await;
+                    post_to_rooms(&bot, &plain, &html).await;
                     if total > 1 {
                         sleep(Duration::from_millis(500)).await;
                     }
@@ -3258,7 +3100,7 @@ async fn main() -> Result<()> {
     }
 
     tokio::spawn(digest_loop(
-        client.clone(),
+        bot.clone(),
         config.schedule.digest_times.clone(),
         db.clone(),
         config.filter.digest_threshold,
@@ -3275,7 +3117,7 @@ async fn main() -> Result<()> {
             }
         };
         tokio::spawn(alerts::alert_loop(
-            client.clone(),
+            bot.clone(),
             http.clone(),
             db.clone(),
             alerts::AlertConfig {
@@ -3303,7 +3145,7 @@ async fn main() -> Result<()> {
                     .unwrap_or_else(|| NaiveTime::from_hms_opt(8, 0, 0).unwrap())
             };
             tokio::spawn(weather::weather_loop(
-                client.clone(),
+                bot.clone(),
                 http.clone(),
                 db.clone(),
                 pt,
@@ -3317,7 +3159,7 @@ async fn main() -> Result<()> {
 
     // Spawn poll loop
     tokio::spawn(poll_loop(
-        client.clone(),
+        bot.clone(),
         http,
         config.sources,
         config.filter,
@@ -3329,15 +3171,5 @@ async fn main() -> Result<()> {
     ));
 
     // Continuous Matrix sync
-    let filter = FilterDefinition::with_lazy_loading();
-    loop {
-        match client
-            .sync(SyncSettings::default().filter(filter.clone().into()))
-            .await
-        {
-            Ok(()) => warn!("Sync loop exited cleanly — reconnecting"),
-            Err(e) => warn!("Sync loop error: {e} — reconnecting in 5s"),
-        }
-        sleep(Duration::from_secs(5)).await;
-    }
+    bot.sync_forever().await
 }

@@ -4,12 +4,12 @@ use std::{
 };
 
 use anyhow::{Context, Result};
-use matrix_sdk::{
-    ruma::{
+use mxbot_common::{
+    matrix_sdk::ruma::{
         events::room::message::{ReplacementMetadata, RoomMessageEventContent},
         OwnedEventId, OwnedTransactionId,
     },
-    Client,
+    Bot,
 };
 use tokio::time::sleep;
 use tracing::{error, info, warn};
@@ -103,7 +103,7 @@ fn known_nina_ags(city: &str) -> Option<&'static str> {
 
 // ── Main loop ─────────────────────────────────────────────────────────────────
 
-pub async fn alert_loop(client: Client, http: reqwest::Client, db: Db, config: AlertConfig) {
+pub async fn alert_loop(client: Bot, http: reqwest::Client, db: Db, config: AlertConfig) {
     let mut dwd_area_cache: HashMap<String, bool> = HashMap::new();
     let mut last_dwd_reconcile: Option<Instant> = None;
 
@@ -160,7 +160,7 @@ pub async fn alert_loop(client: Client, http: reqwest::Client, db: Db, config: A
 
 // ── NINA/warnung.bund.de ──────────────────────────────────────────────────────
 
-async fn check_nina(client: &Client, http: &reqwest::Client, db: &Db, ags: &str) -> Result<()> {
+async fn check_nina(client: &Bot, http: &reqwest::Client, db: &Db, ags: &str) -> Result<()> {
     let url = format!("https://warnung.bund.de/api31/dashboard/{ags}.json");
 
     let body = tokio::time::timeout(Duration::from_secs(15), http.get(&url).send())
@@ -354,7 +354,7 @@ fn format_nina_description(data: &serde_json::Value) -> String {
 // ── DWD weather warnings ─────────────────────────────────────────────────────
 
 async fn check_dwd_weather_warnings(
-    client: &Client,
+    client: &Bot,
     http: &reqwest::Client,
     db: &Db,
     region_keywords: &[String],
@@ -1419,7 +1419,7 @@ fn concise_sentences(text: &str, max_sentences: usize) -> Option<String> {
 // ── USGS significant earthquakes ──────────────────────────────────────────────
 
 async fn check_usgs(
-    client: &Client,
+    client: &Bot,
     http: &reqwest::Client,
     db: &Db,
     ref_point: Option<(f64, f64)>,
@@ -1495,7 +1495,7 @@ async fn check_usgs(
 // ── GDACS global disasters ────────────────────────────────────────────────────
 
 async fn check_gdacs(
-    client: &Client,
+    client: &Bot,
     http: &reqwest::Client,
     db: &Db,
     ref_point: Option<(f64, f64)>,
@@ -1584,14 +1584,14 @@ fn xml_tag(xml: &str, tag: &str) -> Option<String> {
 /// Returns `(all_ok, room_id_str → event_id_str)`.
 /// Collects event IDs from all rooms so they can be stored for future edits.
 async fn post_alert_to_rooms(
-    client: &Client,
+    client: &Bot,
     alert_key: &str,
     plain: &str,
     html: &str,
 ) -> (bool, HashMap<String, String>) {
     let mut event_ids: HashMap<String, String> = HashMap::new();
     let mut all_ok = true;
-    for room in client.joined_rooms() {
+    for room in client.broadcast_rooms() {
         let txn_id = stable_alert_transaction_id(alert_key, room.room_id().as_str());
         match room
             .send(RoomMessageEventContent::text_html(plain, html))
@@ -1629,7 +1629,7 @@ fn stable_alert_transaction_id(alert_key: &str, room_id: &str) -> OwnedTransacti
 
 #[allow(clippy::too_many_arguments)]
 async fn repost_dwd_active_warning(
-    client: &Client,
+    client: &Bot,
     db: &Db,
     id: &str,
     headline: &str,
@@ -1653,7 +1653,7 @@ async fn repost_dwd_active_warning(
 }
 
 async fn post_nina_warning_to_rooms(
-    client: &Client,
+    client: &Bot,
     db: &Db,
     id: &str,
     headline: &str,
@@ -1676,7 +1676,7 @@ async fn post_nina_warning_to_rooms(
 /// Returns whether all edits succeeded, failed transiently, or likely targeted
 /// messages that are gone from the room.
 async fn edit_alert_message_in_rooms(
-    client: &Client,
+    client: &Bot,
     event_ids_json: &str,
     new_plain: &str,
     new_html: &str,
@@ -1691,7 +1691,7 @@ async fn edit_alert_message_in_rooms(
 
     let mut all_ok = true;
     let mut missing_original = false;
-    for room in client.joined_rooms() {
+    for room in client.broadcast_rooms() {
         let room_id = room.room_id().to_string();
         let Some(event_id_str) = map.get(&room_id) else {
             continue;

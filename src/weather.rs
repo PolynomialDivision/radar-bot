@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use chrono::{Local, NaiveTime, Timelike};
-use matrix_sdk::Client;
+use mxbot_common::Bot;
 use tokio::time::sleep;
 use tracing::{info, warn};
 
@@ -18,7 +18,7 @@ pub enum WeatherProvider {
 // ── Loop ──────────────────────────────────────────────────────────────────────
 
 pub async fn weather_loop(
-    client: Client,
+    client: Bot,
     http: reqwest::Client,
     db: Db,
     ref_point: (f64, f64),
