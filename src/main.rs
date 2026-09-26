@@ -169,12 +169,12 @@ async fn main() -> Result<()> {
     // Resolve reference address to coordinates once at startup.
     let ref_point: Option<(f64, f64)> = if let Some(ref addr) = config.filter.reference_address {
         info!("Geocoding reference address: {addr}");
-        match geocode_location(&http, addr, "").await {
-            Ok(Some(hit)) => {
+        match geocode_location(&http, addr, "").await.as_deref() {
+            Ok([hit, ..]) => {
                 info!("Reference point: {:.5}, {:.5}", hit.lat, hit.lon);
                 Some((hit.lat, hit.lon))
             }
-            Ok(None) | Err(()) => {
+            Ok([]) | Err(()) => {
                 warn!("Could not geocode reference address '{addr}' — distance scoring disabled");
                 None
             }

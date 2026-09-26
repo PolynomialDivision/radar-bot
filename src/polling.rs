@@ -35,6 +35,14 @@ pub(crate) async fn process_item(
             match fetch_article(&http, url, &item.title).await {
                 Some(article) => {
                     item.article_text = Some(article.text);
+                    // An old article resurfacing in a feed (or a Google News
+                    // search) often carries a fresh feed date; trust the older.
+                    if let Some(page_date) = article.published_at {
+                        item.published_at = Some(
+                            item.published_at
+                                .map_or(page_date, |feed| feed.min(page_date)),
+                        );
+                    }
                     if let Some(link) = article.resolved_link {
                         item.link = Some(link);
                     }
@@ -54,9 +62,23 @@ pub(crate) async fn process_item(
         }
     }
 
+    // ── 0. Age, now that the page may have told us the real publish date ────
+    let max_age_hours = source.max_age_hours.or(filter.max_age_hours);
+    if let (Some(max_age), Some(published)) = (max_age_hours, item.published_at) {
+        let age_hours = (chrono::Utc::now().timestamp() - published) / 3600;
+        if age_hours > max_age as i64 {
+            let reason = format!("published {age_hours}h ago, older than {max_age}h");
+            tracing::debug!("DROP [{}] {:?}: {reason}", source_name, item.title);
+            return ProcessOutcome::Dropped { item, reason };
+        }
+    }
+
+    let text = ItemText::of(&item);
+    let mut evidence: Vec<LocationEvidence> = Vec::new();
+
     // ── 1. Keyword check → implied distance ───────────────────────────────────
     let effective_required: &[String] = source.required.as_deref().unwrap_or(&filter.required);
-    let kw_evidence: Option<(f64, String)> = if source.filter {
+    if source.filter {
         match keyword_check(&item, &filter, effective_required) {
             None => {
                 let reason = "required/blocklist keyword filter did not pass";
@@ -77,62 +99,34 @@ pub(crate) async fn process_item(
                     reason: reason.to_owned(),
                 };
             }
-            Some((implied, matched)) => {
-                let implied = implied.or_else(|| {
-                    source.base_implied_meters.map(|meters| {
-                        let label = geocode_city
-                            .split(',')
-                            .next()
-                            .map(str::trim)
-                            .filter(|s| !s.is_empty())
-                            .unwrap_or(&source_name)
-                            .to_owned();
-                        (meters, label)
-                    })
-                });
-                if !matched.is_empty() {
+            Some(kw) => {
+                if !kw.matched.is_empty() {
                     info!(
-                        "PASS [{}] {:?} keyword_implied={:?}m terms=[{}]",
+                        "PASS [{}] {:?} terms=[{}]",
                         source_name,
                         item.title,
-                        implied.as_ref().map(|(m, _)| *m as u32),
-                        matched.join(", ")
+                        kw.matched.join(", ")
                     );
                 }
-                implied
+                evidence.extend(kw.evidence);
             }
         }
-    } else {
-        source
-            .base_implied_meters
-            .map(|meters| (meters, source_name.clone()))
-    };
+    }
+    if let Some(meters) = source.base_implied_meters {
+        evidence.push(LocationEvidence {
+            meters,
+            label: String::new(),
+            kind: EvidenceKind::SourceDefault,
+            prominent: true,
+        });
+    }
 
     // ── 2. Geocode → actual distance ──────────────────────────────────────────
-    // Actual distance and keyword-implied are combined by taking the closer result.
-    let geocoded_evidence: Option<(f64, String)> = if let Some((ref_lat, ref_lon)) = ref_point {
-        // If geocoding produces false positives from RSS footer boilerplate
-        // (e.g. Polizei Berlin appends their HQ address to every description),
-        // switch to article_text-only by uncommenting the two lines below and
-        // removing the third:
-        // let body = item.article_text.as_deref()
-        //     .or(item.description.as_deref())
-        //     .unwrap_or("");
-        let candidates_count = extract_street_evidence(
-            &item.title,
-            item.description.as_deref(),
-            item.article_text.as_deref(),
-        )
-        .len();
-        info!(
-            "  geocoding [{}] {:?} ({} candidates)",
-            source_name, item.title, candidates_count
-        );
+    if let Some((ref_lat, ref_lon)) = ref_point {
         match find_nearest_distance(
             &http,
-            &item.title,
-            item.description.as_deref(),
-            item.article_text.as_deref(),
+            &item,
+            &text,
             ref_lat,
             ref_lon,
             &geocode_city,
@@ -141,20 +135,19 @@ pub(crate) async fn process_item(
         )
         .await
         {
-            DistanceLookup::Found(dist, ref label) => {
+            DistanceLookup::Found(found) => {
                 info!(
-                    "  📍 [{}] {:?} → {} at {}",
+                    "  📍 [{}] {:?} → {} at {}{}",
                     source_name,
-                    label,
+                    found.label,
                     item.title,
-                    format_distance(dist)
+                    format_distance(found.meters),
+                    if found.prominent { "" } else { " (body only)" }
                 );
-                item.distance_meters = Some(dist);
-                Some((dist, label.clone()))
+                evidence.push(found);
             }
             DistanceLookup::NoMatch => {
-                info!("  no street geocoded [{}] {:?}", source_name, item.title);
-                None
+                tracing::debug!("  no street geocoded [{}] {:?}", source_name, item.title);
             }
             DistanceLookup::TransientFailure => {
                 return ProcessOutcome::Retry {
@@ -163,32 +156,32 @@ pub(crate) async fn process_item(
                 };
             }
         }
-    } else {
-        None
-    };
+    }
 
-    let place_evidence = find_configured_place_distance(&item, &filter, ref_point);
-    if let Some((dist, label)) = &place_evidence {
+    for place in find_configured_places(&text, &filter, ref_point) {
         info!(
-            "  📍 [{}] configured place {:?} → {} at {}",
+            "  📍 [{}] configured place {:?} → {} at {}{}",
             source_name,
-            label,
+            place.label,
             item.title,
-            format_distance(*dist)
+            format_distance(place.meters),
+            if place.prominent { "" } else { " (body only)" }
         );
+        evidence.push(place);
     }
 
     // ── 3. Final score ────────────────────────────────────────────────────────
-    let final_location = [geocoded_evidence, place_evidence, kw_evidence]
-        .into_iter()
-        .flatten()
-        .min_by(|(a, _), (b, _)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    let final_meters = final_location.as_ref().map(|(meters, _)| *meters);
-    let score = final_meters.map(distance_score).unwrap_or(0);
+    // The strongest single piece of evidence decides. A source default only
+    // sets a floor: it neither shows as a location nor makes two city-wide
+    // items look like they happened at the same place.
+    let best = best_evidence(evidence);
+    let score = best.as_ref().map_or(0, LocationEvidence::score);
     item.score = score;
     item.max_score = 5;
-    item.distance_meters = final_meters;
-    item.location_label = final_location.map(|(_, label)| label);
+    item.distance_meters = best.as_ref().filter(|e| e.is_measured()).map(|e| e.meters);
+    item.location_label = best
+        .filter(|e| e.kind != EvidenceKind::SourceDefault)
+        .map(|e| e.label);
 
     if source.filter && score < filter.digest_threshold {
         let reason = format!(
@@ -431,5 +424,112 @@ pub(crate) async fn poll_loop(
         .await;
         info!("Next poll in {interval_mins}m");
         sleep(interval).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn source(base: Option<f64>, max_age_hours: Option<u64>) -> SourceConfig {
+        SourceConfig {
+            name: "Polizei Berlin".to_owned(),
+            source_type: sources::SourceType::Rss,
+            url: None,
+            query: None,
+            limit: None,
+            max_age_hours,
+            filter: true,
+            base_implied_meters: base,
+            required: Some(vec![]),
+        }
+    }
+
+    fn filter() -> FilterConfig {
+        FilterConfig {
+            digest_threshold: 3,
+            candidate_min_score: 1,
+            area: vec![AreaGroup {
+                implied_meters: 1500.0,
+                terms: vec!["Friedrichshain".to_owned()],
+            }],
+            ..Default::default()
+        }
+    }
+
+    fn report(title: &str, article: &str) -> FeedItem {
+        FeedItem {
+            guid: title.to_owned(),
+            title: title.to_owned(),
+            link: None,
+            link_note: None,
+            description: None,
+            article_text: Some(article.to_owned()),
+            source_name: "Polizei Berlin".to_owned(),
+            score: 0,
+            max_score: 0,
+            distance_meters: None,
+            location_label: None,
+            published_at: Some(chrono::Utc::now().timestamp()),
+        }
+    }
+
+    async fn run(source: SourceConfig, item: FeedItem) -> ProcessOutcome {
+        process_item(
+            reqwest::Client::new(),
+            source,
+            item,
+            Arc::new(filter()),
+            None,
+            Arc::from(""),
+            Arc::new(DashMap::new()),
+            Arc::new(Semaphore::new(1)),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn city_wide_report_is_a_candidate_without_fake_location() {
+        let item = report(
+            "Mann bei Raub mit Messer verletzt",
+            "Friedrichshain-Kreuzberg Nr. 1262 Ein Mann wurde in Kreuzberg verletzt.",
+        );
+
+        let ProcessOutcome::Candidate { item, .. } = run(source(Some(9000.0), None), item).await
+        else {
+            panic!("expected a candidate");
+        };
+
+        assert_eq!(item.score, 1);
+        assert_eq!(item.distance_meters, None);
+        assert_eq!(item.location_label, None);
+    }
+
+    #[tokio::test]
+    async fn local_report_keeps_its_district_label() {
+        let item = report(
+            "Polizeieinsatz",
+            "Nr. 1253 Bei einem Polizeieinsatz in Friedrichshain wurden zwei Bauarbeiter verletzt.",
+        );
+
+        let ProcessOutcome::Candidate { item, .. } = run(source(Some(9000.0), None), item).await
+        else {
+            panic!("expected a candidate below threshold 3");
+        };
+
+        assert_eq!(item.score, 2);
+        assert_eq!(item.location_label.as_deref(), Some("Friedrichshain"));
+    }
+
+    #[tokio::test]
+    async fn items_older_than_max_age_are_dropped() {
+        let mut item = report("Einsatz in Friedrichshain", "Einsatz in Friedrichshain.");
+        item.published_at = Some(chrono::Utc::now().timestamp() - 5 * 86_400);
+
+        let outcome = run(source(None, Some(72)), item).await;
+
+        assert!(
+            matches!(outcome, ProcessOutcome::Dropped { reason, .. } if reason.contains("older than 72h"))
+        );
     }
 }

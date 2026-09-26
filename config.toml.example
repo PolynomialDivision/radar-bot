@@ -55,6 +55,12 @@ candidate_min_score = 1
 candidate_min_sources = 2
 candidate_retention_hours = 24
 
+# Drop items published longer ago than this (hours), for sources without their
+# own max_age_hours. Checked after the article page is fetched, so the page's
+# own publish date (article:published_time / JSON-LD datePublished) can unmask
+# an old article that a feed or search re-lists with a fresh date.
+# max_age_hours = 72
+
 # Your reference address — geocoded once at startup. All distances are measured from here.
 reference_address = "Yourstreet 1, 10000 Yourcity"
 
@@ -70,8 +76,18 @@ blocklist = [
 
 # ── Area groups ───────────────────────────────────────────────────────────────
 # Each group maps keywords to an implied distance from your reference point.
-# When no street can be geocoded, the closest matching group's distance is used
-# as the relevance score. Geocoding always overrides with the real distance if found.
+# Every match (area term, configured place, geocoded street, the source's
+# base_implied_meters) is one piece of evidence; the strongest decides the score.
+#
+# Terms match at word starts: "Friedrichshain" matches "Berlin-Friedrichshain"
+# and "Friedrichshainer", but not "Friedrichshain-Kreuzberg" (the whole borough —
+# add that as its own term with a larger distance if you want it). Postal codes
+# and terms shorter than five letters must match as whole words.
+#
+# Mentions in the title, feed description or the article lead count fully.
+# Mentions only further down the article score one tier lower: those are mostly
+# asides, lists of places or teasers. Press-office contact blocks ("Hinweise
+# nimmt … Wedekindstraße 10, 10243 Berlin") are ignored.
 #
 # Terms don't have to be street names — any location-specific keyword works:
 # building names, landmarks, organisation abbreviations, event keywords, etc.

@@ -166,6 +166,11 @@ pub(crate) struct FilterConfig {
     pub(crate) candidate_min_sources: usize,
     #[serde(default = "default_candidate_retention_hours")]
     pub(crate) candidate_retention_hours: u64,
+    /// Drop items published longer ago than this, for sources without their
+    /// own `max_age_hours`. Checked after the article page is fetched, so a
+    /// page's own publish date can unmask an old article with a fresh feed date.
+    #[serde(default)]
+    pub(crate) max_age_hours: Option<u64>,
     #[serde(default)]
     pub(crate) area: Vec<AreaGroup>,
     #[serde(default)]

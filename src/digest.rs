@@ -49,13 +49,18 @@ pub(crate) fn format_digest(items: &[DigestItem], header: &str) -> (String, Stri
         if item.source_count > 1 {
             info_parts.push(format!("{} sources", item.source_count));
         }
-        if let Some(d) = item.distance_meters {
-            match item.location_label.as_deref() {
-                Some(label) if !label.trim().is_empty() => {
-                    info_parts.push(format!("{} · {}", format_distance(d), label.trim()));
-                }
-                _ => info_parts.push(format_distance(d)),
+        let label = item
+            .location_label
+            .as_deref()
+            .map(str::trim)
+            .filter(|label| !label.is_empty());
+        match (item.distance_meters, label) {
+            (Some(d), Some(label)) => {
+                info_parts.push(format!("{} · {}", format_distance(d), label))
             }
+            (Some(d), None) => info_parts.push(format_distance(d)),
+            (None, Some(label)) => info_parts.push(label.to_owned()),
+            (None, None) => {}
         }
         let info_plain = if info_parts.is_empty() {
             String::new()
@@ -136,10 +141,68 @@ pub(crate) fn locations_compatible(a: &db::DbItem, b: &db::DbItem) -> bool {
     }
 }
 
-pub(crate) fn title_overlap(a: &str, b: &str) -> usize {
+/// Shared significant title words, and the word count of the shorter title.
+pub(crate) fn title_overlap(a: &str, b: &str) -> (usize, usize) {
     let a_words: HashSet<String> = significant_words(a).into_iter().collect();
     let b_words: HashSet<String> = significant_words(b).into_iter().collect();
-    a_words.intersection(&b_words).count()
+    (
+        a_words.intersection(&b_words).count(),
+        a_words.len().min(b_words.len()),
+    )
+}
+
+/// Titles about the same subject: at least two shared words making up half
+/// of the shorter title. Two "Brand in Wohnung in <district>" headlines
+/// qualify, so this only counts together with a matching location.
+pub(crate) fn titles_related(a: &str, b: &str) -> bool {
+    let (shared, shorter) = title_overlap(a, b);
+    shared >= 2 && shared * 2 >= shorter
+}
+
+/// Titles so alike that they are the same story whatever location each
+/// report resolved to: three or more shared words, two thirds of the shorter.
+pub(crate) fn titles_same_story(a: &str, b: &str) -> bool {
+    let (shared, shorter) = title_overlap(a, b);
+    shared >= 3 && shared * 3 >= shorter * 2
+}
+
+/// Link identity ignoring scheme, "www.", fragments, trailing slashes and
+/// tracking parameters.
+pub(crate) fn canonical_link(link: &str) -> String {
+    let link = link.trim();
+    let link = link.split('#').next().unwrap_or(link);
+    let (base, query) = link.split_once('?').unwrap_or((link, ""));
+    let base = base
+        .trim_start_matches("https://")
+        .trim_start_matches("http://")
+        .trim_start_matches("www.")
+        .trim_end_matches('/')
+        .to_lowercase();
+    let kept: Vec<&str> = query
+        .split('&')
+        .filter(|pair| !pair.is_empty())
+        .filter(|pair| {
+            let key = pair.split('=').next().unwrap_or("").to_lowercase();
+            !(key.starts_with("utm_")
+                || key.starts_with("at_")
+                || matches!(
+                    key.as_str(),
+                    "fbclid" | "gclid" | "ref" | "source" | "wt_mc"
+                ))
+        })
+        .collect();
+    if kept.is_empty() {
+        base
+    } else {
+        format!("{base}?{}", kept.join("&"))
+    }
+}
+
+pub(crate) fn same_link(a: &db::DbItem, b: &db::DbItem) -> bool {
+    match (a.link.as_deref(), b.link.as_deref()) {
+        (Some(la), Some(lb)) => canonical_link(la) == canonical_link(lb),
+        _ => false,
+    }
 }
 
 pub(crate) fn normalized_source_name(name: &str) -> String {
@@ -252,14 +315,27 @@ pub(crate) fn translated_event_duplicate(a: &db::DbItem, b: &db::DbItem) -> bool
 
 pub(crate) fn likely_same_incident(item: &db::DbItem, cluster: &[db::DbItem]) -> bool {
     cluster.iter().any(|other| {
-        let same_link = item.link.is_some() && item.link == other.link;
-        if same_link {
-            return true;
-        }
-        if translated_event_duplicate(item, other) {
-            return true;
-        }
-        locations_compatible(item, other) && title_overlap(&item.title, &other.title) >= 2
+        same_link(item, other)
+            || translated_event_duplicate(item, other)
+            || titles_same_story(&item.title, &other.title)
+            || (locations_compatible(item, other) && titles_related(&item.title, &other.title))
+    })
+}
+
+/// How long a posted story suppresses re-reports of itself.
+pub(crate) const ALREADY_POSTED_WINDOW_SECS: i64 = 48 * 3600;
+
+/// Split digest items into new ones and repeats of a recently posted story
+/// (same article, or a clearly identical headline). Looser matches stay, so
+/// a follow-up ("…: Tatverdächtiger festgenommen") is still reported.
+pub(crate) fn split_already_posted(
+    items: Vec<db::DbItem>,
+    posted: &[db::DbItem],
+) -> (Vec<db::DbItem>, Vec<db::DbItem>) {
+    items.into_iter().partition(|item| {
+        !posted
+            .iter()
+            .any(|old| same_link(item, old) || titles_same_story(&item.title, &old.title))
     })
 }
 
@@ -495,6 +571,28 @@ pub(crate) async fn digest_loop(
             }
         };
 
+        let posted = match db.list_recent_posted(ALREADY_POSTED_WINDOW_SECS).await {
+            Ok(v) => v,
+            Err(e) => {
+                warn!("Digest: failed to load recently posted items: {e}");
+                Vec::new()
+            }
+        };
+        let (items, repeats) = split_already_posted(items, &posted);
+        if !repeats.is_empty() {
+            info!(
+                "Digest: {} item(s) repeat an already posted story — not posting",
+                repeats.len()
+            );
+            let guids: Vec<String> = repeats.into_iter().map(|item| item.guid).collect();
+            if let Err(e) = db
+                .drop_processing(&guids, "same story already posted")
+                .await
+            {
+                warn!("Digest: failed to drop repeated items: {e}");
+            }
+        }
+
         if items.is_empty() {
             info!("Digest: no pending items — staying silent");
             continue;
@@ -535,5 +633,126 @@ pub(crate) async fn digest_loop(
                 sleep(Duration::from_millis(500)).await;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn db_item(guid: &str, source: &str, title: &str, link: &str) -> db::DbItem {
+        db::DbItem {
+            guid: guid.to_owned(),
+            source_name: source.to_owned(),
+            title: title.to_owned(),
+            link: Some(link.to_owned()),
+            link_note: None,
+            score: 1,
+            max_score: 5,
+            distance_meters: None,
+            location_label: None,
+        }
+    }
+
+    #[test]
+    fn same_story_merges_even_when_locations_resolved_differently() {
+        // Posted three times on 2026-09-25: one rbb version had a place
+        // mention, the other only the city-wide default.
+        let mut a = db_item(
+            "a",
+            "rbb Berlin",
+            "Kameras werden am Kottbusser Tor installiert - Testbetrieb startet in vier Wochen",
+            "https://rbb.test/1",
+        );
+        a.distance_meters = Some(1231.0);
+        a.location_label = Some("Warschauer Brücke".to_owned());
+        let b = db_item(
+            "b",
+            "rbb Berlin",
+            "Kameras am Kottbusser Tor werden eingerichtet - Testbetrieb in vier Wochen",
+            "https://rbb.test/2",
+        );
+
+        assert_eq!(cluster_digest_items(vec![a, b]).len(), 1);
+    }
+
+    #[test]
+    fn city_wide_items_with_related_titles_stay_separate() {
+        // Both only carry the source default — nothing says they happened at
+        // the same place, so "Brand in Wohnung" alone must not merge them.
+        let a = db_item(
+            "a",
+            "Polizei Berlin",
+            "Brand in Wohnung in Neukölln",
+            "https://p.test/1",
+        );
+        let b = db_item(
+            "b",
+            "rbb Berlin",
+            "Brand in Wohnung in Spandau",
+            "https://r.test/2",
+        );
+
+        assert_eq!(cluster_digest_items(vec![a, b]).len(), 2);
+    }
+
+    #[test]
+    fn links_compare_without_tracking_noise() {
+        assert_eq!(
+            canonical_link("https://www.rbb24.de/panorama/a.html?utm_source=rss#top"),
+            canonical_link("http://rbb24.de/panorama/a.html/")
+        );
+        assert_ne!(
+            canonical_link("https://example.test/article?id=1"),
+            canonical_link("https://example.test/article?id=2")
+        );
+    }
+
+    #[test]
+    fn repeats_of_posted_stories_are_split_off_but_follow_ups_stay() {
+        let posted = vec![db_item(
+            "old",
+            "Morgenpost",
+            "Messerangriff in der Rigaer Straße",
+            "https://m.test/1",
+        )];
+        let repeat = db_item(
+            "r",
+            "taz",
+            "Messerangriff in der Rigaer Straße",
+            "https://www.m.test/1?utm_medium=feed",
+        );
+        let follow_up = db_item(
+            "f",
+            "rbb Berlin",
+            "Nach Messerangriff in der Rigaer Straße: Tatverdächtiger festgenommen",
+            "https://r.test/9",
+        );
+
+        let (fresh, repeats) = split_already_posted(vec![repeat, follow_up], &posted);
+
+        assert_eq!(fresh.len(), 1);
+        assert_eq!(fresh[0].guid, "f");
+        assert_eq!(repeats[0].guid, "r");
+    }
+
+    #[test]
+    fn digest_shows_a_keyword_label_without_a_distance() {
+        let item = DigestItem {
+            guids: vec!["1".to_owned()],
+            source_name: "Polizei Berlin".to_owned(),
+            source_count: 1,
+            title: "Einsatz".to_owned(),
+            link: None,
+            link_note: None,
+            score: 2,
+            max_score: 5,
+            distance_meters: None,
+            location_label: Some("Friedrichshain".to_owned()),
+        };
+
+        let (plain, _) = format_digest(&[item], "Test");
+
+        assert!(plain.contains("[2/5 Friedrichshain]"));
     }
 }

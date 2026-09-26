@@ -582,9 +582,11 @@ mod feed_tests {
             published_at: None,
         };
 
-        let hit = find_configured_place_distance(&item, &filter, Some((52.5070, 13.4540)));
+        let hits = find_configured_places(&ItemText::of(&item), &filter, Some((52.5070, 13.4540)));
 
-        assert_eq!(hit.map(|(_, label)| label), Some("RAW-Gelände".to_owned()));
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].label, "RAW-Gelände");
+        assert!(hits[0].prominent);
     }
 
     #[test]
@@ -613,9 +615,9 @@ mod feed_tests {
             published_at: None,
         };
 
-        let hit = find_configured_place_distance(&item, &filter, Some((52.5070, 13.4540)));
+        let hits = find_configured_places(&ItemText::of(&item), &filter, Some((52.5070, 13.4540)));
 
-        assert!(hit.is_none());
+        assert!(hits.is_empty());
     }
 
     #[test]
@@ -644,8 +646,11 @@ mod feed_tests {
 
         let hit = keyword_check(&item, &filter, &[]).expect("keyword check should pass");
 
-        assert_eq!(hit.0, Some((1500.0, "Friedrichshain".to_owned())));
-        assert_eq!(hit.1, vec!["\"Friedrichshain\" (1500m)"]);
+        assert_eq!(hit.evidence.len(), 1);
+        assert_eq!(hit.evidence[0].meters, 1500.0);
+        assert_eq!(hit.evidence[0].label, "Friedrichshain");
+        assert!(hit.evidence[0].prominent);
+        assert_eq!(hit.matched, vec!["\"Friedrichshain\" (1500m)"]);
     }
 
     #[test]

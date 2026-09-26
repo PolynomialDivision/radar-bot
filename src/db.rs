@@ -458,6 +458,60 @@ impl Db {
         .await?
     }
 
+    /// Items posted within the last `window_secs`, to recognise re-reports.
+    pub async fn list_recent_posted(&self, window_secs: i64) -> Result<Vec<DbItem>> {
+        let db = self.0.clone();
+        let cutoff = chrono::Utc::now().timestamp() - window_secs;
+
+        tokio::task::spawn_blocking(move || {
+            let conn = db.lock().unwrap();
+            let mut stmt = conn.prepare(
+                "SELECT guid, source_name, title, link, link_note, score, max_score, distance_m, location_label
+                 FROM items WHERE state = 'posted' AND posted_at >= ?1",
+            )?;
+            let items = stmt
+                .query_map(params![cutoff], |row| {
+                    Ok(DbItem {
+                        guid:            row.get(0)?,
+                        source_name:     row.get(1)?,
+                        title:           row.get(2)?,
+                        link:            row.get(3)?,
+                        link_note:       row.get(4)?,
+                        score:           row.get(5)?,
+                        max_score:       row.get(6)?,
+                        distance_meters: row.get(7)?,
+                        location_label:  row.get(8)?,
+                    })
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok::<Vec<DbItem>, anyhow::Error>(items)
+        })
+        .await?
+    }
+
+    /// Drop items taken for a digest without posting them.
+    pub async fn drop_processing(&self, guids: &[String], reason: &str) -> Result<()> {
+        if guids.is_empty() {
+            return Ok(());
+        }
+        let db = self.0.clone();
+        let guids = guids.to_vec();
+        let reason = reason.to_owned();
+
+        tokio::task::spawn_blocking(move || {
+            let conn = db.lock().unwrap();
+            for guid in &guids {
+                conn.execute(
+                    "UPDATE items SET state = 'dropped', error = ?1
+                     WHERE guid = ?2 AND state = 'processing'",
+                    params![reason, guid],
+                )?;
+            }
+            Ok::<(), anyhow::Error>(())
+        })
+        .await?
+    }
+
     // ── Startup / crash recovery ──────────────────────────────────────────────
 
     /// Reset any 'processing' rows to 'queued'. These were in-flight when the bot

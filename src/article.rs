@@ -122,6 +122,53 @@ pub(crate) struct ArticleFetch {
     pub(crate) text: String,
     pub(crate) resolved_link: Option<String>,
     pub(crate) link_note: Option<String>,
+    /// Publish date the page itself declares, if any.
+    pub(crate) published_at: Option<i64>,
+}
+
+/// Publish date from the page's metadata: Open Graph / article meta tags or
+/// schema.org JSON-LD `datePublished`. Modification dates are ignored — an
+/// updated old article is still an old event.
+pub(crate) fn page_published_at(html: &str) -> Option<i64> {
+    const META_NAMES: &[&str] = &[
+        "article:published_time",
+        "og:article:published_time",
+        "datePublished",
+        "date",
+        "dc.date",
+        "dc.date.issued",
+        "pubdate",
+    ];
+    META_NAMES
+        .iter()
+        .find_map(|name| meta_property_value(html, name))
+        .or_else(|| json_ld_date_published(html))
+        .and_then(|value| parse_page_date(&value))
+}
+
+fn json_ld_date_published(html: &str) -> Option<String> {
+    let pos = html.find("\"datePublished\"")?;
+    let rest = &html[pos + "\"datePublished\"".len()..];
+    let rest = rest.trim_start().strip_prefix(':')?.trim_start();
+    let rest = rest.strip_prefix('"')?;
+    Some(rest[..rest.find('"')?].to_owned())
+}
+
+fn parse_page_date(value: &str) -> Option<i64> {
+    let value = value.trim();
+    parse_feed_date(value)
+        .or_else(|| {
+            chrono::NaiveDateTime::parse_from_str(value, "%Y-%m-%dT%H:%M:%S")
+                .ok()
+                .and_then(|dt| dt.and_local_timezone(chrono::Local).earliest())
+                .map(|dt| dt.timestamp())
+        })
+        .or_else(|| {
+            chrono::NaiveDate::parse_from_str(value.get(..10)?, "%Y-%m-%d")
+                .ok()
+                .and_then(|d| d.and_hms_opt(12, 0, 0))
+                .map(|dt| dt.and_utc().timestamp())
+        })
 }
 
 pub(crate) fn attr_value(tag: &str, attr: &str) -> Option<String> {
@@ -279,7 +326,27 @@ pub(crate) fn significant_words(s: &str) -> Vec<String> {
         .filter(|w| {
             !matches!(
                 w.as_str(),
-                "berlin" | "polizei" | "meldung" | "update" | "heute"
+                "berlin"
+                    | "polizei"
+                    | "meldung"
+                    | "update"
+                    | "heute"
+                    | "werden"
+                    | "wurde"
+                    | "wurden"
+                    | "worden"
+                    | "einem"
+                    | "einer"
+                    | "eines"
+                    | "diese"
+                    | "dieser"
+                    | "nicht"
+                    | "gegen"
+                    | "unter"
+                    | "sollen"
+                    | "haben"
+                    | "zwischen"
+                    | "liveticker"
             )
         })
         .take(8)
@@ -362,6 +429,7 @@ pub(crate) async fn fetch_article(
                 text: t,
                 resolved_link,
                 link_note,
+                published_at: page_published_at(&html),
             })
         }
     })
@@ -369,4 +437,20 @@ pub(crate) async fn fetch_article(
     .ok()??;
 
     Some(text)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn page_publish_date_comes_from_meta_or_json_ld() {
+        let meta =
+            r#"<meta property="article:published_time" content="2024-03-01T08:00:00+01:00">"#;
+        let json_ld = r#"<script type="application/ld+json">{"@type":"NewsArticle","datePublished": "2024-03-01T07:00:00Z","dateModified":"2026-09-26T10:00:00Z"}</script>"#;
+
+        assert_eq!(page_published_at(meta), Some(1_709_276_400));
+        assert_eq!(page_published_at(json_ld), Some(1_709_276_400));
+        assert_eq!(page_published_at("<p>no date</p>"), None);
+    }
 }

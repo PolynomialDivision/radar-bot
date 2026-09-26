@@ -1011,10 +1011,11 @@ async fn dwd_warning_area_contains_point(
             Ok(true)
         }
         Err(e) => {
+            // Not cached: a network hiccup must not decide this cell for the
+            // rest of the process lifetime. The next poll asks again.
             warn!(
                 "DWD warning-area geometry lookup failed for cell {warncell_id}: {e:#}; falling back to region-name match"
             );
-            cache.insert(warncell_id.to_owned(), true);
             Ok(true)
         }
     }
