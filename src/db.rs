@@ -159,12 +159,14 @@ impl Db {
         let now = chrono::Utc::now().timestamp();
 
         tokio::task::spawn_blocking(move || {
-            db.lock().unwrap().execute(
+            let conn = db.lock().unwrap();
+            conn.execute(
                 "INSERT OR IGNORE INTO items
                  (guid, source_name, title, link, link_note, score, max_score, distance_m, location_label, discovered_at, state, error)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
                 params![guid, source_name, title, link, link_note, score, max_score, distance_m, location, now, state, reason],
             )?;
+            conn.execute("DELETE FROM retry_attempts WHERE guid = ?1", params![guid])?;
             Ok::<(), anyhow::Error>(())
         })
         .await?
@@ -188,12 +190,14 @@ impl Db {
         let now = chrono::Utc::now().timestamp();
 
         tokio::task::spawn_blocking(move || {
-            db.lock().unwrap().execute(
+            let conn = db.lock().unwrap();
+            conn.execute(
                 "INSERT OR IGNORE INTO items
                  (guid, source_name, title, link, score, max_score, discovered_at, state, error)
                  VALUES (?1, ?2, ?3, ?4, 0, 0, ?5, 'dropped', ?6)",
                 params![guid, source_name, title, link, now, reason],
             )?;
+            conn.execute("DELETE FROM retry_attempts WHERE guid = ?1", params![guid])?;
             Ok::<(), anyhow::Error>(())
         })
         .await?
@@ -507,6 +511,45 @@ impl Db {
                     params![reason, guid],
                 )?;
             }
+            Ok::<(), anyhow::Error>(())
+        })
+        .await?
+    }
+
+    /// How many polls ended in "retry later" for this guid.
+    pub async fn retry_attempts(&self, guid: &str) -> Result<u32> {
+        let db = self.0.clone();
+        let guid = guid.to_owned();
+        tokio::task::spawn_blocking(move || {
+            let conn = db.lock().unwrap();
+            let n: Option<u32> = conn
+                .query_row(
+                    "SELECT attempts FROM retry_attempts WHERE guid = ?1",
+                    params![guid],
+                    |r| r.get(0),
+                )
+                .ok();
+            Ok::<u32, anyhow::Error>(n.unwrap_or(0))
+        })
+        .await?
+    }
+
+    pub async fn record_retry(&self, guid: &str) -> Result<()> {
+        let db = self.0.clone();
+        let guid = guid.to_owned();
+        let now = chrono::Utc::now().timestamp();
+        tokio::task::spawn_blocking(move || {
+            let conn = db.lock().unwrap();
+            conn.execute(
+                "INSERT INTO retry_attempts (guid, attempts, last_at) VALUES (?1, 1, ?2)
+                 ON CONFLICT(guid) DO UPDATE SET attempts = attempts + 1, last_at = ?2",
+                params![guid, now],
+            )?;
+            // Items that left their feed while still retrying.
+            conn.execute(
+                "DELETE FROM retry_attempts WHERE last_at < ?1",
+                params![now - 7 * 86_400],
+            )?;
             Ok::<(), anyhow::Error>(())
         })
         .await?
@@ -950,6 +993,11 @@ const SCHEMA: &str = "
     -- feeds that reuse short numeric IDs across different sources.
     CREATE UNIQUE INDEX IF NOT EXISTS idx_source_guid  ON items(source_name, guid);
     CREATE        INDEX IF NOT EXISTS idx_state        ON items(state);
+    CREATE TABLE IF NOT EXISTS retry_attempts (
+        guid     TEXT PRIMARY KEY,
+        attempts INTEGER NOT NULL,
+        last_at  INTEGER NOT NULL
+    );
     CREATE TABLE IF NOT EXISTS source_poll_stats (
         id          INTEGER PRIMARY KEY AUTOINCREMENT,
         ts          INTEGER NOT NULL,

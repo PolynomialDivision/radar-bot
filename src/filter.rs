@@ -195,6 +195,7 @@ pub(crate) fn keyword_check(
                 label: term.clone(),
                 kind: EvidenceKind::Keyword,
                 prominent,
+                penalty: 0,
             });
         }
     }
@@ -223,6 +224,7 @@ mod tests {
             distance_meters: None,
             location_label: None,
             published_at: None,
+            ..Default::default()
         }
     }
 

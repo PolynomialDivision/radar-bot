@@ -102,7 +102,7 @@ async fn main() -> Result<()> {
     mxbot_common::logging::init("radar_bot");
 
     let test_mode = std::env::args().any(|a| a == "--test");
-    let config: Config =
+    let mut config: Config =
         mxbot_common::config::load_toml(&mxbot_common::config::config_path_from_args())?;
 
     // radar-bot keeps its Matrix sqlite store in store/matrix_store/, next to
@@ -183,6 +183,16 @@ async fn main() -> Result<()> {
         warn!("No reference_address configured — distance scoring disabled");
         None
     };
+
+    if let Some(point) = ref_point {
+        // Nominatim's usage policy: at most one request per second.
+        sleep(NOMINATIM_INTERVAL).await;
+        config.filter.home_borough = reverse_borough(&http, point).await;
+        match &config.filter.home_borough {
+            Some(borough) => info!("Reference district: {borough}"),
+            None => warn!("Could not resolve the reference district — district hints ignored"),
+        }
+    }
 
     let bluesky_ctx: Option<sources::BlueskyContext> = match (
         config.bluesky.identifier,
@@ -297,6 +307,7 @@ async fn main() -> Result<()> {
                 nina_ags,
                 ref_point,
                 dwd_region_keywords,
+                dwd_lead: Duration::from_secs(config.weather.warning_lead_hours * 3600),
                 max_distance_km: config.emergency.max_distance_km,
                 poll_interval_secs: config.emergency.poll_interval_secs,
             },

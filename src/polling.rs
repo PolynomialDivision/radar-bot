@@ -4,6 +4,11 @@ use super::*;
 
 // ── Polling loop ──────────────────────────────────────────────────────────────
 
+/// After this many polls ending in "retry later" (article page or geocoder
+/// unreachable), an item is decided with the information at hand — with the
+/// default 30-minute interval that is three hours.
+pub(crate) const MAX_RETRY_ATTEMPTS: u32 = 6;
+
 pub(crate) enum ProcessOutcome {
     Queued(FeedItem),
     Candidate { item: FeedItem, reason: String },
@@ -22,6 +27,7 @@ pub(crate) async fn process_item(
     geocode_city: Arc<str>,
     geocode_cache: GeocodeCache,
     limiter: NominatimLimiter,
+    final_attempt: bool,
 ) -> ProcessOutcome {
     let source_name = source.name.clone();
 
@@ -37,6 +43,9 @@ pub(crate) async fn process_item(
                     item.article_text = Some(article.text);
                     // An old article resurfacing in a feed (or a Google News
                     // search) often carries a fresh feed date; trust the older.
+                    item.coords = item.coords.or(article.event.coords);
+                    item.venue = article.event.address;
+                    item.district = item.district.take().or(article.district);
                     if let Some(page_date) = article.published_at {
                         item.published_at = Some(
                             item.published_at
@@ -58,6 +67,14 @@ pub(crate) async fn process_item(
                     source_name,
                     item.title
                 );
+            }
+            if article_fetch_failed && final_attempt {
+                // Retried often enough — decide with feed title/description.
+                info!(
+                    "  giving up on article fetch [{}] {:?}",
+                    source_name, item.title
+                );
+                article_fetch_failed = false;
             }
         }
     }
@@ -118,6 +135,7 @@ pub(crate) async fn process_item(
             label: String::new(),
             kind: EvidenceKind::SourceDefault,
             prominent: true,
+            penalty: 0,
         });
     }
 
@@ -149,6 +167,12 @@ pub(crate) async fn process_item(
             DistanceLookup::NoMatch => {
                 tracing::debug!("  no street geocoded [{}] {:?}", source_name, item.title);
             }
+            DistanceLookup::TransientFailure if final_attempt => {
+                info!(
+                    "  giving up on geocoding [{}] {:?}",
+                    source_name, item.title
+                );
+            }
             DistanceLookup::TransientFailure => {
                 return ProcessOutcome::Retry {
                     item,
@@ -156,6 +180,19 @@ pub(crate) async fn process_item(
                 };
             }
         }
+    }
+
+    if let (Some((lat, lon)), Some((ref_lat, ref_lon))) = (item.coords, ref_point) {
+        evidence.push(LocationEvidence {
+            meters: haversine_meters(ref_lat, ref_lon, lat, lon),
+            label: item
+                .venue
+                .clone()
+                .unwrap_or_else(|| "source coordinates".to_owned()),
+            kind: EvidenceKind::Coordinates,
+            prominent: true,
+            penalty: 0,
+        });
     }
 
     for place in find_configured_places(&text, &filter, ref_point) {
@@ -168,6 +205,13 @@ pub(crate) async fn process_item(
             if place.prominent { "" } else { " (body only)" }
         );
         evidence.push(place);
+    }
+
+    if let Some(why) = located_elsewhere(&item, &filter) {
+        info!("  ↘ [{}] {:?}: {why}", source_name, item.title);
+        for e in evidence.iter_mut().filter(|e| e.is_textual()) {
+            e.penalty += 1;
+        }
     }
 
     // ── 3. Final score ────────────────────────────────────────────────────────
@@ -210,6 +254,44 @@ pub(crate) async fn process_item(
     info!("QUEUE [{}] {:?} score={}", source_name, item.title, score);
     ProcessOutcome::Queued(item)
 }
+/// District labels that do not point anywhere in particular.
+const NON_SPECIFIC_DISTRICTS: &[&str] = &["bezirksübergreifend", "berlinweit", "landesweit"];
+
+/// Why the item is probably not about the neighbourhood, if it is: the
+/// source files it under another Bezirk, or its title names an `elsewhere`
+/// place and none of the configured own areas or places.
+pub(crate) fn located_elsewhere(item: &FeedItem, filter: &FilterConfig) -> Option<String> {
+    if let (Some(district), Some(home)) = (item.district.as_deref(), filter.home_borough.as_deref())
+    {
+        let district_n = normalize(district);
+        let specific = !NON_SPECIFIC_DISTRICTS
+            .iter()
+            .any(|d| district_n.contains(&normalize(d)));
+        if specific && district_n.trim() != normalize(home).trim() {
+            return Some(format!("filed under {district}, not {home}"));
+        }
+    }
+
+    let title = ItemText {
+        prominent: normalize(&item.title),
+        rest: String::new(),
+    };
+    let other = filter
+        .elsewhere
+        .iter()
+        .find(|term| title.mention(term, TermMatch::Place).is_some())?;
+    let own_terms = filter.area.iter().flat_map(|group| &group.terms).chain(
+        filter
+            .places
+            .iter()
+            .flat_map(|p| std::iter::once(&p.name).chain(&p.aliases)),
+    );
+    let names_own = own_terms
+        .into_iter()
+        .any(|term| title.mention(term, TermMatch::Place).is_some());
+    (!names_own).then(|| format!("title names {other}"))
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn poll_once(
     _client: &Bot,
@@ -268,6 +350,11 @@ pub(crate) async fn poll_once(
     let mut tasks: JoinSet<ProcessOutcome> = JoinSet::new();
     let n_pending = pending.len();
     for (source, item) in pending {
+        let attempts = if test_mode {
+            0
+        } else {
+            db.retry_attempts(&item.guid).await.unwrap_or(0)
+        };
         tasks.spawn(process_item(
             http.clone(),
             source,
@@ -277,6 +364,7 @@ pub(crate) async fn poll_once(
             geocode_city.clone(),
             geocode_cache.clone(),
             limiter.clone(),
+            attempts >= MAX_RETRY_ATTEMPTS,
         ));
     }
     if n_pending > 0 {
@@ -353,6 +441,9 @@ pub(crate) async fn poll_once(
                     .entry(item.source_name.clone())
                     .or_default() += 1;
                 *retry_reasons.entry(reason).or_default() += 1;
+                if !test_mode {
+                    db.record_retry(&item.guid).await.ok();
+                }
             }
             Err(e) => warn!("Item task panicked: {e}"),
         }
@@ -471,6 +562,7 @@ mod tests {
             distance_meters: None,
             location_label: None,
             published_at: Some(chrono::Utc::now().timestamp()),
+            ..Default::default()
         }
     }
 
@@ -484,6 +576,7 @@ mod tests {
             Arc::from(""),
             Arc::new(DashMap::new()),
             Arc::new(Semaphore::new(1)),
+            false,
         )
         .await
     }
@@ -531,5 +624,100 @@ mod tests {
         assert!(
             matches!(outcome, ProcessOutcome::Dropped { reason, .. } if reason.contains("older than 72h"))
         );
+    }
+
+    #[test]
+    fn items_filed_under_another_district_or_titled_elsewhere_are_flagged() {
+        let mut filter = filter();
+        filter.home_borough = Some("Friedrichshain-Kreuzberg".to_owned());
+        filter.elsewhere = vec!["Neukölln".to_owned()];
+
+        let mut filed = report("Raub", "");
+        filed.district = Some("Lichtenberg".to_owned());
+        let mut home = report("Raub", "");
+        home.district = Some("Friedrichshain-Kreuzberg".to_owned());
+        let mut citywide = report("Raub", "");
+        citywide.district = Some("bezirksübergreifend".to_owned());
+
+        assert!(located_elsewhere(&filed, &filter).is_some());
+        assert!(located_elsewhere(&home, &filter).is_none());
+        assert!(located_elsewhere(&citywide, &filter).is_none());
+        assert!(located_elsewhere(&report("Messerangriff in Neukölln", ""), &filter).is_some());
+        assert!(located_elsewhere(
+            &report("Demo von Neukölln nach Friedrichshain", ""),
+            &filter
+        )
+        .is_none());
+    }
+
+    #[tokio::test]
+    async fn source_coordinates_count_as_measured_evidence() {
+        let mut item = report("Konzert", "Ein Konzert.");
+        item.coords = Some((52.5145, 13.4705));
+        item.venue = Some("Scharnweberstraße 38".to_owned());
+
+        // Offline: the venue address is a known geocoder miss.
+        let cache: GeocodeCache = Arc::new(DashMap::new());
+        cache.insert("Scharnweberstraße 38".to_owned(), Vec::new());
+
+        let outcome = process_item(
+            reqwest::Client::new(),
+            source(Some(9000.0), None),
+            item,
+            Arc::new(filter()),
+            Some((52.5136, 13.4705)),
+            Arc::from(""),
+            cache,
+            Arc::new(Semaphore::new(1)),
+            false,
+        )
+        .await;
+
+        let ProcessOutcome::Queued(item) = outcome else {
+            panic!("expected queued");
+        };
+        assert_eq!(item.score, 5);
+        assert_eq!(item.location_label.as_deref(), Some("Scharnweberstraße 38"));
+        assert!(item.distance_meters.is_some_and(|m| m < 200.0));
+    }
+
+    #[tokio::test]
+    async fn unreachable_article_is_decided_after_the_last_retry() {
+        let mut item = report("Einsatz", "");
+        item.article_text = None;
+        item.link = Some("http://127.0.0.1:9/unreachable".to_owned());
+        let run = |final_attempt| {
+            process_item(
+                reqwest::Client::new(),
+                source(Some(9000.0), None),
+                item.clone(),
+                Arc::new(filter()),
+                None,
+                Arc::from(""),
+                Arc::new(DashMap::new()),
+                Arc::new(Semaphore::new(1)),
+                final_attempt,
+            )
+        };
+
+        assert!(matches!(run(false).await, ProcessOutcome::Retry { .. }));
+        assert!(matches!(run(true).await, ProcessOutcome::Candidate { .. }));
+    }
+
+    #[tokio::test]
+    async fn retry_attempts_are_counted_and_cleared_on_decision() {
+        let path = std::env::temp_dir().join(format!("radar-retry-test-{}.db", std::process::id()));
+        let db = Db::open(&path).unwrap();
+        let item = report("Einsatz", "");
+
+        db.record_retry(&item.guid).await.unwrap();
+        db.record_retry(&item.guid).await.unwrap();
+        assert_eq!(db.retry_attempts(&item.guid).await.unwrap(), 2);
+
+        db.insert_candidate(&item, "test").await.unwrap();
+        assert_eq!(db.retry_attempts(&item.guid).await.unwrap(), 0);
+
+        drop(db);
+        let _ = std::fs::remove_file(path);
     }
 }

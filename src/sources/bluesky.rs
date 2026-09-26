@@ -166,6 +166,7 @@ impl BlueskyAdapter {
             published_at: post["record"]["createdAt"]
                 .as_str()
                 .and_then(crate::parse_feed_date),
+            ..Default::default()
         })
     }
 }

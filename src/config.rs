@@ -33,8 +33,10 @@ pub(crate) struct BlueskyConfig {
 pub(crate) struct EmergencyConfig {
     #[serde(default = "default_true")]
     pub(crate) enabled: bool,
-    /// Max distance in km for USGS earthquake alerts. None = send all globally.
-    #[serde(default)]
+    /// Max distance in km for USGS/GDACS alerts (default 500, the same whether
+    /// or not an [emergency] section exists). A huge value such as 20000
+    /// receives everything worldwide.
+    #[serde(default = "default_alert_max_distance_km")]
     pub(crate) max_distance_km: Option<f64>,
     /// Poll interval in seconds (default 120).
     #[serde(default = "default_alert_poll_secs")]
@@ -45,10 +47,14 @@ impl Default for EmergencyConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            max_distance_km: Some(500.0),
+            max_distance_km: default_alert_max_distance_km(),
             poll_interval_secs: default_alert_poll_secs(),
         }
     }
+}
+
+pub(crate) fn default_alert_max_distance_km() -> Option<f64> {
+    Some(500.0)
 }
 
 pub(crate) fn default_alert_poll_secs() -> u64 {
@@ -72,6 +78,15 @@ pub(crate) struct WeatherConfig {
     /// filter.geocode_city/reference_address, e.g. "Berlin".
     #[serde(default)]
     pub(crate) warning_region_keywords: Vec<String>,
+    /// Post DWD warnings this many hours before they take effect (default 3),
+    /// so a storm warning issued in the morning for the afternoon arrives in
+    /// the morning.
+    #[serde(default = "default_warning_lead_hours")]
+    pub(crate) warning_lead_hours: u64,
+}
+
+pub(crate) fn default_warning_lead_hours() -> u64 {
+    3
 }
 
 impl Default for WeatherConfig {
@@ -82,6 +97,7 @@ impl Default for WeatherConfig {
             post_time: None,
             alerts_enabled: true,
             warning_region_keywords: Vec::new(),
+            warning_lead_hours: default_warning_lead_hours(),
         }
     }
 }
@@ -175,6 +191,16 @@ pub(crate) struct FilterConfig {
     pub(crate) area: Vec<AreaGroup>,
     #[serde(default)]
     pub(crate) places: Vec<PlaceConfig>,
+    /// Places that are *not* near you ("Kreuzberg", "Neukölln"). An item whose
+    /// title names one of these, but none of your own area terms or places,
+    /// loses one tier on location evidence taken from its text.
+    #[serde(default)]
+    pub(crate) elsewhere: Vec<String>,
+    /// Bezirk of the reference address, resolved at startup. Items a source
+    /// files under another Bezirk (Polizei Berlin "Ereignisort") are treated
+    /// like items naming an `elsewhere` place.
+    #[serde(skip)]
+    pub(crate) home_borough: Option<String>,
     /// Full address used as the reference point for distance scoring.
     /// Geocoded once at startup via Nominatim.
     pub(crate) reference_address: Option<String>,

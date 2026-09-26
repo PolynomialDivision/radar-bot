@@ -11,6 +11,100 @@ pub(crate) struct GeocodeHit {
     /// right one of several same-named streets.
     pub(crate) suburb: Option<String>,
     pub(crate) borough: Option<String>,
+    /// OSM geometry as (lat, lon) paths when Nominatim returned a line or
+    /// area; empty for plain points (house numbers, POIs).
+    pub(crate) shape: Vec<Vec<(f64, f64)>>,
+}
+
+impl GeocodeHit {
+    /// (nearest, farthest) distance of this hit's geometry from `point`.
+    /// Streets are lines: an incident "on the Frankfurter Allee" is somewhere
+    /// along it, so the nearest point is the relevant distance, and the
+    /// spread says how vague the mention is.
+    pub(crate) fn distance_range(&self, (lat, lon): (f64, f64)) -> (f64, f64) {
+        let center = haversine_meters(lat, lon, self.lat, self.lon);
+        let vertices = self.shape.iter().flatten();
+        let Some(farthest) = vertices
+            .map(|&(vlat, vlon)| haversine_meters(lat, lon, vlat, vlon))
+            .reduce(f64::max)
+        else {
+            return (center, center);
+        };
+        let nearest = self
+            .shape
+            .iter()
+            .flat_map(|path| {
+                // A lone vertex is a degenerate segment.
+                let pairs: Vec<_> = if path.len() == 1 {
+                    vec![(path[0], path[0])]
+                } else {
+                    path.windows(2).map(|w| (w[0], w[1])).collect()
+                };
+                pairs
+            })
+            .map(|(a, b)| segment_distance_meters((lat, lon), a, b))
+            .fold(f64::INFINITY, f64::min);
+        (nearest.min(center), farthest.max(center))
+    }
+}
+
+/// Distance from `p` to segment `a`–`b` (all (lat, lon)), in an
+/// equirectangular projection around `p` — accurate to well under 1% at
+/// city scale.
+pub(crate) fn segment_distance_meters(p: (f64, f64), a: (f64, f64), b: (f64, f64)) -> f64 {
+    const M_PER_DEG: f64 = 111_320.0;
+    let kx = p.0.to_radians().cos() * M_PER_DEG;
+    let project = |q: (f64, f64)| ((q.1 - p.1) * kx, (q.0 - p.0) * M_PER_DEG);
+    let (ax, ay) = project(a);
+    let (bx, by) = project(b);
+    let (dx, dy) = (bx - ax, by - ay);
+    let len2 = dx * dx + dy * dy;
+    let t = if len2 == 0.0 {
+        0.0
+    } else {
+        (-(ax * dx + ay * dy) / len2).clamp(0.0, 1.0)
+    };
+    let (cx, cy) = (ax + t * dx, ay + t * dy);
+    (cx * cx + cy * cy).sqrt()
+}
+
+/// Tiers a street mention loses for being vague: a street whose geometry
+/// runs well past its nearest point, named without a house number.
+pub(crate) fn vagueness_penalty(nearest: f64, farthest: f64) -> i32 {
+    match farthest - nearest {
+        spread if spread > 3_000.0 => 2,
+        spread if spread > 1_000.0 => 1,
+        _ => 0,
+    }
+}
+
+/// GeoJSON geometry → (lat, lon) paths.
+fn geojson_paths(geometry: &serde_json::Value) -> Vec<Vec<(f64, f64)>> {
+    fn path(coords: &serde_json::Value) -> Vec<(f64, f64)> {
+        coords
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|pos| Some((pos.get(1)?.as_f64()?, pos.get(0)?.as_f64()?)))
+            .collect()
+    }
+    let coords = &geometry["coordinates"];
+    let nested = |depth: usize| -> Vec<Vec<(f64, f64)>> {
+        let mut level = vec![coords];
+        for _ in 0..depth {
+            level = level
+                .into_iter()
+                .flat_map(|v| v.as_array().into_iter().flatten())
+                .collect();
+        }
+        level.into_iter().map(path).collect()
+    };
+    match geometry["type"].as_str() {
+        Some("LineString") => vec![path(coords)],
+        Some("MultiLineString") | Some("Polygon") => nested(1),
+        Some("MultiPolygon") => nested(2),
+        _ => Vec::new(),
+    }
 }
 
 /// Candidate → validated hits, best first. Empty = confirmed miss.
@@ -34,6 +128,8 @@ pub(crate) enum EvidenceKind {
     Place,
     /// A street mention geocoded via Nominatim.
     Geocoded,
+    /// Coordinates the source attached itself (GeoRSS, schema.org Event geo).
+    Coordinates,
 }
 
 /// One reason to believe an item is at a certain distance.
@@ -45,23 +141,34 @@ pub(crate) struct LocationEvidence {
     /// Found in the title, description or article lead rather than only
     /// further down the article body.
     pub(crate) prominent: bool,
+    /// Further tiers to subtract: a long street named without house number,
+    /// or an item the source files under another district.
+    pub(crate) penalty: i32,
 }
 
 impl LocationEvidence {
     /// Distance score, one tier lower for a mention buried in the article
-    /// body — those are mostly asides, lists of places or teasers.
+    /// body — those are mostly asides, lists of places or teasers — and lower
+    /// still by `penalty`.
     pub(crate) fn score(&self) -> i32 {
-        let score = distance_score(self.meters);
-        if self.prominent {
-            score
-        } else {
-            (score - 1).max(0)
-        }
+        let buried = i32::from(!self.prominent);
+        (distance_score(self.meters) - buried - self.penalty).max(0)
     }
 
     /// Real coordinates (as opposed to an implied or default distance).
     pub(crate) fn is_measured(&self) -> bool {
-        matches!(self.kind, EvidenceKind::Place | EvidenceKind::Geocoded)
+        matches!(
+            self.kind,
+            EvidenceKind::Place | EvidenceKind::Geocoded | EvidenceKind::Coordinates
+        )
+    }
+
+    /// Derived from the item's wording (as opposed to source-given data).
+    pub(crate) fn is_textual(&self) -> bool {
+        matches!(
+            self.kind,
+            EvidenceKind::Keyword | EvidenceKind::Place | EvidenceKind::Geocoded
+        )
     }
 }
 
@@ -462,7 +569,8 @@ pub(crate) async fn geocode_location(
     };
     let q = url_encode(&full);
     let url = format!(
-        "https://nominatim.openstreetmap.org/search?q={q}&format=json&addressdetails=1&limit=5"
+        "https://nominatim.openstreetmap.org/search?q={q}&format=json&addressdetails=1&limit=5\
+         &polygon_geojson=1&polygon_threshold=0.0001"
     );
     let resp: reqwest::Response = tokio::time::timeout(
         NOMINATIM_TIMEOUT,
@@ -477,6 +585,32 @@ pub(crate) async fn geocode_location(
         .map_err(|_| ())?;
     let results: serde_json::Value = serde_json::from_str(&body).map_err(|_| ())?;
     Ok(validated_hits(&results, query, city))
+}
+
+/// Bezirk (or Ortsteil when the city has no Bezirke) of `point`.
+pub(crate) async fn reverse_borough(
+    http: &reqwest::Client,
+    (lat, lon): (f64, f64),
+) -> Option<String> {
+    let url = format!(
+        "https://nominatim.openstreetmap.org/reverse?lat={lat}&lon={lon}&format=json&addressdetails=1"
+    );
+    let body = tokio::time::timeout(
+        NOMINATIM_TIMEOUT,
+        http.get(&url).header("Accept-Language", "de").send(),
+    )
+    .await
+    .ok()?
+    .ok()?
+    .text()
+    .await
+    .ok()?;
+    let json: serde_json::Value = serde_json::from_str(&body).ok()?;
+    let address = &json["address"];
+    ["borough", "city_district", "suburb"]
+        .iter()
+        .find_map(|field| address[*field].as_str())
+        .map(str::to_owned)
 }
 
 /// Address fields that name a street-like thing a mention can refer to.
@@ -544,6 +678,7 @@ pub(crate) fn validated_hits(
                 display_name: result["display_name"].as_str().map(str::to_owned),
                 suburb: field("suburb").or_else(|| field("quarter")),
                 borough: field("borough").or_else(|| field("city_district")),
+                shape: geojson_paths(&result["geojson"]),
             })
         })
         .collect()
@@ -603,11 +738,25 @@ pub(crate) async fn find_nearest_distance(
     cache: &GeocodeCache,
     limiter: &NominatimLimiter,
 ) -> DistanceLookup {
-    let candidates = extract_street_evidence(
-        &item.title,
-        item.description.as_deref(),
-        item.article_text.as_deref(),
-    );
+    // A declared event venue outranks anything the prose mentions.
+    let venue = item
+        .venue
+        .as_deref()
+        .map(extract_street_candidates)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|candidate| StreetEvidence {
+            candidate,
+            confidence: 7,
+            prominent: true,
+        });
+    let candidates: Vec<StreetEvidence> = venue
+        .chain(extract_street_evidence(
+            &item.title,
+            item.description.as_deref(),
+            item.article_text.as_deref(),
+        ))
+        .collect();
     if candidates.is_empty() {
         return DistanceLookup::NoMatch;
     }
@@ -649,13 +798,20 @@ pub(crate) async fn find_nearest_distance(
                 }
             }
         };
-        let Some(hit) = pick_hit(&hits, text) else {
+        let Some((dist, farthest, hit)) =
+            street_distance(&hits, text, item.district.as_deref(), (ref_lat, ref_lon))
+        else {
             continue;
         };
-        let dist = haversine_meters(ref_lat, ref_lon, hit.lat, hit.lon);
         if dist >= 20_000.0 {
             continue;
         }
+        let has_house_number = street_without_house_number(&candidate) != candidate;
+        let penalty = if has_house_number {
+            0
+        } else {
+            vagueness_penalty(dist, farthest)
+        };
         let replace = best.as_ref().is_none_or(|(best_conf, best_ev)| {
             evidence.confidence > *best_conf
                 || (evidence.confidence == *best_conf && dist < best_ev.meters)
@@ -673,6 +829,7 @@ pub(crate) async fn find_nearest_distance(
                     label,
                     kind: EvidenceKind::Geocoded,
                     prominent: evidence.prominent,
+                    penalty,
                 },
             ));
         }
@@ -686,18 +843,69 @@ pub(crate) async fn find_nearest_distance(
     }
 }
 
-/// Nominatim's best hit, unless the item names the Ortsteil or Bezirk of
-/// another one — many street names ("Bahnhofstraße", "Dorfstraße") exist
-/// several times in one city.
-pub(crate) fn pick_hit<'a>(hits: &'a [GeocodeHit], text: &ItemText) -> Option<&'a GeocodeHit> {
-    hits.iter()
-        .find(|hit| {
+/// Nominatim's best hit, unless the source files the item under the Bezirk
+/// of another one or the item names its Ortsteil or Bezirk — many street
+/// names ("Bahnhofstraße", "Dorfstraße") exist several times in one city.
+/// The flag says whether a district pinned the choice.
+pub(crate) fn pick_hit<'a>(
+    hits: &'a [GeocodeHit],
+    text: &ItemText,
+    district: Option<&str>,
+) -> Option<(&'a GeocodeHit, bool)> {
+    let filed_under = |hit: &&GeocodeHit| {
+        district.is_some_and(|d| {
             [&hit.suburb, &hit.borough]
                 .into_iter()
                 .flatten()
-                .any(|district| text.contains(district))
+                .any(|name| normalize(name) == normalize(d))
         })
-        .or_else(|| hits.first())
+    };
+    let named = |hit: &&GeocodeHit| {
+        [&hit.suburb, &hit.borough]
+            .into_iter()
+            .flatten()
+            .any(|name| text.contains(name))
+    };
+    hits.iter()
+        .find(filed_under)
+        .or_else(|| hits.iter().find(named))
+        .map(|hit| (hit, true))
+        .or_else(|| hits.first().map(|hit| (hit, false)))
+}
+
+/// Same-named hits this far apart are different streets, not segments of one.
+const SAME_STREET_SPAN_METERS: f64 = 5_000.0;
+
+/// (nearest, farthest, hit to label with) for the street a candidate names.
+/// Nominatim returns a long street as separate segments, often in several
+/// Ortsteile; together they are the street's extent — an incident "on the
+/// Frankfurter Allee" lies somewhere along it. A district pinning the choice
+/// narrows the extent to that district's segments.
+pub(crate) fn street_distance<'a>(
+    hits: &'a [GeocodeHit],
+    text: &ItemText,
+    district: Option<&str>,
+    point: (f64, f64),
+) -> Option<(f64, f64, &'a GeocodeHit)> {
+    let (picked, pinned) = pick_hit(hits, text, district)?;
+    let area = |hit: &GeocodeHit| hit.suburb.clone().or_else(|| hit.borough.clone());
+    let segments = hits.iter().filter(|hit| {
+        if pinned {
+            area(hit) == area(picked)
+        } else {
+            haversine_meters(picked.lat, picked.lon, hit.lat, hit.lon) < SAME_STREET_SPAN_METERS
+        }
+    });
+    let mut nearest = (f64::INFINITY, picked);
+    let mut farthest = 0.0_f64;
+    for hit in segments {
+        let (near, far) = hit.distance_range(point);
+        if near < nearest.0 {
+            nearest = (near, hit);
+        }
+        farthest = farthest.max(far);
+    }
+    Some((nearest.0, farthest, nearest.1))
 }
 
 /// Every `[[filter.places]]` entry the item mentions, by name or alias.
@@ -730,6 +938,7 @@ pub(crate) fn find_configured_places(
                 label: place.name.clone(),
                 kind: EvidenceKind::Place,
                 prominent,
+                penalty: 0,
             });
         }
     }
@@ -858,6 +1067,7 @@ mod tests {
             display_name: None,
             suburb: Some(suburb.to_owned()),
             borough: None,
+            shape: Vec::new(),
         };
         let hits = vec![hit("Mahlsdorf", 52.51), hit("Köpenick", 52.44)];
         let text = |title: &str| ItemText {
@@ -865,17 +1075,17 @@ mod tests {
             rest: String::new(),
         };
 
+        let pick = |title: &str, district| pick_hit(&hits, &text(title), district).unwrap();
+
         assert_eq!(
-            pick_hit(&hits, &text("Brand in der Bahnhofstraße in Köpenick"))
-                .unwrap()
-                .lat,
+            pick("Brand in der Bahnhofstraße in Köpenick", None).0.lat,
             52.44
         );
+        assert_eq!(pick("Brand in der Bahnhofstraße", None).0.lat, 52.51);
+        assert!(!pick("Brand in der Bahnhofstraße", None).1);
         assert_eq!(
-            pick_hit(&hits, &text("Brand in der Bahnhofstraße"))
-                .unwrap()
-                .lat,
-            52.51
+            pick("Brand in der Bahnhofstraße", Some("Köpenick")).0.lat,
+            52.44
         );
     }
 
@@ -886,6 +1096,7 @@ mod tests {
             label: String::new(),
             kind,
             prominent,
+            penalty: 0,
         };
 
         let best = best_evidence(vec![
@@ -913,5 +1124,77 @@ mod tests {
 
         assert!(relevant.contains("Kontaktbereichsbeamte"));
         assert!(!relevant.contains("Luftbrücke"));
+    }
+
+    #[test]
+    fn long_street_is_measured_at_its_nearest_point_and_marked_vague() {
+        // A 4 km east-west street passing 100 m north of the reference point.
+        let reference = (52.5136, 13.4705);
+        let street = GeocodeHit {
+            lat: 52.5145,
+            lon: 13.43,
+            display_name: None,
+            suburb: None,
+            borough: None,
+            shape: geojson_paths(&json!({
+                "type": "LineString",
+                "coordinates": [[13.43, 52.5145], [13.4705, 52.5145], [13.49, 52.5145]]
+            })),
+        };
+
+        let (nearest, farthest) = street.distance_range(reference);
+
+        assert!((95.0..105.0).contains(&nearest), "{nearest}");
+        assert!(farthest > 2_700.0, "{farthest}");
+        assert_eq!(vagueness_penalty(nearest, farthest), 1);
+        assert_eq!(vagueness_penalty(100.0, 400.0), 0);
+    }
+
+    #[test]
+    fn geojson_polygons_and_multilines_become_paths() {
+        let polygon =
+            json!({"type": "Polygon", "coordinates": [[[13.0, 52.0], [13.1, 52.0], [13.1, 52.1]]]});
+        let multi = json!({"type": "MultiPolygon", "coordinates": [[[[13.0, 52.0], [13.1, 52.0]]], [[[14.0, 53.0]]]]});
+
+        assert_eq!(
+            geojson_paths(&polygon),
+            vec![vec![(52.0, 13.0), (52.0, 13.1), (52.1, 13.1)]]
+        );
+        assert_eq!(geojson_paths(&multi).len(), 2);
+        assert!(geojson_paths(&json!({"type": "Point", "coordinates": [13.0, 52.0]})).is_empty());
+    }
+
+    #[test]
+    fn street_segments_form_one_extent_unless_a_district_pins_one() {
+        let segment = |suburb: &str, lon1: f64, lon2: f64| GeocodeHit {
+            lat: 52.5145,
+            lon: lon1,
+            display_name: None,
+            suburb: Some(suburb.to_owned()),
+            borough: None,
+            shape: vec![vec![(52.5145, lon1), (52.5145, lon2)]],
+        };
+        // Segments of one street running east from the reference point, as
+        // Nominatim returns the Frankfurter Allee.
+        let hits = vec![
+            segment("Lichtenberg", 13.49, 13.50),
+            segment("Friedrichshain", 13.465, 13.475),
+            segment("Lichtenberg", 13.50, 13.51),
+        ];
+        let text = |t: &str| ItemText {
+            prominent: normalize(t),
+            rest: String::new(),
+        };
+        let reference = (52.5136, 13.4705);
+
+        let (near, far, hit) = street_distance(&hits, &text("Unfall"), None, reference).unwrap();
+        assert!(near < 150.0, "{near}");
+        assert!(far > 2_500.0, "{far}");
+        assert_eq!(hit.suburb.as_deref(), Some("Friedrichshain"));
+
+        let (near, _, hit) =
+            street_distance(&hits, &text("Unfall in Lichtenberg"), None, reference).unwrap();
+        assert!(near > 1_000.0, "{near}");
+        assert_eq!(hit.suburb.as_deref(), Some("Lichtenberg"));
     }
 }

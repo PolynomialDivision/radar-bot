@@ -4,7 +4,7 @@ use super::*;
 
 // ── Feed item ─────────────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub(crate) struct FeedItem {
     pub(crate) guid: String,
     pub(crate) title: String,
@@ -33,6 +33,17 @@ pub(crate) struct FeedItem {
     /// Unix timestamp from <pubDate> / <published> / <updated>. None if missing or unparseable.
     #[serde(default)]
     pub(crate) published_at: Option<i64>,
+    /// Coordinates the source itself attaches (GeoRSS in the feed, schema.org
+    /// Event geo on the page), as (lat, lon).
+    #[serde(default)]
+    pub(crate) coords: Option<(f64, f64)>,
+    /// Street address of an event venue declared on the page (schema.org Event).
+    #[serde(default)]
+    pub(crate) venue: Option<String>,
+    /// District the source files the item under, e.g. the "Ereignisort" of a
+    /// Polizei Berlin report.
+    #[serde(default)]
+    pub(crate) district: Option<String>,
 }
 
 // ── HTML utilities ────────────────────────────────────────────────────────────
@@ -146,10 +157,20 @@ pub(crate) fn decode_entities(s: &str) -> String {
 pub(crate) fn parse_feed(xml: &str, source_name: &str) -> Vec<FeedItem> {
     match feed_rs::parser::parse(xml.as_bytes()) {
         Ok(feed) => {
+            let coords = feed_item_coords(xml);
             let items: Vec<FeedItem> = feed
                 .entries
                 .into_iter()
                 .filter_map(|entry| normalize_feed_entry(entry, source_name))
+                .map(|mut item| {
+                    item.coords = coords.get(&item.guid).copied().or_else(|| {
+                        item.link
+                            .as_ref()
+                            .and_then(|link| coords.get(link))
+                            .copied()
+                    });
+                    item
+                })
                 .collect();
             if !items.is_empty() {
                 return items;
@@ -231,7 +252,79 @@ pub(crate) fn normalize_feed_entry(
         distance_meters: None,
         location_label: None,
         published_at,
+        ..Default::default()
     })
+}
+
+/// Per-item coordinates from GeoRSS (`<georss:point>lat lon</georss:point>`)
+/// or W3C geo (`<geo:lat>`/`<geo:long>`), keyed by the item's guid/id and
+/// link. feed-rs does not expose these extensions.
+pub(crate) fn feed_item_coords(xml: &str) -> HashMap<String, (f64, f64)> {
+    let mut map = HashMap::new();
+    for tag in ["item", "entry"] {
+        let open = format!("<{tag}");
+        let close = format!("</{tag}>");
+        for block in xml.split(&open).skip(1) {
+            // Skip e.g. "<itemizedlist": the tag name must end here.
+            if !block.starts_with(['>', ' ', '\n', '\r', '\t']) {
+                continue;
+            }
+            let item = &block[..block.find(&close).unwrap_or(block.len())];
+            let point = xml_text(item, "georss:point").and_then(|p| {
+                let mut parts = p.split_whitespace().map(str::parse::<f64>);
+                Some((parts.next()?.ok()?, parts.next()?.ok()?))
+            });
+            let point = point.or_else(|| {
+                let lat = xml_text(item, "geo:lat")?.parse().ok()?;
+                let lon = xml_text(item, "geo:long")?.parse().ok()?;
+                Some((lat, lon))
+            });
+            let Some(point) = point else { continue };
+            let keys = [
+                xml_text(item, "guid"),
+                xml_text(item, "id"),
+                xml_text(item, "link"),
+                xml_attr_of(item, "link", "href"),
+            ];
+            for key in keys.into_iter().flatten() {
+                map.insert(key, point);
+            }
+        }
+    }
+    map
+}
+
+/// Trimmed text content of the first `<tag …>…</tag>` in `xml`, CDATA unwrapped.
+pub(crate) fn xml_text(xml: &str, tag: &str) -> Option<String> {
+    let open = format!("<{tag}");
+    let close = format!("</{tag}>");
+    let mut from = 0;
+    while let Some(pos) = xml[from..].find(&open) {
+        let start = from + pos + open.len();
+        from = start;
+        if !xml[start..].starts_with(['>', ' ']) {
+            continue; // "<link" must not match "<linkx"
+        }
+        let content_start = start + xml[start..].find('>')? + 1;
+        if xml[..content_start].ends_with("/>") {
+            continue;
+        }
+        let end = content_start + xml[content_start..].find(&close)?;
+        let text = xml[content_start..end].trim();
+        let text = text
+            .strip_prefix("<![CDATA[")
+            .and_then(|t| t.strip_suffix("]]>"))
+            .unwrap_or(text)
+            .trim();
+        return (!text.is_empty()).then(|| decode_entities(text));
+    }
+    None
+}
+
+fn xml_attr_of(xml: &str, tag: &str, attr: &str) -> Option<String> {
+    let start = xml.find(&format!("<{tag} "))?;
+    let end = start + xml[start..].find('>')?;
+    attr_value(&xml[start..=end], attr).map(|v| decode_entities(&v))
 }
 
 pub(crate) fn preferred_entry_link(entry: &feed_rs::model::Entry) -> Option<String> {
@@ -471,6 +564,7 @@ mod feed_tests {
             distance_meters: Some(1500.0),
             location_label: Some("Rigaer Straße".to_owned()),
             published_at: None,
+            ..Default::default()
         };
         let mut b = a.clone();
         b.guid = "candidate-b".to_owned();
@@ -580,6 +674,7 @@ mod feed_tests {
             distance_meters: None,
             location_label: None,
             published_at: None,
+            ..Default::default()
         };
 
         let hits = find_configured_places(&ItemText::of(&item), &filter, Some((52.5070, 13.4540)));
@@ -613,6 +708,7 @@ mod feed_tests {
             distance_meters: None,
             location_label: None,
             published_at: None,
+            ..Default::default()
         };
 
         let hits = find_configured_places(&ItemText::of(&item), &filter, Some((52.5070, 13.4540)));
@@ -642,6 +738,7 @@ mod feed_tests {
             distance_meters: None,
             location_label: None,
             published_at: None,
+            ..Default::default()
         };
 
         let hit = keyword_check(&item, &filter, &[]).expect("keyword check should pass");
@@ -664,5 +761,25 @@ mod feed_tests {
 
         assert!(candidates.iter().any(|c| c.contains("Rigaer Straße")));
         assert!(!candidates.iter().any(|c| c.contains("Alexanderplatz")));
+    }
+
+    #[test]
+    fn georss_and_w3c_geo_coordinates_are_attached_to_items() {
+        let xml = r#"<?xml version="1.0"?>
+<rss version="2.0" xmlns:georss="http://www.georss.org/georss" xmlns:geo="http://www.w3.org/2003/01/geo/wgs84_pos#">
+  <channel><title>T</title><link>https://t.test/</link><description>d</description>
+    <item><title>A</title><link>https://t.test/a</link><guid isPermaLink="false">a-1</guid>
+      <georss:point>52.5136 13.4705</georss:point></item>
+    <item><title>B</title><link>https://t.test/b</link>
+      <geo:lat>52.50</geo:lat><geo:long>13.45</geo:long></item>
+    <item><title>C</title><link>https://t.test/c</link></item>
+  </channel>
+</rss>"#;
+
+        let items = parse_feed(xml, "Geo");
+
+        assert_eq!(items[0].coords, Some((52.5136, 13.4705)));
+        assert_eq!(items[1].coords, Some((52.50, 13.45)));
+        assert_eq!(items[2].coords, None);
     }
 }

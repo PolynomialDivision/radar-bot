@@ -124,6 +124,100 @@ pub(crate) struct ArticleFetch {
     pub(crate) link_note: Option<String>,
     /// Publish date the page itself declares, if any.
     pub(crate) published_at: Option<i64>,
+    /// Venue of a schema.org Event on the page.
+    pub(crate) event: EventLocation,
+    /// District the page files the item under (Polizei Berlin "Ereignisort").
+    pub(crate) district: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+pub(crate) struct EventLocation {
+    pub(crate) coords: Option<(f64, f64)>,
+    pub(crate) address: Option<String>,
+}
+
+/// Where a schema.org `Event` in the page's JSON-LD takes place. Only Event
+/// objects are read — publisher `Organization` blocks carry the newsroom's
+/// own address, which says nothing about the story.
+pub(crate) fn page_event_location(html: &str) -> EventLocation {
+    for (tag, body) in tag_blocks(html, "script") {
+        if !attr_value(tag, "type").is_some_and(|t| t.eq_ignore_ascii_case("application/ld+json")) {
+            continue;
+        }
+        let Ok(json) = serde_json::from_str::<serde_json::Value>(body.trim()) else {
+            continue;
+        };
+        if let Some(found) = find_event_location(&json) {
+            return found;
+        }
+    }
+    EventLocation::default()
+}
+
+fn find_event_location(value: &serde_json::Value) -> Option<EventLocation> {
+    match value {
+        serde_json::Value::Array(items) => items.iter().find_map(find_event_location),
+        serde_json::Value::Object(obj) => {
+            let is_event = match &obj.get("@type") {
+                Some(serde_json::Value::String(t)) => t.ends_with("Event"),
+                Some(serde_json::Value::Array(ts)) => ts
+                    .iter()
+                    .any(|t| t.as_str().is_some_and(|t| t.ends_with("Event"))),
+                _ => false,
+            };
+            if is_event {
+                let location = obj.get("location")?;
+                let location = location
+                    .as_array()
+                    .and_then(|l| l.first())
+                    .unwrap_or(location);
+                let found = EventLocation {
+                    coords: json_ld_geo(&location["geo"]),
+                    address: json_ld_address(&location["address"])
+                        .or_else(|| location.as_str().map(str::to_owned)),
+                };
+                return (found != EventLocation::default()).then_some(found);
+            }
+            obj.get("@graph").and_then(find_event_location)
+        }
+        _ => None,
+    }
+}
+
+fn json_ld_number(value: &serde_json::Value) -> Option<f64> {
+    value
+        .as_f64()
+        .or_else(|| value.as_str()?.trim().parse().ok())
+}
+
+fn json_ld_geo(geo: &serde_json::Value) -> Option<(f64, f64)> {
+    let lat = json_ld_number(&geo["latitude"])?;
+    let lon = json_ld_number(&geo["longitude"])?;
+    ((-90.0..=90.0).contains(&lat) && (-180.0..=180.0).contains(&lon)).then_some((lat, lon))
+}
+
+fn json_ld_address(address: &serde_json::Value) -> Option<String> {
+    if let Some(text) = address.as_str() {
+        return Some(text.trim().to_owned()).filter(|t| !t.is_empty());
+    }
+    let parts: Vec<&str> = ["streetAddress", "postalCode", "addressLocality"]
+        .iter()
+        .filter_map(|key| address[*key].as_str())
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .collect();
+    (!parts.is_empty()).then(|| parts.join(" "))
+}
+
+/// The district a page files its story under: Polizei Berlin reports carry
+/// `<p class="polizeimeldung" title="Ereignisort">Friedrichshain-Kreuzberg</p>`.
+pub(crate) fn page_district(html: &str) -> Option<String> {
+    let lower = html.to_lowercase();
+    let pos = lower.find("title=\"ereignisort\"")?;
+    let start = pos + html[pos..].find('>')? + 1;
+    let end = start + html[start..].find('<')?;
+    let district = decode_entities(html[start..end].trim());
+    (!district.is_empty()).then_some(district)
 }
 
 /// Publish date from the page's metadata: Open Graph / article meta tags or
@@ -430,6 +524,8 @@ pub(crate) async fn fetch_article(
                 resolved_link,
                 link_note,
                 published_at: page_published_at(&html),
+                event: page_event_location(&html),
+                district: page_district(&html),
             })
         }
     })
@@ -452,5 +548,40 @@ mod tests {
         assert_eq!(page_published_at(meta), Some(1_709_276_400));
         assert_eq!(page_published_at(json_ld), Some(1_709_276_400));
         assert_eq!(page_published_at("<p>no date</p>"), None);
+    }
+
+    #[test]
+    fn event_venue_comes_from_event_json_ld_not_the_publisher() {
+        let html = r#"<script type="application/ld+json">{"@context":"https://schema.org","@graph":[
+            {"@type":"Organization","name":"rbb","address":{"streetAddress":"Masurenallee 8-14"}},
+            {"@type":"MusicEvent","name":"Konzert","location":{"@type":"Place","name":"Cassiopeia",
+             "address":{"@type":"PostalAddress","streetAddress":"Revaler Str. 99","postalCode":"10245","addressLocality":"Berlin"},
+             "geo":{"@type":"GeoCoordinates","latitude":"52.5075","longitude":13.4539}}}]}</script>"#;
+
+        let event = page_event_location(html);
+
+        assert_eq!(event.coords, Some((52.5075, 13.4539)));
+        assert_eq!(
+            event.address.as_deref(),
+            Some("Revaler Str. 99 10245 Berlin")
+        );
+
+        let publisher_only = r#"<script type="application/ld+json">{"@type":"NewsArticle",
+            "publisher":{"@type":"Organization","address":{"streetAddress":"Masurenallee 8-14"}}}</script>"#;
+        assert_eq!(
+            page_event_location(publisher_only),
+            EventLocation::default()
+        );
+    }
+
+    #[test]
+    fn police_report_district_is_read_from_the_ereignisort_tag() {
+        let html = r#"<p class="polizeimeldung">Polizeimeldung vom 26.09.2026</p><p class="polizeimeldung" title="Ereignisort">Friedrichshain-Kreuzberg</p>"#;
+
+        assert_eq!(
+            page_district(html).as_deref(),
+            Some("Friedrichshain-Kreuzberg")
+        );
+        assert_eq!(page_district("<p>kein Tag</p>"), None);
     }
 }

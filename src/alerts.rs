@@ -31,6 +31,8 @@ pub struct AlertConfig {
     pub ref_point: Option<(f64, f64)>,
     /// DWD warning region keywords, e.g. ["Berlin"]. Empty = skip direct DWD warnings.
     pub dwd_region_keywords: Vec<String>,
+    /// How long before its start a DWD warning is posted.
+    pub dwd_lead: Duration,
     /// Drop USGS events farther than this from ref_point. None = send all.
     pub max_distance_km: Option<f64>,
     pub poll_interval_secs: u64,
@@ -122,6 +124,7 @@ pub async fn alert_loop(client: Bot, http: reqwest::Client, db: Db, config: Aler
                 &http,
                 &db,
                 &config.dwd_region_keywords,
+                config.dwd_lead,
                 config.ref_point,
                 &mut dwd_area_cache,
                 reconcile_active_messages,
@@ -354,11 +357,13 @@ fn format_nina_description(data: &serde_json::Value) -> String {
 
 // ── DWD weather warnings ─────────────────────────────────────────────────────
 
+#[allow(clippy::too_many_arguments)]
 async fn check_dwd_weather_warnings(
     client: &Bot,
     http: &reqwest::Client,
     db: &Db,
     region_keywords: &[String],
+    lead: Duration,
     ref_point: Option<(f64, f64)>,
     area_cache: &mut HashMap<String, bool>,
     reconcile_active_messages: bool,
@@ -420,7 +425,8 @@ async fn check_dwd_weather_warnings(
                 }
                 let start_ms = w["start"].as_i64().unwrap_or(0);
                 let end_ms = w["end"].as_i64().unwrap_or(i64::MAX);
-                if !dwd_warning_is_relevant_now(bucket, start_ms, end_ms, now_ms) {
+                let lead_ms = i64::try_from(lead.as_millis()).unwrap_or(i64::MAX);
+                if !dwd_warning_is_relevant_now(bucket, start_ms, end_ms, now_ms, lead_ms) {
                     continue;
                 }
                 if let Some(point) = ref_point {
@@ -920,14 +926,22 @@ fn matches_region(region: &str, keywords: &[String]) -> bool {
     })
 }
 
-fn dwd_warning_is_relevant_now(bucket: &str, start_ms: i64, end_ms: i64, now_ms: i64) -> bool {
+/// Active warnings, warnings starting within `lead_ms`, and every
+/// Vorabinformation that has not ended yet.
+fn dwd_warning_is_relevant_now(
+    bucket: &str,
+    start_ms: i64,
+    end_ms: i64,
+    now_ms: i64,
+    lead_ms: i64,
+) -> bool {
     if end_ms < now_ms {
         return false;
     }
     if bucket == "vorabInformation" {
         return true;
     }
-    start_ms <= now_ms
+    start_ms <= now_ms.saturating_add(lead_ms)
 }
 
 fn dwd_primary_rank(
@@ -1514,7 +1528,6 @@ async fn check_gdacs(
     .await
     .context("GDACS response read failed")?;
 
-    let coords = gdacs_coords(&xml);
     let cutoff = chrono::Utc::now().timestamp() - 48 * 3600;
 
     for item in crate::parse_feed(&xml, "GDACS") {
@@ -1530,8 +1543,8 @@ async fn check_gdacs(
 
         // Distance filter using <geo:lat>/<geo:long> from the RSS item.
         if let (Some(max_km), Some((ref_lat, ref_lon))) = (max_distance_km, ref_point) {
-            match coords.get(&item.guid) {
-                Some(&(lat, lon)) if haversine_km(ref_lat, ref_lon, lat, lon) <= max_km => {}
+            match item.coords {
+                Some((lat, lon)) if haversine_km(ref_lat, ref_lon, lat, lon) <= max_km => {}
                 Some(_) => continue, // too far
                 None => continue,    // no coordinates — can't verify proximity, skip
             }
@@ -1541,7 +1554,7 @@ async fn check_gdacs(
             continue;
         }
 
-        let desc = format_gdacs_description(&item, coords.get(&item.guid).copied());
+        let desc = format_gdacs_description(&item, item.coords);
         let (plain, html) = format_alert("GDACS", &item.title, &desc, item.link.as_deref());
         if crate::post_to_rooms(client, &plain, &html).await {
             db.mark_alert_seen(&item.guid, "gdacs").await?;
@@ -1555,30 +1568,6 @@ async fn check_gdacs(
     }
 
     Ok(())
-}
-
-/// Extract a map of guid → (lat, lon) from GDACS RSS XML.
-/// GDACS includes <geo:lat> and <geo:long> per item.
-fn gdacs_coords(xml: &str) -> std::collections::HashMap<String, (f64, f64)> {
-    let mut map = std::collections::HashMap::new();
-    for block in xml.split("<item>").skip(1) {
-        let item = &block[..block.find("</item>").unwrap_or(block.len())];
-        let guid = xml_tag(item, "guid");
-        let lat = xml_tag(item, "geo:lat").and_then(|s| s.parse::<f64>().ok());
-        let lon = xml_tag(item, "geo:long").and_then(|s| s.parse::<f64>().ok());
-        if let (Some(guid), Some(lat), Some(lon)) = (guid, lat, lon) {
-            map.insert(guid, (lat, lon));
-        }
-    }
-    map
-}
-
-fn xml_tag(xml: &str, tag: &str) -> Option<String> {
-    let open = format!("<{tag}>");
-    let close = format!("</{tag}>");
-    let start = xml.find(&open)? + open.len();
-    let end = xml[start..].find(&close)? + start;
-    Some(xml[start..end].trim().to_owned())
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -2037,21 +2026,38 @@ mod tests {
     }
 
     #[test]
-    fn dwd_future_vorabinformation_is_relevant_but_future_warning_is_not() {
-        let now = 1_000;
+    fn dwd_warnings_are_relevant_within_the_lead_time_vorab_always() {
+        const HOUR: i64 = 3_600_000;
+        let now = 100 * HOUR;
+        let lead = 3 * HOUR;
 
         assert!(dwd_warning_is_relevant_now(
             "vorabInformation",
-            2_000,
-            3_000,
-            now
+            now + 20 * HOUR,
+            now + 30 * HOUR,
+            now,
+            lead
         ));
-        assert!(!dwd_warning_is_relevant_now("warnings", 2_000, 3_000, now));
+        assert!(dwd_warning_is_relevant_now(
+            "warnings",
+            now + 2 * HOUR,
+            now + 5 * HOUR,
+            now,
+            lead
+        ));
+        assert!(!dwd_warning_is_relevant_now(
+            "warnings",
+            now + 4 * HOUR,
+            now + 6 * HOUR,
+            now,
+            lead
+        ));
         assert!(!dwd_warning_is_relevant_now(
             "vorabInformation",
-            500,
-            900,
-            now
+            now - 5 * HOUR,
+            now - HOUR,
+            now,
+            lead
         ));
     }
 
