@@ -137,7 +137,7 @@ pub(crate) struct EventLocation {
 }
 
 /// Where a schema.org `Event` in the page's JSON-LD takes place. Only Event
-/// objects are read — publisher `Organization` blocks carry the newsroom's
+/// objects are read: publisher `Organization` blocks carry the newsroom's
 /// own address, which says nothing about the story.
 pub(crate) fn page_event_location(html: &str) -> EventLocation {
     for (tag, body) in tag_blocks(html, "script") {
@@ -221,7 +221,7 @@ pub(crate) fn page_district(html: &str) -> Option<String> {
 }
 
 /// Publish date from the page's metadata: Open Graph / article meta tags or
-/// schema.org JSON-LD `datePublished`. Modification dates are ignored — an
+/// schema.org JSON-LD `datePublished`. Modification dates are ignored. An
 /// updated old article is still an old event.
 pub(crate) fn page_published_at(html: &str) -> Option<i64> {
     const META_NAMES: &[&str] = &[

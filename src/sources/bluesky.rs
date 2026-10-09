@@ -53,7 +53,7 @@ impl BlueskyAdapter {
                 *lock = Some(new_sess);
                 return Some(token);
             }
-            warn!("Bluesky token refresh failed — re-authenticating");
+            warn!("Bluesky token refresh failed, re-authenticating");
         }
 
         match create_session(http, &self.identifier, &self.password).await {
@@ -249,7 +249,7 @@ async fn parse_session_response(resp: reqwest::Response, op: &str) -> Option<Blu
 
     if let Some(err) = json["error"].as_str() {
         warn!(
-            "Bluesky {op} error: {} — {}",
+            "Bluesky {op} error: {}, {}",
             err,
             json["message"].as_str().unwrap_or("")
         );

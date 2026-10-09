@@ -35,54 +35,50 @@ impl DigestItem {
     }
 }
 
+/// One item per block, laid out for a phone: the title on its own line, then
+/// source and score, then the place, then the link. A blank line separates
+/// the items.
 pub(crate) fn format_digest(items: &[DigestItem], header: &str) -> (String, String) {
-    let mut plain = vec![format!("📡 {header}\n")];
-    let mut html = vec![format!("📡 <strong>{}</strong><br>", html_escape(header))];
+    let mut plain = vec![format!("📡 {header}")];
+    let mut html = vec![format!("📡 <strong>{}</strong>", html_escape(header))];
 
     for item in items {
-        let src = &item.source_name;
+        let color = score_color(item.score);
+        plain.push(String::new());
+        html.push(String::new());
+        plain.push(format!("{color} {}", item.title));
+        html.push(format!(
+            "{color} <strong>{}</strong>",
+            html_escape(&item.title)
+        ));
 
-        let mut info_parts: Vec<String> = Vec::new();
+        let mut meta = vec![format!("📰 {}", item.source_name)];
         if item.max_score > 0 {
-            info_parts.push(format!("{}/{}", item.score, item.max_score));
+            meta.push(format!("⭐ {}/{}", item.score, item.max_score));
         }
         if item.source_count > 1 {
-            info_parts.push(format!("{} sources", item.source_count));
+            meta.push(format!("👥 {} sources", item.source_count));
         }
+        let meta = meta.join(" · ");
+        plain.push(meta.clone());
+        html.push(html_escape(&meta));
+
         let label = item
             .location_label
             .as_deref()
             .map(str::trim)
             .filter(|label| !label.is_empty());
-        match (item.distance_meters, label) {
-            (Some(d), Some(label)) => {
-                info_parts.push(format!("{} · {}", format_distance(d), label))
-            }
-            (Some(d), None) => info_parts.push(format_distance(d)),
-            (None, Some(label)) => info_parts.push(label.to_owned()),
-            (None, None) => {}
+        let place = match (item.distance_meters, label) {
+            (Some(d), Some(label)) => Some(format!("📍 {} · {}", format_distance(d), label)),
+            (Some(d), None) => Some(format!("📍 {}", format_distance(d))),
+            (None, Some(label)) => Some(format!("📍 {label}")),
+            (None, None) => None,
+        };
+        if let Some(place) = place {
+            html.push(html_escape(&place));
+            plain.push(place);
         }
-        let info_plain = if info_parts.is_empty() {
-            String::new()
-        } else {
-            format!(" [{}]", info_parts.join(" "))
-        };
-        let info_html = if info_parts.is_empty() {
-            String::new()
-        } else {
-            format!(" <em>[{}]</em>", html_escape(&info_parts.join(" ")))
-        };
 
-        let link_p = item
-            .link
-            .as_deref()
-            .map(|l| format!(" — {l}"))
-            .unwrap_or_default();
-        let link_h = item
-            .link
-            .as_deref()
-            .map(|l| format!(" — <a href=\"{}\">link</a>", html_escape(l)))
-            .unwrap_or_default();
         let note_p = item
             .link_note
             .as_deref()
@@ -93,21 +89,16 @@ pub(crate) fn format_digest(items: &[DigestItem], header: &str) -> (String, Stri
             .as_deref()
             .map(|note| format!(" <em>({})</em>", html_escape(note)))
             .unwrap_or_default();
-        let color = score_color(item.score);
-        plain.push(format!(
-            "{color} [{src}] {}{info_plain}{link_p}{note_p}",
-            item.title
-        ));
-        html.push(format!(
-            "{color} <em>[{}]</em> {}{info_html}{link_h}{note_h}<br>",
-            html_escape(src),
-            html_escape(&item.title)
-        ));
+        if let Some(link) = item.link.as_deref() {
+            plain.push(format!("🔗 {link}{note_p}"));
+            html.push(format!(
+                "🔗 <a href=\"{}\">Open</a>{note_h}",
+                html_escape(link)
+            ));
+        }
     }
 
-    let html_out = html.join("");
-    let html_out = html_out.trim_end_matches("<br>").to_owned();
-    (plain.join("\n").trim_end().to_owned(), html_out)
+    (plain.join("\n"), html.join("<br>"))
 }
 
 pub(crate) fn unique_source_names(names: &[String]) -> Vec<String> {
@@ -530,7 +521,7 @@ pub(crate) async fn digest_loop(
         .collect();
 
     if targets.is_empty() {
-        warn!("No valid digest_times configured — digest loop disabled");
+        warn!("No valid digest_times configured, digest loop disabled");
         return;
     }
 
@@ -581,7 +572,7 @@ pub(crate) async fn digest_loop(
         let (items, repeats) = split_already_posted(items, &posted);
         if !repeats.is_empty() {
             info!(
-                "Digest: {} item(s) repeat an already posted story — not posting",
+                "Digest: {} item(s) repeat an already posted story, not posting",
                 repeats.len()
             );
             let guids: Vec<String> = repeats.into_iter().map(|item| item.guid).collect();
@@ -594,12 +585,12 @@ pub(crate) async fn digest_loop(
         }
 
         if items.is_empty() {
-            info!("Digest: no pending items — staying silent");
+            info!("Digest: no pending items, staying silent");
             continue;
         }
 
         let day_str = Local::now().format("%A, %d %b %Y").to_string();
-        let header = format!("Digest — {day_str}");
+        let header = format!("Digest · {day_str}");
         let clustered_items = cluster_digest_items(items);
         info!(
             "Posting digest with {} clustered item(s)",
@@ -624,7 +615,7 @@ pub(crate) async fn digest_loop(
                 }
             } else {
                 warn!(
-                    "Digest: post failed — requeueing {} item(s) for retry",
+                    "Digest: post failed, requeueing {} item(s) for retry",
                     guids.len()
                 );
                 db.requeue_failed(&guids, "post_to_rooms failed").await.ok();
@@ -678,7 +669,7 @@ mod tests {
 
     #[test]
     fn city_wide_items_with_related_titles_stay_separate() {
-        // Both only carry the source default — nothing says they happened at
+        // Both only carry the source default. Nothing says they happened at
         // the same place, so "Brand in Wohnung" alone must not merge them.
         let a = db_item(
             "a",
@@ -753,6 +744,7 @@ mod tests {
 
         let (plain, _) = format_digest(&[item], "Test");
 
-        assert!(plain.contains("[2/5 Friedrichshain]"));
+        assert!(plain.contains("⭐ 2/5"));
+        assert!(plain.contains("📍 Friedrichshain"));
     }
 }

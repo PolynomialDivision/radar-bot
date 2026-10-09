@@ -12,10 +12,7 @@ pub struct RssAdapter {
 impl RssAdapter {
     pub async fn fetch_items(&self, http: &reqwest::Client) -> Vec<FeedItem> {
         if self.url.trim().is_empty() {
-            warn!(
-                "RSS source '{}' has no URL configured — skipping",
-                self.name
-            );
+            warn!("RSS source '{}' has no URL configured: skipping", self.name);
             return vec![];
         }
 
@@ -44,7 +41,7 @@ impl RssAdapter {
         if let Some(max_age) = self.max_age_hours {
             let cutoff = chrono::Utc::now().timestamp() - (max_age as i64 * 3600);
             let before = items.len();
-            // Items with no date are kept (fail open — better to over-include than silently drop).
+            // Items with no date are kept (fail open, better to over-include than silently drop).
             items.retain(|item| item.published_at.is_none_or(|ts| ts >= cutoff));
             let dropped = before - items.len();
             if dropped > 0 {

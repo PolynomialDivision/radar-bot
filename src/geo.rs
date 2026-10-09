@@ -49,7 +49,7 @@ impl GeocodeHit {
 }
 
 /// Distance from `p` to segment `a`–`b` (all (lat, lon)), in an
-/// equirectangular projection around `p` — accurate to well under 1% at
+/// equirectangular projection around `p`: accurate to well under 1% at
 /// city scale.
 pub(crate) fn segment_distance_meters(p: (f64, f64), a: (f64, f64), b: (f64, f64)) -> f64 {
     const M_PER_DEG: f64 = 111_320.0;
@@ -119,7 +119,7 @@ pub(crate) enum DistanceLookup {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum EvidenceKind {
-    /// The source's `base_implied_meters` prior — says nothing about where
+    /// The source's `base_implied_meters` prior: says nothing about where
     /// in the city the item is.
     SourceDefault,
     /// An `[[filter.area]]` term with its implied distance.
@@ -148,7 +148,7 @@ pub(crate) struct LocationEvidence {
 
 impl LocationEvidence {
     /// Distance score, one tier lower for a mention buried in the article
-    /// body — those are mostly asides, lists of places or teasers — and lower
+    /// body (those are mostly asides, lists of places or teasers) and lower
     /// still by `penalty`.
     pub(crate) fn score(&self) -> i32 {
         let buried = i32::from(!self.prominent);
@@ -318,9 +318,9 @@ fn starts_uppercase(word: &str) -> bool {
 /// Extract candidate German street names (with house number when given) from
 /// plain text: "Rigaer Straße 94", "Scharnweberstraße", "Karl Marx Allee".
 ///
-/// The name is taken as short as plausible — a compound word alone (plus a
+/// The name is taken as short as plausible: a compound word alone (plus a
 /// leading "Neue"/"Alte"…), or up to two capitalized words before a separate
-/// suffix word, stopping after an "-er"/"-sche" adjective like "Rigaer" — so
+/// suffix word, stopping after an "-er"/"-sche" adjective like "Rigaer". So
 /// "Feuerwehreinsatz Rigaer Straße" yields "Rigaer Straße". Slashes separate
 /// streets ("Frankfurter Allee/Warschauer Straße").
 pub(crate) fn extract_street_candidates(text: &str) -> Vec<String> {
@@ -391,8 +391,8 @@ pub(crate) fn contains_any_normalized(text: &str, terms: &[&str]) -> bool {
 }
 
 /// Where the article proper ends: page furniture, press-office contact
-/// blocks — which carry the office's own address, e.g. "Hinweise nimmt …
-/// Wedekindstraße 10, 10243 Berlin" under every witness appeal — and
+/// blocks (which carry the office's own address, e.g. "Hinweise nimmt …
+/// Wedekindstraße 10, 10243 Berlin" under every witness appeal) and
 /// related-article teasers.
 const ARTICLE_END_MARKERS: &[&str] = &[
     "impressum",
@@ -630,8 +630,8 @@ const CITY_ADDRESS_FIELDS: &[&str] =
     &["city", "town", "village", "municipality", "state", "county"];
 
 /// Filter Nominatim results. With a `city` anchor, a result must lie in that
-/// city by its address fields — a "Berliner Straße" in Potsdam contains
-/// "Berlin" in its display name but is not in Berlin — and must be the
+/// city by its address fields (a "Berliner Straße" in Potsdam contains
+/// "Berlin" in its display name but is not in Berlin) and must be the
 /// street that was asked for: Nominatim happily answers "Parkplatz" or
 /// "Verkäufer" with some unrelated POI, which used to score as a real place.
 pub(crate) fn validated_hits(
@@ -777,7 +777,7 @@ pub(crate) async fn find_nearest_distance(
                 let _permit = limiter.acquire().await.unwrap();
                 // Re-check: another task may have geocoded this while we waited.
                 if let Some(v) = cache.get(&candidate).map(|v| v.clone()) {
-                    v // cache hit — release permit immediately, no sleep needed
+                    v // cache hit: release permit immediately, no sleep needed
                 } else {
                     let result = geocode_location(http, &candidate, city).await;
                     sleep(NOMINATIM_INTERVAL).await; // enforce rate limit before releasing permit
@@ -788,7 +788,7 @@ pub(crate) async fn find_nearest_distance(
                         }
                         Err(()) => {
                             warn!(
-                                "geocode transient failure for {:?} — will retry next poll",
+                                "geocode transient failure for {:?}, will retry next poll",
                                 candidate
                             );
                             transient_failure = true;
@@ -844,7 +844,7 @@ pub(crate) async fn find_nearest_distance(
 }
 
 /// Nominatim's best hit, unless the source files the item under the Bezirk
-/// of another one or the item names its Ortsteil or Bezirk — many street
+/// of another one or the item names its Ortsteil or Bezirk. Many street
 /// names ("Bahnhofstraße", "Dorfstraße") exist several times in one city.
 /// The flag says whether a district pinned the choice.
 pub(crate) fn pick_hit<'a>(
@@ -878,7 +878,7 @@ const SAME_STREET_SPAN_METERS: f64 = 5_000.0;
 
 /// (nearest, farthest, hit to label with) for the street a candidate names.
 /// Nominatim returns a long street as separate segments, often in several
-/// Ortsteile; together they are the street's extent — an incident "on the
+/// Ortsteile; together they are the street's extent. An incident "on the
 /// Frankfurter Allee" lies somewhere along it. A district pinning the choice
 /// narrows the extent to that district's segments.
 pub(crate) fn street_distance<'a>(
@@ -1005,7 +1005,7 @@ mod tests {
     #[test]
     fn geocode_results_must_be_the_named_street_in_the_city() {
         let results = json!([
-            // A POI Nominatim returns for a generic word — not a street.
+            // A POI Nominatim returns for a generic word, not a street.
             nominatim(
                 "",
                 "amenity",

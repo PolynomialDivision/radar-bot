@@ -5,7 +5,7 @@ use super::*;
 // ── Polling loop ──────────────────────────────────────────────────────────────
 
 /// After this many polls ending in "retry later" (article page or geocoder
-/// unreachable), an item is decided with the information at hand — with the
+/// unreachable), an item is decided with the information at hand, with the
 /// default 30-minute interval that is three hours.
 pub(crate) const MAX_RETRY_ATTEMPTS: u32 = 6;
 
@@ -69,7 +69,7 @@ pub(crate) async fn process_item(
                 );
             }
             if article_fetch_failed && final_attempt {
-                // Retried often enough — decide with feed title/description.
+                // Retried often enough: decide with feed title/description.
                 info!(
                     "  giving up on article fetch [{}] {:?}",
                     source_name, item.title
@@ -345,7 +345,7 @@ pub(crate) async fn poll_once(
         }
     }
 
-    // Spawn one task per item — article fetches and geocoding run in parallel.
+    // Spawn one task per item: article fetches and geocoding run in parallel.
     // Geocoding tasks share the NominatimLimiter so total Nominatim traffic stays ≤ 1 req/s.
     let mut tasks: JoinSet<ProcessOutcome> = JoinSet::new();
     let n_pending = pending.len();

@@ -12,7 +12,7 @@ use tracing::warn;
 //   2. Create src/sources/<platform>.rs with a struct + fetch_items().
 //   3. Add the variant to SourceAdapter and build_adapter() below.
 //   4. Add platform-specific fields to SourceConfig in main.rs (optional).
-//   That's it — poll_once() and everything downstream is untouched.
+//   That's it: poll_once() and everything downstream is untouched.
 
 #[derive(Deserialize, Clone, Default, Debug)]
 #[serde(rename_all = "snake_case")]
@@ -98,7 +98,7 @@ pub fn build_adapter(source: &SourceConfig, bluesky: Option<&BlueskyContext>) ->
 
 fn google_news_rss_url(source_name: &str, query: &str) -> String {
     if query.trim().is_empty() {
-        warn!("Google News source '{source_name}' has no query configured — skipping");
+        warn!("Google News source '{source_name}' has no query configured, skipping");
         return String::new();
     }
     let q = crate::url_encode(query);

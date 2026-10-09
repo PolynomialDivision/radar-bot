@@ -11,16 +11,16 @@ device_id = "your_device_id_here"
 # Configured admins may always open a direct chat with the bot.
 allowed_inviters = ["@you:matrix.org"]
 
-# Users allowed to run admin commands — in shared rooms and privately in a
+# Users allowed to run admin commands, privately in a
 # direct chat with the bot (send !admin there for help).
 # Bot-specific:
 #   !source-stats [hours]
 admin_users = ["@you:matrix.org"]
 
 # Which devices receive room keys:
-#   identity_based  — only cross-signed devices (default, recommended)
-#   only_trusted    — only explicitly verified devices
-#   all_devices     — all devices, no restriction
+#   identity_based: only cross-signed devices (default, recommended)
+#   only_trusted: only explicitly verified devices
+#   all_devices: all devices, no restriction
 encryption_strategy = "all_devices"
 
 # ── Bluesky ───────────────────────────────────────────────────────────────────
@@ -61,7 +61,7 @@ candidate_retention_hours = 24
 # an old article that a feed or search re-lists with a fresh date.
 # max_age_hours = 72
 
-# Your reference address — geocoded once at startup. All distances are measured from here.
+# Your reference address: geocoded once at startup. All distances are measured from here.
 reference_address = "Yourstreet 1, 10000 Yourcity"
 
 # City string appended to Nominatim queries when geocoding street mentions from articles.
@@ -80,7 +80,7 @@ blocklist = [
 # base_implied_meters) is one piece of evidence; the strongest decides the score.
 #
 # Terms match at word starts: "Friedrichshain" matches "Berlin-Friedrichshain"
-# and "Friedrichshainer", but not "Friedrichshain-Kreuzberg" (the whole borough —
+# and "Friedrichshainer", but not "Friedrichshain-Kreuzberg" (the whole borough,
 # add that as its own term with a larger distance if you want it). Postal codes
 # and terms shorter than five letters must match as whole words.
 #
@@ -94,26 +94,26 @@ blocklist = [
 # asides, lists of places or teasers. Press-office contact blocks ("Hinweise
 # nimmt … Wedekindstraße 10, 10243 Berlin") are ignored.
 #
-# Terms don't have to be street names — any location-specific keyword works:
+# Terms don't have to be street names. Any location-specific keyword works:
 # building names, landmarks, organisation abbreviations, event keywords, etc.
 #
 # Distance → score mapping:
 #   < 200m  → 5 🔴   < 500m → 4 🟠   < 1km → 3 🟡
 #   < 2km   → 2 🟢   < 10km → 1 🔵   else → 0 ⚪
 
-# Your immediate street(s) — treated as ~300m away
+# Your immediate street(s): treated as ~300m away
 [[filter.area]]
 implied_meters = 300
 terms = [
     "Yourstreet",
 ]
 
-# Nearby postal codes — treated as ~800m away
+# Nearby postal codes: treated as ~800m away
 [[filter.area]]
 implied_meters = 800
 terms = ["10000", "10001"]
 
-# Your district / nearby landmarks — treated as ~1500m away
+# Your district / nearby landmarks: treated as ~1500m away
 [[filter.area]]
 implied_meters = 1500
 terms = [
@@ -140,26 +140,26 @@ aliases = ["Local U-Bahn", "Local S-Bahn", "Station Nickname"]
 
 # ── Sources ───────────────────────────────────────────────────────────────────
 # Each source needs a name and a type (default: "rss"). Shared optional fields:
-#   filter              = true (default) — apply location filter and scoring
-#   filter              = false — skip location filter, include everything
-#   required            = ["keyword"] — overrides global filter.required for this source.
+#   filter              = true (default): apply location filter and scoring
+#   filter              = false: skip location filter, include everything
+#   required            = ["keyword"]: overrides global filter.required for this source.
 #                         Set to [] to skip the city check for city-specific sources.
-#   base_implied_meters = N — fallback distance when neither area keywords nor geocoding
+#   base_implied_meters = N: fallback distance when neither area keywords nor geocoding
 #                             produce a result.
 #                             City-wide feeds: ~9000 (score 1 🔵)
 #                             District feeds:  ~1500 (score 2 🟢)
 #
-# RSS/Atom sources (type = "rss", the default — "type" field can be omitted):
-#   url = "https://..."    — required
+# RSS/Atom sources (type = "rss", the default, so "type" can be omitted):
+#   url = "https://..."    : required
 #
 # Google News search RSS sources (type = "google_news"):
 #   query = "\"Yourstreet\" Yourcity Unfall OR Brand OR Polizei"
-#   max_age_hours = 48     — recommended, keeps search results fresh
+#   max_age_hours = 48: recommended, keeps search results fresh
 #   Keep filter = true. Use narrow street/district queries to reduce false positives.
 #
 # Bluesky sources (type = "bluesky"):
-#   query = "#Hashtag"     — keyword or hashtag search query, required
-#   limit = 25             — max posts per poll (default 25, API max 100)
+#   query = "#Hashtag"     : keyword or hashtag search query, required
+#   limit = 25             : max posts per poll (default 25, API max 100)
 #
 # Posts are normalized to the same FeedItem as RSS entries and pass through
 # the same location filter, geocoding, and scoring pipeline unchanged.
@@ -202,7 +202,7 @@ url = "https://example.com/local/rss.xml"
 filter = false
 base_implied_meters = 1500
 
-# Bluesky keyword search — posts are filtered and scored like RSS items.
+# Bluesky keyword search: posts are filtered and scored like RSS items.
 # Use a city-level hashtag as the query so only relevant posts get through.
 # Omit filter.required check for hashtag searches (the hashtag already scopes them).
 [[sources]]

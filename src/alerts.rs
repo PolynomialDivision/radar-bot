@@ -62,7 +62,7 @@ pub async fn lookup_nina_ags(http: &reqwest::Client, ref_point: (f64, f64)) -> O
 
     let country_code = json["address"]["country_code"].as_str()?;
     if country_code != "de" {
-        info!("Reference address is outside Germany — NINA disabled");
+        info!("Reference address is outside Germany, NINA disabled");
         return None;
     }
 
@@ -780,7 +780,7 @@ async fn check_dwd_weather_warnings(
                     }
                 }
                 None => {
-                    // No event IDs (pre-upgrade row) — can't edit. Post fresh and
+                    // No event IDs (pre-upgrade row): can't edit. Post fresh and
                     // clean up the stale row so no spurious all-clear fires.
                     let (all_ok, room_event_ids) =
                         post_alert_to_rooms(client, &primary_id, &new_plain, &new_html).await;
@@ -814,7 +814,7 @@ async fn check_dwd_weather_warnings(
                 }
             }
         } else {
-            // Genuinely new warning — no prior message for this event type.
+            // Genuinely new warning. No prior message for this event type.
             let desc = format_dwd_description_with_continuations(region, &primary.w, &cont_notes);
             let (plain, html) = format_alert(
                 "DWD Weather Warnings",
@@ -1486,7 +1486,7 @@ async fn check_usgs(
             match (lat, lon) {
                 (Some(lat), Some(lon)) if haversine_km(ref_lat, ref_lon, lat, lon) <= max_km => {}
                 (Some(_), Some(_)) => continue, // too far
-                _ => continue,                  // no coordinates — can't verify proximity, skip
+                _ => continue,                  // no coordinates: can't verify proximity, skip
             }
         }
 
@@ -1546,7 +1546,7 @@ async fn check_gdacs(
             match item.coords {
                 Some((lat, lon)) if haversine_km(ref_lat, ref_lon, lat, lon) <= max_km => {}
                 Some(_) => continue, // too far
-                None => continue,    // no coordinates — can't verify proximity, skip
+                None => continue,    // no coordinates: can't verify proximity, skip
             }
         }
 
@@ -1778,9 +1778,9 @@ fn format_dwd_allclear(headline: &str, region: &str) -> (String, String) {
     let body = format!("📍 {region}\nDie Warnung ist nicht mehr aktiv.");
     let headline_html = alert_html_escape(headline);
     let body_html = alert_html_escape(&body).replace('\n', "<br>");
-    let plain = format!("✅ Entwarnung: {headline}\n{body}\nSource: DWD Weather Warnings");
+    let plain = format!("✅ Entwarnung: {headline}\n{body}\n📰 Source: DWD Weather Warnings");
     let html = format!(
-        "<b>✅ Entwarnung: {headline_html}</b><br>{body_html}<br><em>Source: DWD Weather Warnings</em>"
+        "<b>✅ Entwarnung: {headline_html}</b><br>{body_html}<br><em>📰 Source: DWD Weather Warnings</em>"
     );
     (plain, html)
 }
@@ -1811,9 +1811,9 @@ fn format_alert(
     let description_html = alert_html_escape(description).replace('\n', "<br>");
     let source_html = alert_html_escape(source);
 
-    let plain = format!("🚨 {event}\n{description}{link_plain}\nSource: {source}");
+    let plain = format!("🚨 {event}\n{description}{link_plain}\n📰 Source: {source}");
     let html = format!(
-        "<b>🚨 {event_html}</b><br>{description_html}{link_html}<br><em>Source: {source_html}</em>"
+        "<b>🚨 {event_html}</b><br>{description_html}{link_html}<br><em>📰 Source: {source_html}</em>"
     );
     (plain, html)
 }

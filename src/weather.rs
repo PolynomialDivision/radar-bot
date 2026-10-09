@@ -44,7 +44,7 @@ pub async fn weather_loop(
         let date_key = format!("weather:{}", Local::now().date_naive());
         match db.is_alert_seen(&date_key).await {
             Ok(true) => {
-                info!("Weather already posted today — skipping");
+                info!("Weather already posted today, skipping");
                 continue;
             }
             Err(e) => {
@@ -63,7 +63,7 @@ pub async fn weather_loop(
                 crate::post_to_rooms(&client, &plain, &html).await;
                 db.mark_alert_seen(&date_key, "weather").await.ok();
             }
-            None => warn!("Weather forecast fetch failed — skipping today"),
+            None => warn!("Weather forecast fetch failed, skipping today"),
         }
     }
 }
@@ -224,9 +224,9 @@ fn format_message(rows_plain: Vec<String>, rows_html: Vec<String>) -> Option<(St
         return None;
     }
     let date = Local::now().format("%A, %d %b").to_string();
-    let plain = format!("Weather — {date}\n{}", rows_plain.join("\n"));
+    let plain = format!("🌦️ Weather · {date}\n{}", rows_plain.join("\n"));
     let html = format!(
-        "<strong>Weather — {date}</strong><br>{}",
+        "🌦️ <strong>Weather · {date}</strong><br>{}",
         rows_html.join("<br>")
     );
     Some((plain, html))

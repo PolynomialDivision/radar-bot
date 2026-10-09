@@ -200,7 +200,7 @@ pub(crate) fn keyword_check(
         }
     }
 
-    // No area match is not a hard drop — caller can fall back to source.base_implied_meters.
+    // No area match is not a hard drop: caller can fall back to source.base_implied_meters.
     Some(KeywordMatch { evidence, matched })
 }
 

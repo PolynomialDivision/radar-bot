@@ -12,7 +12,7 @@ pub(crate) struct FeedItem {
     /// Optional user-facing note about the link, e.g. rolling/live ticker pages.
     #[serde(default)]
     pub(crate) link_note: Option<String>,
-    /// Short snippet from the RSS/social feed — shown to the user.
+    /// Short snippet from the RSS/social feed: shown to the user.
     pub(crate) description: Option<String>,
     /// Full stripped text used only for filtering/geocoding. Pre-filled by
     /// adapters that already have the full text (e.g. Bluesky posts).
@@ -138,12 +138,12 @@ pub(crate) fn decode_entities(s: &str) -> String {
                 out.push_str(&r);
                 rest = &rest[semi + 1..];
             } else {
-                // unknown entity — emit as-is
+                // unknown entity: emit as-is
                 out.push('&');
                 rest = &rest[1..];
             }
         } else {
-            // no closing semicolon — emit literally
+            // no closing semicolon: emit literally
             out.push('&');
             rest = &rest[1..];
         }
@@ -342,7 +342,7 @@ pub(crate) fn text_to_plain(s: &str) -> String {
 }
 
 /// Parse RFC 2822 (RSS pubDate) or RFC 3339/ISO 8601 (Atom) date strings to Unix timestamp.
-/// Returns None if the string is missing, empty, or unparseable — callers treat None as "keep".
+/// Returns None if the string is missing, empty, or unparseable. Callers treat None as "keep".
 pub(crate) fn parse_feed_date(s: &str) -> Option<i64> {
     let s = s.trim();
     if s.is_empty() {

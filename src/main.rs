@@ -73,13 +73,14 @@ async fn source_stats_reply(db: &Db, body: &str) -> String {
         .clamp(1, 24 * 30);
     match db.source_stats_summary(hours).await {
         Ok(stats) if stats.is_empty() => {
-            format!("No source stats recorded in the last {hours}h.")
+            format!("🤷 No source stats in the last {hours}h.")
         }
         Ok(stats) => {
-            let mut lines = vec![format!("Source stats, last {hours}h:")];
+            let mut lines = vec![format!("📊 Source stats, last {hours}h")];
             for stat in stats {
+                lines.push(String::new());
                 lines.push(format!(
-                    "{}: {} total, {} queued, {} candidate, {} dropped, {} retry",
+                    "📰 {}\n📥 {} total · 📬 {} queued\n🔎 {} candidate · 🗑️ {} dropped · 🔁 {} retry",
                     stat.source_name,
                     stat.total,
                     stat.queued,
@@ -92,7 +93,7 @@ async fn source_stats_reply(db: &Db, body: &str) -> String {
         }
         Err(e) => {
             warn!("!source-stats failed: {e}");
-            "Source stats query failed.".to_owned()
+            "❌ Source stats query failed.".to_owned()
         }
     }
 }
@@ -111,7 +112,7 @@ async fn main() -> Result<()> {
     let bot = Bot::builder("radar-bot", env!("CARGO_PKG_VERSION"))
         .store_path(&store_dir)
         .matrix_store_path(store_dir.join("matrix_store"))
-        .admin_help("!source-stats [hours] — per-source item counts")
+        .admin_help("📊 !source-stats [hours]: items per source")
         .start(&config.matrix, &config.security)
         .await?;
 
@@ -136,7 +137,7 @@ async fn main() -> Result<()> {
                 let body = text.body.trim();
                 if body.starts_with("!source-stats") {
                     if !bot.is_admin(&ev.sender) {
-                        warn!("!source-stats from non-admin {} — ignored", ev.sender);
+                        warn!("!source-stats from non-admin {}, ignored", ev.sender);
                         return;
                     }
                     let reply = source_stats_reply(&db, body).await;
@@ -158,7 +159,9 @@ async fn main() -> Result<()> {
     // Crash recovery: anything left in 'processing' from last run goes back to 'queued'.
     let recovered = db.recover_processing().await?;
     if recovered > 0 {
-        warn!("{recovered} item(s) recovered from interrupted digest — will retry at next digest time");
+        warn!(
+            "{recovered} item(s) recovered from interrupted digest, will retry at next digest time"
+        );
     }
 
     let geocode_cache: GeocodeCache = Arc::new(DashMap::new());
@@ -175,12 +178,12 @@ async fn main() -> Result<()> {
                 Some((hit.lat, hit.lon))
             }
             Ok([]) | Err(()) => {
-                warn!("Could not geocode reference address '{addr}' — distance scoring disabled");
+                warn!("Could not geocode reference address '{addr}', distance scoring disabled");
                 None
             }
         }
     } else {
-        warn!("No reference_address configured — distance scoring disabled");
+        warn!("No reference_address configured, distance scoring disabled");
         None
     };
 
@@ -190,7 +193,7 @@ async fn main() -> Result<()> {
         config.filter.home_borough = reverse_borough(&http, point).await;
         match &config.filter.home_borough {
             Some(borough) => info!("Reference district: {borough}"),
-            None => warn!("Could not resolve the reference district — district hints ignored"),
+            None => warn!("Could not resolve the reference district, district hints ignored"),
         }
     }
 
@@ -212,7 +215,7 @@ async fn main() -> Result<()> {
                 .iter()
                 .any(|s| matches!(s.source_type, sources::SourceType::Bluesky));
             if has_bluesky {
-                warn!("Bluesky source(s) configured but [bluesky] identifier/password missing — searches will fail");
+                warn!("Bluesky source(s) configured but [bluesky] identifier/password missing, searches will fail");
             }
             None
         }
@@ -223,7 +226,7 @@ async fn main() -> Result<()> {
         Vec::new()
     };
     if config.weather.alerts_enabled && dwd_region_keywords.is_empty() {
-        warn!("DWD weather warnings disabled — no weather.warning_region_keywords, geocode_city, or reference_address city found");
+        warn!("DWD weather warnings disabled, no weather.warning_region_keywords, geocode_city, or reference_address city found");
     } else if !dwd_region_keywords.is_empty() {
         info!(
             "DWD weather warning region keyword(s): {:?}",
@@ -251,10 +254,10 @@ async fn main() -> Result<()> {
             )
             .await;
             let cache_after = geocode_cache.len();
-            info!("Run {run}/2 done — geocode cache: {cache_before} → {cache_after} entries");
+            info!("Run {run}/2 done, geocode cache: {cache_before} → {cache_after} entries");
 
             // In test mode poll_once doesn't write to DB; query what would be queued by
-            // re-running take_for_digest on an empty DB (no-op) — instead just note it.
+            // re-running take_for_digest on an empty DB (no-op): instead just note it.
             let items = db
                 .take_for_digest(config.filter.digest_threshold)
                 .await
@@ -295,7 +298,7 @@ async fn main() -> Result<()> {
         let nina_ags = match ref_point {
             Some(pt) => alerts::lookup_nina_ags(&http, pt).await,
             None => {
-                warn!("No reference_address — NINA alerts disabled");
+                warn!("No reference_address, NINA alerts disabled");
                 None
             }
         };
@@ -337,7 +340,7 @@ async fn main() -> Result<()> {
                 config.weather.provider,
             ));
         } else {
-            warn!("Weather forecast disabled — no reference_address configured");
+            warn!("Weather forecast disabled, no reference_address configured");
         }
     }
 
