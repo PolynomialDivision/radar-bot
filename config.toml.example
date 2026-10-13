@@ -10,6 +10,11 @@ device_id = "your_device_id_here"
 # Users allowed to invite the bot ("all" = anyone, [] = nobody).
 # Configured admins may always open a direct chat with the bot.
 allowed_inviters = ["@you:matrix.org"]
+# Rooms the bot may join: room IDs, [] for none, or "all" for every room.
+# Required: without it the bot refuses to start.
+allowed_rooms = ["!REPLACE_ME:example.org"]
+# Members of these rooms may also open a private chat with the bot.
+# dm_rooms = ["!REPLACE_ME:example.org"]
 
 # Users allowed to run admin commands, privately in a
 # direct chat with the bot (send !admin there for help).

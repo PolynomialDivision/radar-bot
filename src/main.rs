@@ -167,6 +167,8 @@ async fn main() -> Result<()> {
     let geocode_cache: GeocodeCache = Arc::new(DashMap::new());
     let http = reqwest::Client::builder()
         .user_agent("Mozilla/5.0 (compatible; radar-bot/0.1)")
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .timeout(std::time::Duration::from_secs(60))
         .build()?;
 
     // Resolve reference address to coordinates once at startup.

@@ -117,7 +117,7 @@ impl Db {
         let db = self.0.clone();
         let guid = guid.to_owned();
         tokio::task::spawn_blocking(move || {
-            let conn = db.lock().unwrap();
+            let conn = db.lock().unwrap_or_else(|e| e.into_inner());
             let n: i64 = conn.query_row(
                 "SELECT COUNT(*) FROM items WHERE guid = ?1",
                 params![guid],
@@ -159,7 +159,7 @@ impl Db {
         let now = chrono::Utc::now().timestamp();
 
         tokio::task::spawn_blocking(move || {
-            let conn = db.lock().unwrap();
+            let conn = db.lock().unwrap_or_else(|e| e.into_inner());
             conn.execute(
                 "INSERT OR IGNORE INTO items
                  (guid, source_name, title, link, link_note, score, max_score, distance_m, location_label, discovered_at, state, error)
@@ -190,7 +190,7 @@ impl Db {
         let now = chrono::Utc::now().timestamp();
 
         tokio::task::spawn_blocking(move || {
-            let conn = db.lock().unwrap();
+            let conn = db.lock().unwrap_or_else(|e| e.into_inner());
             conn.execute(
                 "INSERT OR IGNORE INTO items
                  (guid, source_name, title, link, score, max_score, discovered_at, state, error)
@@ -214,7 +214,7 @@ impl Db {
         let cutoff = chrono::Utc::now().timestamp() - candidate_retention_secs;
 
         tokio::task::spawn_blocking(move || {
-            let conn = db.lock().unwrap();
+            let conn = db.lock().unwrap_or_else(|e| e.into_inner());
             let mut stmt = conn.prepare(
                 "SELECT guid, source_name, title, link, link_note, score, max_score, distance_m, location_label, state
                  FROM items
@@ -259,7 +259,7 @@ impl Db {
         let reason = reason.to_owned();
 
         tokio::task::spawn_blocking(move || {
-            let conn = db.lock().unwrap();
+            let conn = db.lock().unwrap_or_else(|e| e.into_inner());
             let mut n = 0;
             for guid in &guids {
                 n += conn.execute(
@@ -280,7 +280,7 @@ impl Db {
         let db = self.0.clone();
         let cutoff = chrono::Utc::now().timestamp() - candidate_retention_secs;
         tokio::task::spawn_blocking(move || {
-            let n = db.lock().unwrap().execute(
+            let n = db.lock().unwrap_or_else(|e| e.into_inner()).execute(
                 "UPDATE items
                  SET state = 'dropped', error = 'candidate expired before corroboration'
                  WHERE state = 'candidate' AND discovered_at < ?1",
@@ -300,7 +300,7 @@ impl Db {
         let cutoff = now - 30 * 86_400;
 
         tokio::task::spawn_blocking(move || {
-            let mut conn = db.lock().unwrap();
+            let mut conn = db.lock().unwrap_or_else(|e| e.into_inner());
             let tx = conn.transaction()?;
             for stat in stats {
                 tx.execute(
@@ -334,7 +334,7 @@ impl Db {
         let cutoff = chrono::Utc::now().timestamp() - hours as i64 * 3600;
 
         tokio::task::spawn_blocking(move || {
-            let conn = db.lock().unwrap();
+            let conn = db.lock().unwrap_or_else(|e| e.into_inner());
             let mut stmt = conn.prepare(
                 "SELECT source_name,
                         COALESCE(SUM(total), 0),
@@ -375,7 +375,7 @@ impl Db {
         let now = chrono::Utc::now().timestamp();
 
         tokio::task::spawn_blocking(move || {
-            let mut conn = db.lock().unwrap();
+            let mut conn = db.lock().unwrap_or_else(|e| e.into_inner());
             let tx = conn.transaction()?;
 
             tx.execute(
@@ -426,7 +426,7 @@ impl Db {
         let now = chrono::Utc::now().timestamp();
 
         tokio::task::spawn_blocking(move || {
-            let conn = db.lock().unwrap();
+            let conn = db.lock().unwrap_or_else(|e| e.into_inner());
             for guid in &guids {
                 conn.execute(
                     "UPDATE items SET state = 'posted', posted_at = ?1, error = NULL
@@ -449,7 +449,7 @@ impl Db {
         let error = error.to_owned();
 
         tokio::task::spawn_blocking(move || {
-            let conn = db.lock().unwrap();
+            let conn = db.lock().unwrap_or_else(|e| e.into_inner());
             for guid in &guids {
                 conn.execute(
                     "UPDATE items SET state = 'queued', error = ?1
@@ -468,7 +468,7 @@ impl Db {
         let cutoff = chrono::Utc::now().timestamp() - window_secs;
 
         tokio::task::spawn_blocking(move || {
-            let conn = db.lock().unwrap();
+            let conn = db.lock().unwrap_or_else(|e| e.into_inner());
             let mut stmt = conn.prepare(
                 "SELECT guid, source_name, title, link, link_note, score, max_score, distance_m, location_label
                  FROM items WHERE state = 'posted' AND posted_at >= ?1",
@@ -503,7 +503,7 @@ impl Db {
         let reason = reason.to_owned();
 
         tokio::task::spawn_blocking(move || {
-            let conn = db.lock().unwrap();
+            let conn = db.lock().unwrap_or_else(|e| e.into_inner());
             for guid in &guids {
                 conn.execute(
                     "UPDATE items SET state = 'dropped', error = ?1
@@ -521,7 +521,7 @@ impl Db {
         let db = self.0.clone();
         let guid = guid.to_owned();
         tokio::task::spawn_blocking(move || {
-            let conn = db.lock().unwrap();
+            let conn = db.lock().unwrap_or_else(|e| e.into_inner());
             let n: Option<u32> = conn
                 .query_row(
                     "SELECT attempts FROM retry_attempts WHERE guid = ?1",
@@ -539,7 +539,7 @@ impl Db {
         let guid = guid.to_owned();
         let now = chrono::Utc::now().timestamp();
         tokio::task::spawn_blocking(move || {
-            let conn = db.lock().unwrap();
+            let conn = db.lock().unwrap_or_else(|e| e.into_inner());
             conn.execute(
                 "INSERT INTO retry_attempts (guid, attempts, last_at) VALUES (?1, 1, ?2)
                  ON CONFLICT(guid) DO UPDATE SET attempts = attempts + 1, last_at = ?2",
@@ -562,7 +562,7 @@ impl Db {
     pub async fn recover_processing(&self) -> Result<usize> {
         let db = self.0.clone();
         tokio::task::spawn_blocking(move || {
-            let n = db.lock().unwrap().execute(
+            let n = db.lock().unwrap_or_else(|e| e.into_inner()).execute(
                 "UPDATE items SET state = 'queued', error = 'recovered after crash'
                  WHERE state = 'processing'",
                 [],
@@ -578,7 +578,7 @@ impl Db {
         let db = self.0.clone();
         let id = id.to_owned();
         tokio::task::spawn_blocking(move || {
-            let conn = db.lock().unwrap();
+            let conn = db.lock().unwrap_or_else(|e| e.into_inner());
             let n: i64 = conn.query_row(
                 "SELECT COUNT(*) FROM alerts WHERE id = ?1",
                 params![id],
@@ -595,7 +595,7 @@ impl Db {
         let source = source.to_owned();
         let now = chrono::Utc::now().timestamp();
         tokio::task::spawn_blocking(move || {
-            db.lock().unwrap().execute(
+            db.lock().unwrap_or_else(|e| e.into_inner()).execute(
                 "INSERT OR IGNORE INTO alerts (id, source, sent_at) VALUES (?1, ?2, ?3)",
                 params![id, source, now],
             )?;
@@ -610,7 +610,7 @@ impl Db {
         let db = self.0.clone();
         let id = id.to_owned();
         tokio::task::spawn_blocking(move || {
-            let conn = db.lock().unwrap();
+            let conn = db.lock().unwrap_or_else(|e| e.into_inner());
             let mut stmt = conn.prepare(
                 "SELECT headline, event_ids_json, original_plain, original_html
                  FROM nina_active_warnings
@@ -648,7 +648,7 @@ impl Db {
         let original_html = original_html.to_owned();
         let now = chrono::Utc::now().timestamp();
         tokio::task::spawn_blocking(move || {
-            db.lock().unwrap().execute(
+            db.lock().unwrap_or_else(|e| e.into_inner()).execute(
                 "INSERT INTO nina_active_warnings
                      (id, headline, region, seen_at, event_ids_json, original_plain, original_html)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
@@ -678,7 +678,7 @@ impl Db {
         let db = self.0.clone();
         let id = id.to_owned();
         tokio::task::spawn_blocking(move || {
-            db.lock().unwrap().execute(
+            db.lock().unwrap_or_else(|e| e.into_inner()).execute(
                 "DELETE FROM nina_active_warnings WHERE id = ?1",
                 params![id],
             )?;
@@ -692,7 +692,7 @@ impl Db {
     pub async fn list_active_dwd_warnings(&self) -> Result<Vec<DwdActiveWarning>> {
         let db = self.0.clone();
         tokio::task::spawn_blocking(move || {
-            let conn = db.lock().unwrap();
+            let conn = db.lock().unwrap_or_else(|e| e.into_inner());
             let mut stmt = conn.prepare(
                 "SELECT id, headline, region, event_ids_json, original_plain, original_html,
                         start_ms, end_ms
@@ -745,7 +745,7 @@ impl Db {
         let original_html = original_html.to_owned();
         let now = chrono::Utc::now().timestamp();
         tokio::task::spawn_blocking(move || {
-            db.lock().unwrap().execute(
+            db.lock().unwrap_or_else(|e| e.into_inner()).execute(
                 "INSERT INTO dwd_active_warnings
                      (id, headline, region, event, seen_at,
                       event_ids_json, start_ms, end_ms, original_plain, original_html)
@@ -795,7 +795,7 @@ impl Db {
         let plain = plain.map(str::to_owned);
         let html = html.map(str::to_owned);
         tokio::task::spawn_blocking(move || {
-            db.lock().unwrap().execute(
+            db.lock().unwrap_or_else(|e| e.into_inner()).execute(
                 "UPDATE dwd_active_warnings
                  SET start_ms       = ?2,
                      end_ms         = ?3,
@@ -838,7 +838,7 @@ impl Db {
         let original_html = original_html.to_owned();
         let now = chrono::Utc::now().timestamp();
         tokio::task::spawn_blocking(move || {
-            let mut conn = db.lock().unwrap();
+            let mut conn = db.lock().unwrap_or_else(|e| e.into_inner());
             let tx = conn.transaction()?;
             tx.execute(
                 "DELETE FROM dwd_active_warnings WHERE id = ?1",
@@ -874,7 +874,7 @@ impl Db {
         let db = self.0.clone();
         let warning_id = warning_id.to_owned();
         tokio::task::spawn_blocking(move || {
-            db.lock().unwrap().execute(
+            db.lock().unwrap_or_else(|e| e.into_inner()).execute(
                 "DELETE FROM dwd_active_warnings WHERE id = ?1",
                 params![warning_id],
             )?;
@@ -891,7 +891,7 @@ impl Db {
         let db = self.0.clone();
         let cutoff = chrono::Utc::now().timestamp() - (keep_days as i64 * 86_400);
         tokio::task::spawn_blocking(move || {
-            let n = db.lock().unwrap().execute(
+            let n = db.lock().unwrap_or_else(|e| e.into_inner()).execute(
                 "DELETE FROM items
                  WHERE state IN ('posted', 'dropped') AND discovered_at < ?1",
                 params![cutoff],
