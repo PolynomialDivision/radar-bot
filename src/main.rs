@@ -48,17 +48,13 @@ use tracing::{error, info, warn};
 /// Returns true if all rooms received the message. On false the caller should
 /// requeue the items so they appear in the next digest.
 pub(crate) async fn post_to_rooms(bot: &Bot, plain: &str, html: &str) -> bool {
-    let mut all_ok = true;
-    for room in bot.broadcast_rooms() {
-        if let Err(e) = room
-            .send(RoomMessageEventContent::text_html(plain, html))
-            .await
-        {
-            error!("Failed to post to {}: {e}", room.room_id());
-            all_ok = false;
-        }
+    let failed = bot
+        .broadcast(RoomMessageEventContent::text_html(plain, html))
+        .await;
+    for (room, e) in &failed {
+        error!("Failed to post to {room}: {e}");
     }
-    all_ok
+    failed.is_empty()
 }
 
 // ── main ──────────────────────────────────────────────────────────────────────

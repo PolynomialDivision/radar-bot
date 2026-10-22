@@ -1584,16 +1584,16 @@ async fn post_alert_to_rooms(
     let mut all_ok = true;
     for room in client.broadcast_rooms() {
         let txn_id = stable_alert_transaction_id(alert_key, room.room_id().as_str());
-        match room
-            .send(RoomMessageEventContent::text_html(plain, html))
-            .with_transaction_id(txn_id)
-            .await
+        // retried with the same transaction ID: a lost answer posts no second alert
+        match mxbot_common::send::send_with_retry_txn(
+            &room,
+            RoomMessageEventContent::text_html(plain, html),
+            &txn_id,
+        )
+        .await
         {
-            Ok(resp) => {
-                event_ids.insert(
-                    room.room_id().to_string(),
-                    resp.response.event_id.to_string(),
-                );
+            Ok(event_id) => {
+                event_ids.insert(room.room_id().to_string(), event_id.to_string());
             }
             Err(e) => {
                 error!("Failed to post alert message to {}: {e}", room.room_id());
