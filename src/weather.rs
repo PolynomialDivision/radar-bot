@@ -1,9 +1,14 @@
 use std::time::Duration;
 
-use chrono::{Local, NaiveTime, Timelike};
-use mxbot_common::Bot;
-use tokio::time::sleep;
-use tracing::{info, warn};
+use chrono::{Local, Timelike};
+use mxbot_common::{
+    clock::Zone,
+    config::TimeOfDay,
+    schedule::{self, Delivery, Job, Outcome, Rule, Slot},
+    supervise::Alive,
+    Bot,
+};
+use tracing::warn;
 
 use crate::db::Db;
 
@@ -17,55 +22,61 @@ pub enum WeatherProvider {
 
 // ── Loop ──────────────────────────────────────────────────────────────────────
 
+/// The forecast as a scheduled job: daily at `post_time` (local time), one
+/// missed by a restart caught up within [`crate::CATCH_UP`], recorded in the
+/// `alerts` table once posted (`weather:2026-10-30`, as before).
+pub fn weather_job(zone: Zone, post_time: TimeOfDay) -> Job {
+    let rule = Rule::daily(post_time);
+    Job::new(
+        "weather",
+        zone,
+        Delivery::AtLeastOnce,
+        crate::CATCH_UP,
+        move || Some(rule.clone()),
+    )
+}
+
 pub async fn weather_loop(
     client: Bot,
     http: reqwest::Client,
     db: Db,
     ref_point: (f64, f64),
-    post_time: NaiveTime,
+    job: Job,
     provider: WeatherProvider,
+    alive: Alive,
 ) {
-    loop {
-        let now = Local::now();
-        let today = now.date_naive();
-        let target = if now.time() < post_time {
-            today.and_time(post_time)
-        } else {
-            (today + chrono::Duration::days(1)).and_time(post_time)
-        };
-        let secs = (target - now.naive_local()).num_seconds().max(0) as u64;
-        info!(
-            "Next weather forecast in {secs}s (at {})",
-            target.format("%H:%M")
-        );
-        sleep(Duration::from_secs(secs)).await;
+    schedule::run(job, db, alive, move |slot: Slot| {
+        let client = client.clone();
+        let http = http.clone();
+        let provider = provider.clone();
+        async move { post_forecast(&client, &http, ref_point, &provider, &slot).await }
+    })
+    .await
+}
 
-        // Guard against double-posting when the container restarts near post_time.
-        let date_key = format!("weather:{}", Local::now().date_naive());
-        match db.is_alert_seen(&date_key).await {
-            Ok(true) => {
-                info!("Weather already posted today, skipping");
-                continue;
-            }
-            Err(e) => {
-                warn!("DB check for weather guard failed: {e}");
-            }
-            Ok(false) => {}
-        }
-
-        let result = match provider {
-            WeatherProvider::Brightsky => fetch_brightsky(&http, ref_point).await,
-            WeatherProvider::Openmeteo => fetch_openmeteo(&http, ref_point).await,
-        };
-
-        match result {
-            Some((plain, html)) => {
-                crate::post_to_rooms(&client, &plain, &html).await;
-                db.mark_alert_seen(&date_key, "weather").await.ok();
-            }
-            None => warn!("Weather forecast fetch failed, skipping today"),
-        }
-    }
+/// Fetch and post the forecast of `slot`. A failed fetch or a post that did
+/// not get through is tried again after [`crate::RETRY_AFTER`] instead of
+/// losing the day's forecast.
+async fn post_forecast(
+    client: &Bot,
+    http: &reqwest::Client,
+    ref_point: (f64, f64),
+    provider: &WeatherProvider,
+    slot: &Slot,
+) -> Outcome {
+    let result = match provider {
+        WeatherProvider::Brightsky => fetch_brightsky(http, ref_point).await,
+        WeatherProvider::Openmeteo => fetch_openmeteo(http, ref_point).await,
+    };
+    let Some((plain, html)) = result else {
+        warn!("Weather forecast fetch failed, trying again later");
+        return Outcome::RetryIn(crate::RETRY_AFTER);
+    };
+    let key = format!("radar-bot:weather:{}", slot.key());
+    let deadline = std::time::Instant::now() + crate::SEND_FOR;
+    crate::post_slot(client, &plain, &html, &key, deadline)
+        .await
+        .outcome(crate::RETRY_AFTER)
 }
 
 // ── BrightSky (DWD) ───────────────────────────────────────────────────────────
@@ -230,4 +241,107 @@ fn format_message(rows_plain: Vec<String>, rows_html: Vec<String>) -> Option<(St
         rows_html.join("<br>")
     );
     Some((plain, html))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::{DateTime, Utc};
+    use mxbot_common::schedule::Runner;
+
+    fn utc(s: &str) -> DateTime<Utc> {
+        s.parse().unwrap()
+    }
+
+    fn temp_db(what: &str) -> (Db, std::path::PathBuf) {
+        let path = std::env::temp_dir().join(format!(
+            "radar-bot-{what}-{}-{}.db",
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        (Db::open(&path).expect("open temp db"), path)
+    }
+
+    /// One round of the forecast job at `now`, its work answering `outcome`;
+    /// when it wants to look again, and whether the work ran.
+    async fn round(
+        runner: &mut Runner,
+        db: &Db,
+        now: &str,
+        outcome: Outcome,
+    ) -> (Option<DateTime<Utc>>, bool) {
+        let mut ran = false;
+        let wake = runner
+            .round(db, utc(now), &mut |_slot: Slot| {
+                ran = true;
+                async move { outcome }
+            })
+            .await;
+        (wake, ran)
+    }
+
+    fn eight() -> Runner {
+        Runner::new(weather_job(Zone::DEFAULT, TimeOfDay::new(8, 0)))
+    }
+
+    #[tokio::test]
+    async fn the_forecast_is_at_local_time_across_both_dst_changes() {
+        let (db, path) = temp_db("weather-dst");
+        db.mark_alert_seen("weather:2026-03-28", "weather")
+            .await
+            .unwrap();
+        db.mark_alert_seen("weather:2026-10-24", "weather")
+            .await
+            .unwrap();
+        let mut weather = eight();
+        // 08:00 CEST is 06:00 UTC: not an hour late.
+        let (wake, ran) = round(&mut weather, &db, "2026-03-28T22:00:00Z", Outcome::Done).await;
+        assert_eq!(wake, Some(utc("2026-03-29T06:00:00Z")));
+        assert!(!ran);
+        // 08:00 CET is 07:00 UTC: an hour early (where a naive sleep woke) nothing is due.
+        let mut weather = eight();
+        let (wake, _) = round(&mut weather, &db, "2026-10-24T22:00:00Z", Outcome::Done).await;
+        assert_eq!(wake, Some(utc("2026-10-25T07:00:00Z")));
+        let (_, ran) = round(&mut weather, &db, "2026-10-25T06:00:00Z", Outcome::Done).await;
+        assert!(!ran);
+        let (_, ran) = round(&mut weather, &db, "2026-10-25T07:00:00Z", Outcome::Done).await;
+        assert!(ran);
+        std::fs::remove_file(path).ok();
+    }
+
+    #[tokio::test]
+    async fn a_forecast_that_failed_is_tried_again_and_recorded_only_once_posted() {
+        let (db, path) = temp_db("weather-retry");
+        let mut weather = eight();
+        let retry = Outcome::RetryIn(crate::RETRY_AFTER);
+        // The fetch (or the post) failed at 08:00: not recorded, tried at 08:15.
+        let (wake, ran) = round(&mut weather, &db, "2026-10-30T07:00:00Z", retry).await;
+        assert!(ran);
+        assert!(!db.is_alert_seen("weather:2026-10-30").await.unwrap());
+        assert_eq!(wake, Some(utc("2026-10-30T07:00:00Z")));
+        let (wake, ran) = round(&mut weather, &db, "2026-10-30T07:01:00Z", Outcome::Done).await;
+        assert!(!ran);
+        assert_eq!(wake, Some(utc("2026-10-30T07:15:00Z")));
+        let (_, ran) = round(&mut weather, &db, "2026-10-30T07:15:00Z", Outcome::Done).await;
+        assert!(ran);
+        assert!(db.is_alert_seen("weather:2026-10-30").await.unwrap());
+        std::fs::remove_file(path).ok();
+    }
+
+    #[tokio::test]
+    async fn a_restart_after_the_post_time_catches_the_forecast_up() {
+        let (db, path) = temp_db("weather-restart");
+        // Posted by the version before (same row): not again.
+        db.mark_alert_seen("weather:2026-10-29", "weather")
+            .await
+            .unwrap();
+        let (_, ran) = round(&mut eight(), &db, "2026-10-29T09:00:00Z", Outcome::Done).await;
+        assert!(!ran);
+        // Down over 08:00: posted at the restart at 10:00, not after 11:00.
+        let (_, ran) = round(&mut eight(), &db, "2026-10-30T09:00:00Z", Outcome::Done).await;
+        assert!(ran);
+        let (_, ran) = round(&mut eight(), &db, "2026-10-31T10:30:00Z", Outcome::Done).await;
+        assert!(!ran);
+        std::fs::remove_file(path).ok();
+    }
 }

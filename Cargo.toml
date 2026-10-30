@@ -13,7 +13,7 @@ chrono = "0.4"
 dashmap = "6"
 feed-rs = "2.3.1"
 futures-util = "0.3"
-mxbot-common = { git = "https://github.com/PolynomialDivision/mxbot-common" }
+mxbot-common = { git = "https://github.com/PolynomialDivision/mxbot-common", features = ["schedule"] }
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "gzip", "deflate", "brotli", "zstd"] }
 rusqlite = "0.40"
 serde = { version = "1", features = ["derive"] }

@@ -15,7 +15,7 @@ use mxbot_common::{
 use tokio::time::sleep;
 use tracing::{error, info, warn};
 
-use crate::db::Db;
+use crate::db::{Db, PostKey};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DwdEditResult {
@@ -186,6 +186,8 @@ async fn check_nina(client: &Bot, http: &reqwest::Client, db: &Db, ags: &str) ->
     let json: serde_json::Value = serde_json::from_str(&body).context("NINA JSON parse failed")?;
     let warnings = json.as_array().context("NINA response is not an array")?;
 
+    // The warnings in the feed (without their version), for the post keys.
+    let mut current: HashSet<String> = HashSet::new();
     for w in warnings {
         let id = match w["id"].as_str() {
             Some(id) => id,
@@ -198,11 +200,14 @@ async fn check_nina(client: &Bot, http: &reqwest::Client, db: &Db, ags: &str) ->
 
         let data = &w["payload"]["data"];
         let headline = data["headline"].as_str().unwrap_or("Warnung");
+        let active_key = nina_active_key(id);
+        if data["msgType"].as_str() != Some("Cancel") {
+            current.insert(active_key.clone());
+        }
         let alert_key = nina_alert_key(id, data);
         if db.is_alert_seen(&alert_key).await? {
             continue;
         }
-        let active_key = nina_active_key(id);
 
         if data["msgType"].as_str() == Some("Cancel") {
             match db.get_active_nina_warning(&active_key).await? {
@@ -261,10 +266,11 @@ async fn check_nina(client: &Bot, http: &reqwest::Client, db: &Db, ags: &str) ->
                     info!("ALERT updated [nina]: {headline}");
                 }
                 DwdEditResult::MissingOriginal => {
-                    if post_nina_warning_to_rooms(
+                    match post_nina_warning_to_rooms(
                         client,
                         db,
                         &active_key,
+                        &alert_key,
                         headline,
                         &nina_region(data),
                         &plain,
@@ -272,34 +278,53 @@ async fn check_nina(client: &Bot, http: &reqwest::Client, db: &Db, ags: &str) ->
                     )
                     .await?
                     {
-                        db.mark_alert_seen(&alert_key, "nina").await?;
-                        info!("ALERT reposted [nina] after missing original: {headline}");
-                    } else {
-                        warn!("ALERT repost failed [nina], will retry next poll: {headline}");
+                        NinaPosted::ThisVersion => {
+                            db.mark_alert_seen(&alert_key, "nina").await?;
+                            info!("ALERT reposted [nina] after missing original: {headline}");
+                        }
+                        NinaPosted::EarlierVersion => {
+                            info!("ALERT reposted [nina], updated next poll: {headline}");
+                        }
+                        NinaPosted::Failed => {
+                            warn!("ALERT repost failed [nina], will retry next poll: {headline}");
+                        }
                     }
                 }
                 DwdEditResult::Failed => {
                     warn!("ALERT update failed [nina], will retry next poll: {headline}");
                 }
             }
-        } else if post_nina_warning_to_rooms(
-            client,
-            db,
-            &active_key,
-            headline,
-            &nina_region(data),
-            &plain,
-            &html,
-        )
-        .await?
-        {
-            db.mark_alert_seen(&alert_key, "nina").await?;
-            info!("ALERT sent [nina]: {headline}");
         } else {
-            warn!("ALERT post failed [nina], will retry next poll: {headline}");
+            match post_nina_warning_to_rooms(
+                client,
+                db,
+                &active_key,
+                &alert_key,
+                headline,
+                &nina_region(data),
+                &plain,
+                &html,
+            )
+            .await?
+            {
+                NinaPosted::ThisVersion => {
+                    db.mark_alert_seen(&alert_key, "nina").await?;
+                    info!("ALERT sent [nina]: {headline}");
+                }
+                NinaPosted::EarlierVersion => {
+                    info!(
+                        "ALERT sent [nina], earlier version's rooms updated next poll: {headline}"
+                    );
+                }
+                NinaPosted::Failed => {
+                    warn!("ALERT post failed [nina], will retry next poll: {headline}");
+                }
+            }
         }
     }
 
+    // Warnings that left the feed before every room had them.
+    db.forget_post_keys_except(NINA_POST_KEYS, &current).await?;
     Ok(())
 }
 
@@ -588,6 +613,7 @@ async fn check_dwd_weather_warnings(
                         client,
                         db,
                         &primary_id,
+                        active.event_ids_json.as_deref().unwrap_or_default(),
                         &primary.headline,
                         region,
                         event_key,
@@ -639,6 +665,7 @@ async fn check_dwd_weather_warnings(
                                 client,
                                 db,
                                 &primary_id,
+                                ids_json,
                                 &primary.headline,
                                 region,
                                 event_key,
@@ -756,6 +783,7 @@ async fn check_dwd_weather_warnings(
                                 client,
                                 db,
                                 &primary_id,
+                                ids_json,
                                 &primary.headline,
                                 region,
                                 event_key,
@@ -790,11 +818,16 @@ async fn check_dwd_weather_warnings(
                 None => {
                     // No event IDs (pre-upgrade row): can't edit. Post fresh and
                     // clean up the stale row so no spurious all-clear fires.
+                    let first =
+                        dwd_occurrence_key(db, &primary_id, primary.start_ms, primary.end_ms, None)
+                            .await?;
                     let (all_ok, room_event_ids) =
-                        post_alert_to_rooms(client, &primary_id, &new_plain, &new_html).await;
+                        post_alert_to_rooms(client, &first.key, &new_plain, &new_html).await;
                     if all_ok {
                         let ids_json = serde_json::to_string(&room_event_ids)
                             .unwrap_or_else(|_| String::from("{}"));
+                        // The window of the first attempt: if it moved since,
+                        // the next poll edits every room's message to the new one.
                         db.promote_dwd_active_warning(
                             old_id,
                             &primary_id,
@@ -802,8 +835,8 @@ async fn check_dwd_weather_warnings(
                             region,
                             event_key,
                             &ids_json,
-                            primary.start_ms,
-                            primary.end_ms,
+                            first.start_ms,
+                            first.end_ms,
                             &new_plain,
                             &new_html,
                         )
@@ -830,19 +863,23 @@ async fn check_dwd_weather_warnings(
                 &desc,
                 Some("https://www.dwd.de/DE/wetter/warnungen_gemeinden/warnWetter_node.html"),
             );
+            let first =
+                dwd_occurrence_key(db, &primary_id, primary.start_ms, primary.end_ms, None).await?;
             let (all_ok, room_event_ids) =
-                post_alert_to_rooms(client, &primary_id, &plain, &html).await;
+                post_alert_to_rooms(client, &first.key, &plain, &html).await;
             if all_ok {
                 let ids_json =
                     serde_json::to_string(&room_event_ids).unwrap_or_else(|_| String::from("{}"));
+                // The window of the first attempt: if it moved since, the
+                // next poll edits every room's message to the new one.
                 db.mark_dwd_alert_posted(
                     &primary_id,
                     &primary.headline,
                     region,
                     event_key,
                     &ids_json,
-                    primary.start_ms,
-                    primary.end_ms,
+                    first.start_ms,
+                    first.end_ms,
                     &plain,
                     &html,
                 )
@@ -856,6 +893,11 @@ async fn check_dwd_weather_warnings(
             }
         }
     }
+
+    // Warnings that left the feed before every room had them: if they come
+    // back, that is a new occurrence with a key of its own.
+    db.forget_post_keys_except(DWD_POST_KEYS, &current_active)
+        .await?;
 
     // Genuine all-clears: warnings that disappeared from DWD with no replacement
     // at any level. Level changes are handled above in Phase 2 (promoted_keys).
@@ -1505,7 +1547,9 @@ async fn check_usgs(
         let desc = format_usgs_description(f);
 
         let (plain, html) = format_alert("USGS Earthquakes", title, &desc, url);
-        if crate::post_to_rooms(client, &plain, &html).await {
+        // Retried with the same transaction IDs: rooms that got it get no second copy.
+        let key = format!("usgs:{id}");
+        if post_alert_to_rooms(client, &key, &plain, &html).await.0 {
             db.mark_alert_seen(id, "usgs").await?;
             info!("ALERT sent [usgs]: {title}");
         } else {
@@ -1564,7 +1608,9 @@ async fn check_gdacs(
 
         let desc = format_gdacs_description(&item, item.coords);
         let (plain, html) = format_alert("GDACS", &item.title, &desc, item.link.as_deref());
-        if crate::post_to_rooms(client, &plain, &html).await {
+        // Retried with the same transaction IDs: rooms that got it get no second copy.
+        let key = format!("gdacs:{}", item.guid);
+        if post_alert_to_rooms(client, &key, &plain, &html).await.0 {
             db.mark_alert_seen(&item.guid, "gdacs").await?;
             info!("ALERT sent [gdacs]: {}", item.title);
         } else {
@@ -1612,6 +1658,42 @@ async fn post_alert_to_rooms(
     (all_ok, event_ids)
 }
 
+/// The key of a DWD warning post's transaction IDs. `stable` alone names
+/// the warning, and the same warning comes back (next week's storm at the
+/// same level): the homeserver remembers transaction IDs for good and would
+/// answer with the old message instead of posting the new one. So the key
+/// also names this occurrence: by the warning's end at its first attempt
+/// (DWD gives no ID of its own, and its start moves with every poll), and
+/// for a repost by the messages it replaces. [`dwd_occurrence_key`] keeps
+/// it for the retries of that post (some rooms failed), also when DWD moves
+/// the end in between, so rooms that have it get no second copy.
+fn dwd_post_key(stable: &str, end_ms: i64, replaces: Option<&str>) -> String {
+    match replaces {
+        Some(replaced) => format!("{stable}|end={end_ms}|replaces={replaced}"),
+        None => format!("{stable}|end={end_ms}"),
+    }
+}
+
+/// The `source` of DWD rows in `alert_post_keys`.
+const DWD_POST_KEYS: &str = "dwd";
+/// The `source` of NINA rows in `alert_post_keys`.
+const NINA_POST_KEYS: &str = "nina";
+
+/// The key (and window) for posting the DWD warning `id` now: the one of its
+/// first attempt while that post has not reached every room, else a new one
+/// ([`dwd_post_key`]) from this window. Once stored as delivered, or gone
+/// from the feed, the next post of `id` gets a new key.
+async fn dwd_occurrence_key(
+    db: &Db,
+    id: &str,
+    start_ms: i64,
+    end_ms: i64,
+    replaces: Option<&str>,
+) -> Result<PostKey> {
+    let key = dwd_post_key(id, end_ms, replaces);
+    db.post_key(id, DWD_POST_KEYS, &key, start_ms, end_ms).await
+}
+
 fn stable_alert_transaction_id(alert_key: &str, room_id: &str) -> OwnedTransactionId {
     let mut hash = 0xcbf29ce484222325u64;
     for byte in alert_key
@@ -1631,6 +1713,7 @@ async fn repost_dwd_active_warning(
     client: &Bot,
     db: &Db,
     id: &str,
+    replaces: &str,
     headline: &str,
     region: &str,
     event: &str,
@@ -1639,35 +1722,70 @@ async fn repost_dwd_active_warning(
     plain: &str,
     html: &str,
 ) -> Result<bool> {
-    let (all_ok, room_event_ids) = post_alert_to_rooms(client, id, plain, html).await;
+    let first = dwd_occurrence_key(db, id, start_ms, end_ms, Some(replaces)).await?;
+    let (all_ok, room_event_ids) = post_alert_to_rooms(client, &first.key, plain, html).await;
     if !all_ok {
         return Ok(false);
     }
     let ids_json = serde_json::to_string(&room_event_ids).unwrap_or_else(|_| String::from("{}"));
+    // The window of the first attempt: if it moved since, the next poll
+    // edits every room's message to the new one.
     db.mark_dwd_alert_posted(
-        id, headline, region, event, &ids_json, start_ms, end_ms, plain, html,
+        id,
+        headline,
+        region,
+        event,
+        &ids_json,
+        first.start_ms,
+        first.end_ms,
+        plain,
+        html,
     )
     .await?;
     Ok(true)
 }
 
+/// What [`post_nina_warning_to_rooms`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NinaPosted {
+    /// Every room has this version.
+    ThisVersion,
+    /// Every room has the warning, but those that got an earlier version's
+    /// first attempt still show that one: the version is not marked seen,
+    /// so the next poll edits the messages to it.
+    EarlierVersion,
+    /// Some room failed: tried again next poll.
+    Failed,
+}
+
+/// `alert_key` names this version of the warning (its ID with the version
+/// number, its send time): see [`dwd_post_key`] for why `id` alone is not
+/// enough. While an earlier version's post has not reached every room, its
+/// key is used ([`Db::post_key`]), so rooms that have it get no second copy.
+#[allow(clippy::too_many_arguments)]
 async fn post_nina_warning_to_rooms(
     client: &Bot,
     db: &Db,
     id: &str,
+    alert_key: &str,
     headline: &str,
     region: &str,
     plain: &str,
     html: &str,
-) -> Result<bool> {
-    let (all_ok, room_event_ids) = post_alert_to_rooms(client, id, plain, html).await;
+) -> Result<NinaPosted> {
+    let first = db.post_key(id, NINA_POST_KEYS, alert_key, 0, 0).await?;
+    let (all_ok, room_event_ids) = post_alert_to_rooms(client, &first.key, plain, html).await;
     if !all_ok {
-        return Ok(false);
+        return Ok(NinaPosted::Failed);
     }
     let ids_json = serde_json::to_string(&room_event_ids).unwrap_or_else(|_| String::from("{}"));
     db.mark_nina_alert_posted(id, headline, region, &ids_json, plain, html)
         .await?;
-    Ok(true)
+    Ok(if first.key == alert_key {
+        NinaPosted::ThisVersion
+    } else {
+        NinaPosted::EarlierVersion
+    })
 }
 
 /// Edit the original alert message in each room.
@@ -1861,6 +1979,226 @@ mod tests {
         assert!(!is_nina_dwd_weather_warning(
             "mow.DE-BE-B-SE017-20260620-017-000"
         ));
+    }
+
+    #[test]
+    fn a_warning_that_comes_back_is_posted_again() {
+        let stable = "dwd:warnings:Berlin:WIND:3";
+        let room = "!room:matrix.org";
+        let txn = |key: &str| stable_alert_transaction_id(key, room);
+        let storm = dwd_post_key(stable, 1_780_000_000_000, None);
+        // Retried (one room failed): the same transaction ID.
+        assert_eq!(
+            txn(&storm),
+            txn(&dwd_post_key(stable, 1_780_000_000_000, None))
+        );
+        // The same warning a week later: a new one, not swallowed.
+        let next_week = dwd_post_key(stable, 1_780_604_800_000, None);
+        assert_ne!(txn(&storm), txn(&next_week));
+        // A repost of a deleted message: new, and new again for the next.
+        let repost = dwd_post_key(stable, 1_780_000_000_000, Some(r#"{"!r":"$a"}"#));
+        let again = dwd_post_key(stable, 1_780_000_000_000, Some(r#"{"!r":"$b"}"#));
+        assert_ne!(txn(&storm), txn(&repost));
+        assert_ne!(txn(&repost), txn(&again));
+        // NINA: each version of a warning has its own key.
+        let first = serde_json::json!({"sent": "2026-06-20T10:00:00+02:00"});
+        let later = serde_json::json!({"sent": "2026-06-27T10:00:00+02:00"});
+        assert_ne!(
+            txn(&nina_alert_key(
+                "mow.DE-BE-B-SE017-20260620-017-000",
+                &first
+            )),
+            txn(&nina_alert_key(
+                "mow.DE-BE-B-SE017-20260627-018-000",
+                &later
+            ))
+        );
+    }
+
+    fn temp_db(what: &str) -> (Db, std::path::PathBuf) {
+        let path = std::env::temp_dir().join(format!(
+            "radar-bot-alerts-{what}-{}-{}.db",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        (Db::open(&path).expect("open temp db"), path)
+    }
+
+    const STORM: &str = "dwd:warnings:Berlin:WIND:3";
+    const ROOM: &str = "!room:matrix.org";
+    const START: i64 = 1_780_000_000_000;
+    const END: i64 = 1_780_010_000_000;
+    const LATER_END: i64 = 1_780_020_000_000;
+
+    /// Store `id` as delivered (the poll's `mark_dwd_alert_posted`).
+    async fn delivered(db: &Db, id: &str, first: &PostKey) {
+        db.mark_dwd_alert_posted(
+            id,
+            "Sturmböen",
+            "Berlin",
+            "WIND",
+            r#"{"!room:matrix.org":"$a"}"#,
+            first.start_ms,
+            first.end_ms,
+            "plain",
+            "html",
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_dwd_retry_after_the_end_moved_sends_the_first_attempts_post() {
+        let (db, path) = temp_db("dwd-retry");
+        let txn = |key: &PostKey| stable_alert_transaction_id(&key.key, ROOM);
+        // One room failed: not stored. DWD extends the warning before the retry.
+        let first = dwd_occurrence_key(&db, STORM, START, END, None)
+            .await
+            .unwrap();
+        assert_eq!(first.key, dwd_post_key(STORM, END, None));
+        let retry = dwd_occurrence_key(&db, STORM, START + 60_000, LATER_END, None)
+            .await
+            .unwrap();
+        // Same transaction ID: the room that has it gets no second copy.
+        assert_eq!(txn(&retry), txn(&first));
+        // Stored with the first attempt's window, so the next poll sees the
+        // new end and edits every room's message to it.
+        assert_eq!((retry.start_ms, retry.end_ms), (START, END));
+        delivered(&db, STORM, &retry).await;
+        let active = db.list_active_dwd_warnings().await.unwrap();
+        assert_eq!(active[0].end_ms, END);
+        assert_ne!(active[0].end_ms, LATER_END, "differs: edited next poll");
+        std::fs::remove_file(path).ok();
+    }
+
+    #[tokio::test]
+    async fn a_dwd_warning_that_comes_back_after_it_ended_is_posted_again() {
+        let (db, path) = temp_db("dwd-back");
+        let next_week = END + 7 * 86_400_000;
+        // Delivered, then the all-clear: next week's storm is a new post.
+        let first = dwd_occurrence_key(&db, STORM, START, END, None)
+            .await
+            .unwrap();
+        delivered(&db, STORM, &first).await;
+        db.mark_dwd_allclear_sent(STORM).await.unwrap();
+        let again = dwd_occurrence_key(&db, STORM, START, next_week, None)
+            .await
+            .unwrap();
+        assert_eq!(again.key, dwd_post_key(STORM, next_week, None));
+        assert_ne!(again.key, first.key);
+
+        // Never delivered everywhere: while it is in the feed the key stays…
+        let (db, path2) = temp_db("dwd-back-partial");
+        let first = dwd_occurrence_key(&db, STORM, START, END, None)
+            .await
+            .unwrap();
+        let feed: HashSet<String> = [STORM.to_owned()].into();
+        assert_eq!(db.forget_post_keys_except("dwd", &feed).await.unwrap(), 0);
+        let retry = dwd_occurrence_key(&db, STORM, START, LATER_END, None)
+            .await
+            .unwrap();
+        assert_eq!(retry.key, first.key);
+        // …and it goes when the warning leaves the feed (it ended).
+        assert_eq!(
+            db.forget_post_keys_except("dwd", &HashSet::new())
+                .await
+                .unwrap(),
+            1
+        );
+        let again = dwd_occurrence_key(&db, STORM, START, next_week, None)
+            .await
+            .unwrap();
+        assert_ne!(again.key, first.key);
+        // NINA's rows are not DWD's to drop.
+        db.post_key("mow.DE-BE-1", "nina", "nina:v1", 0, 0)
+            .await
+            .unwrap();
+        db.forget_post_keys_except("dwd", &HashSet::new())
+            .await
+            .unwrap();
+        let nina = db.post_key("mow.DE-BE-1", "nina", "nina:v2", 0, 0).await;
+        assert_eq!(nina.unwrap().key, "nina:v1");
+        std::fs::remove_file(path).ok();
+        std::fs::remove_file(path2).ok();
+    }
+
+    #[tokio::test]
+    async fn dwd_level_changes_and_reposts_get_keys_of_their_own() {
+        let (db, path) = temp_db("dwd-update");
+        let first = dwd_occurrence_key(&db, STORM, START, END, None)
+            .await
+            .unwrap();
+        // A level change while level 3 is still pending: level 4 is another
+        // warning with its own key, as before.
+        let level4 = "dwd:warnings:Berlin:WIND:4";
+        let promoted = dwd_occurrence_key(&db, level4, START, END, None)
+            .await
+            .unwrap();
+        assert_eq!(promoted.key, dwd_post_key(level4, END, None));
+        assert_ne!(promoted.key, first.key);
+        // Level 3 delivered, then promoted to 4 by an edit: no key is left
+        // behind for either.
+        delivered(&db, STORM, &first).await;
+        db.promote_dwd_active_warning(
+            STORM,
+            level4,
+            "Orkanböen",
+            "Berlin",
+            "WIND",
+            "{}",
+            START,
+            END,
+            "p",
+            "h",
+        )
+        .await
+        .unwrap();
+        let later = dwd_occurrence_key(&db, level4, START, LATER_END, None)
+            .await
+            .unwrap();
+        assert_eq!(later.key, dwd_post_key(level4, LATER_END, None));
+        // A repost of a delivered warning (its message was deleted) is new.
+        let (db, path2) = temp_db("dwd-repost");
+        let first = dwd_occurrence_key(&db, STORM, START, END, None)
+            .await
+            .unwrap();
+        delivered(&db, STORM, &first).await;
+        let repost = dwd_occurrence_key(&db, STORM, START, END, Some(r#"{"!r":"$a"}"#))
+            .await
+            .unwrap();
+        assert_ne!(repost.key, first.key);
+        assert_eq!(repost.key, dwd_post_key(STORM, END, Some(r#"{"!r":"$a"}"#)));
+        std::fs::remove_file(path).ok();
+        std::fs::remove_file(path2).ok();
+    }
+
+    #[tokio::test]
+    async fn a_nina_version_retried_after_a_partial_failure_keeps_the_first_key() {
+        let (db, path) = temp_db("nina-retry");
+        let id = "mow.DE-BE-B-SE017-20260620-017";
+        let v1 = nina_alert_key(
+            "mow.DE-BE-B-SE017-20260620-017-000",
+            &json!({"sent": "2026-06-20T10:00:00+02:00"}),
+        );
+        let v2 = nina_alert_key(
+            "mow.DE-BE-B-SE017-20260620-017-001",
+            &json!({"sent": "2026-06-20T11:00:00+02:00"}),
+        );
+        db.post_key(id, NINA_POST_KEYS, &v1, 0, 0).await.unwrap();
+        // v2 arrives before every room had v1: v1's key, no second copy.
+        let retry = db.post_key(id, NINA_POST_KEYS, &v2, 0, 0).await.unwrap();
+        assert_eq!(retry.key, v1);
+        // Delivered: the next version is posted (or edited) as its own.
+        db.mark_nina_alert_posted(id, "Warnung", "Berlin", "{}", "p", "h")
+            .await
+            .unwrap();
+        let v3 = db.post_key(id, NINA_POST_KEYS, "nina:v3", 0, 0).await;
+        assert_eq!(v3.unwrap().key, "nina:v3");
+        // An all-clear ends it too.
+        db.mark_nina_allclear_sent(id).await.unwrap();
+        let v4 = db.post_key(id, NINA_POST_KEYS, "nina:v4", 0, 0).await;
+        assert_eq!(v4.unwrap().key, "nina:v4");
+        std::fs::remove_file(path).ok();
     }
 
     #[test]

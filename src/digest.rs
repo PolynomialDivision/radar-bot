@@ -1,6 +1,7 @@
 //! Digest formatting, duplicate clustering, chunking and the digest loop.
 
 use super::*;
+use mxbot_common::schedule::{Delivery, Job, Ledger, Outcome, Rule, Slot};
 
 // ── Message formatting ────────────────────────────────────────────────────────
 
@@ -502,130 +503,195 @@ pub(crate) fn chunk_digest(items: &[DigestItem]) -> Vec<Vec<DigestItem>> {
 
 // ── Digest loop ───────────────────────────────────────────────────────────────
 
-pub(crate) async fn digest_loop(
-    client: Bot,
-    digest_times: Vec<String>,
-    db: Db,
-    min_score: i32,
-    candidate_min_sources: usize,
-    candidate_retention_hours: u64,
-) {
-    let targets: Vec<NaiveTime> = digest_times
+/// The digest as a scheduled job: at each of `digest_times` (local time), a
+/// digest missed by a restart caught up within [`CATCH_UP`], recorded in
+/// the `alerts` table once handled (`digest:2026-10-30 08:00`). `None` when
+/// no time is valid.
+pub(crate) fn digest_job(zone: Zone, digest_times: &[String]) -> Option<Job> {
+    let targets: Vec<TimeOfDay> = digest_times
         .iter()
-        .filter_map(|s| {
-            let mut p = s.splitn(2, ':');
-            let h: u32 = p.next()?.parse().ok()?;
-            let m: u32 = p.next()?.parse().ok()?;
-            NaiveTime::from_hms_opt(h, m, 0)
+        .filter_map(|s| match s.parse() {
+            Ok(time) => Some(time),
+            Err(e) => {
+                warn!("Ignoring digest time {s:?}: {e:#}");
+                None
+            }
         })
         .collect();
 
     if targets.is_empty() {
         warn!("No valid digest_times configured, digest loop disabled");
-        // Wait instead of returning: the loop is supervised, its end would restart the bot.
-        return std::future::pending().await;
+        return None;
+    }
+    let rule = Rule::Daily { at: targets };
+    Some(Job::new(
+        "digest",
+        zone,
+        Delivery::AtLeastOnce,
+        CATCH_UP,
+        move || Some(rule.clone()),
+    ))
+}
+
+pub(crate) async fn digest_loop(
+    client: Bot,
+    job: Job,
+    db: Db,
+    min_score: i32,
+    candidate_min_sources: usize,
+    candidate_retention_hours: u64,
+    alive: Alive,
+) {
+    if let Err(e) = seed_digest_ledger(&db, &job, chrono::Utc::now()).await {
+        warn!("Digest: could not seed the ledger: {e:#}");
+    }
+    let ledger = db.clone();
+    schedule::run(job, ledger, alive, move |slot: Slot| {
+        let client = client.clone();
+        let db = db.clone();
+        async move {
+            post_digest(
+                &client,
+                &db,
+                &slot,
+                min_score,
+                candidate_min_sources,
+                candidate_retention_hours,
+            )
+            .await
+        }
+    })
+    .await
+}
+
+/// The first start of the version that records digests in the ledger: the
+/// version before wrote no `digest:` rows, so a digest it posted within
+/// [`CATCH_UP`] would run again. With no digest row at all, the latest slot
+/// is recorded as handled instead of run (items it did not post stay queued
+/// for the next digest). Whether it seeded.
+pub(crate) async fn seed_digest_ledger(
+    db: &Db,
+    job: &Job,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<bool> {
+    let entry = job.ledger_entry();
+    if db.has_alerts_from(entry).await? {
+        return Ok(false);
+    }
+    let Some(slot) = job.latest(now) else {
+        return Ok(false);
+    };
+    db.mark_done(entry, &slot).await?;
+    info!(
+        "Digest: no digest recorded yet (first start of this version), counting the one of {} as posted",
+        slot.local.format("%a %d %b %H:%M")
+    );
+    Ok(true)
+}
+
+/// The digest of `slot`: everything queued since the last one. Chunks that
+/// did not get through are requeued and the digest is tried again after
+/// [`RETRY_AFTER`]; each chunk's transaction IDs name the slot and its
+/// items, so rooms that already have it get no second copy.
+async fn post_digest(
+    client: &Bot,
+    db: &Db,
+    slot: &Slot,
+    min_score: i32,
+    candidate_min_sources: usize,
+    candidate_retention_hours: u64,
+) -> Outcome {
+    if let Err(e) = promote_candidate_clusters(
+        db,
+        min_score,
+        candidate_min_sources,
+        candidate_retention_hours,
+    )
+    .await
+    {
+        warn!("Digest: candidate promotion failed, continuing with queued items: {e}");
     }
 
-    loop {
-        let now = Local::now();
-        let today = now.date_naive();
-        let next_dt = targets
-            .iter()
-            .map(|t| {
-                if now.time() < *t {
-                    today.and_time(*t)
-                } else {
-                    (today + chrono::Duration::days(1)).and_time(*t)
-                }
-            })
-            .min()
-            .unwrap();
-        let secs = (next_dt - now.naive_local()).num_seconds().max(0) as u64;
-        info!("Next digest in {secs}s (at {})", next_dt.format("%H:%M"));
-        sleep(Duration::from_secs(secs)).await;
-
-        if let Err(e) = promote_candidate_clusters(
-            &db,
-            min_score,
-            candidate_min_sources,
-            candidate_retention_hours,
-        )
-        .await
-        {
-            warn!("Digest: candidate promotion failed, continuing with queued items: {e}");
+    let items = match db.take_for_digest(min_score).await {
+        Ok(v) => v,
+        Err(e) => {
+            error!("Digest: failed to query DB: {e}");
+            return Outcome::RetryIn(RETRY_AFTER);
         }
+    };
 
-        let items = match db.take_for_digest(min_score).await {
-            Ok(v) => v,
-            Err(e) => {
-                error!("Digest: failed to query DB: {e}");
-                continue;
-            }
-        };
-
-        let posted = match db.list_recent_posted(ALREADY_POSTED_WINDOW_SECS).await {
-            Ok(v) => v,
-            Err(e) => {
-                warn!("Digest: failed to load recently posted items: {e}");
-                Vec::new()
-            }
-        };
-        let (items, repeats) = split_already_posted(items, &posted);
-        if !repeats.is_empty() {
-            info!(
-                "Digest: {} item(s) repeat an already posted story, not posting",
-                repeats.len()
-            );
-            let guids: Vec<String> = repeats.into_iter().map(|item| item.guid).collect();
-            if let Err(e) = db
-                .drop_processing(&guids, "same story already posted")
-                .await
-            {
-                warn!("Digest: failed to drop repeated items: {e}");
-            }
+    let posted = match db.list_recent_posted(ALREADY_POSTED_WINDOW_SECS).await {
+        Ok(v) => v,
+        Err(e) => {
+            warn!("Digest: failed to load recently posted items: {e}");
+            Vec::new()
         }
-
-        if items.is_empty() {
-            info!("Digest: no pending items, staying silent");
-            continue;
-        }
-
-        let day_str = Local::now().format("%A, %d %b %Y").to_string();
-        let header = format!("Digest · {day_str}");
-        let clustered_items = cluster_digest_items(items);
+    };
+    let (items, repeats) = split_already_posted(items, &posted);
+    if !repeats.is_empty() {
         info!(
-            "Posting digest with {} clustered item(s)",
-            clustered_items.len()
+            "Digest: {} item(s) repeat an already posted story, not posting",
+            repeats.len()
         );
-        let chunks = chunk_digest(&clustered_items);
-        let total = chunks.len();
-        for (i, chunk) in chunks.into_iter().enumerate() {
-            let chunk_header = if total > 1 {
-                format!("{header} ({}/{})", i + 1, total)
-            } else {
-                header.clone()
-            };
-            let (plain, html) = format_digest(&chunk, &chunk_header);
-            let guids: Vec<String> = chunk
-                .iter()
-                .flat_map(|it| it.guids.iter().cloned())
-                .collect();
-            if post_to_rooms(&client, &plain, &html).await {
-                if let Err(e) = db.mark_posted(&guids).await {
-                    error!("Digest: failed to mark items posted: {e}");
-                }
-            } else {
-                warn!(
-                    "Digest: post failed, requeueing {} item(s) for retry",
-                    guids.len()
-                );
-                db.requeue_failed(&guids, "post_to_rooms failed").await.ok();
-            }
-            if total > 1 {
-                sleep(Duration::from_millis(500)).await;
-            }
+        let guids: Vec<String> = repeats.into_iter().map(|item| item.guid).collect();
+        if let Err(e) = db
+            .drop_processing(&guids, "same story already posted")
+            .await
+        {
+            warn!("Digest: failed to drop repeated items: {e}");
         }
     }
+
+    if items.is_empty() {
+        info!("Digest: no pending items, staying silent");
+        return Outcome::Skipped;
+    }
+
+    let day_str = Local::now().format("%A, %d %b %Y").to_string();
+    let header = format!("Digest · {day_str}");
+    let clustered_items = cluster_digest_items(items);
+    info!(
+        "Posting digest with {} clustered item(s)",
+        clustered_items.len()
+    );
+    let chunks = chunk_digest(&clustered_items);
+    let total = chunks.len();
+    let deadline = std::time::Instant::now() + SEND_FOR;
+    let mut outcome = Outcome::Done;
+    for (i, chunk) in chunks.into_iter().enumerate() {
+        let chunk_header = if total > 1 {
+            format!("{header} ({}/{})", i + 1, total)
+        } else {
+            header.clone()
+        };
+        let (plain, html) = format_digest(&chunk, &chunk_header);
+        let guids: Vec<String> = chunk
+            .iter()
+            .flat_map(|it| it.guids.iter().cloned())
+            .collect();
+        let key = digest_post_key(slot, &guids);
+        let delivered = post_slot(client, &plain, &html, &key, deadline).await;
+        if let Outcome::RetryIn(after) = delivered.outcome(RETRY_AFTER) {
+            warn!(
+                "Digest: post failed, requeueing {} item(s) for retry",
+                guids.len()
+            );
+            db.requeue_failed(&guids, "post_to_rooms failed").await.ok();
+            outcome = Outcome::RetryIn(after);
+        } else if let Err(e) = db.mark_posted(&guids).await {
+            error!("Digest: failed to mark items posted: {e}");
+        }
+        if total > 1 {
+            sleep(Duration::from_millis(500)).await;
+        }
+    }
+    outcome
+}
+
+/// The key of a digest chunk's transaction IDs: the slot and the items in
+/// it. A chunk tried again with the same items is the same post.
+fn digest_post_key(slot: &Slot, guids: &[String]) -> String {
+    format!("radar-bot:digest:{}:{}", slot.key(), guids.join(","))
 }
 
 #[cfg(test)]
@@ -747,5 +813,127 @@ mod tests {
 
         assert!(plain.contains("⭐ 2/5"));
         assert!(plain.contains("📍 Friedrichshain"));
+    }
+
+    /// One round of the digest job at `now`; the slot it ran, if any.
+    async fn digest_round(
+        runner: &mut mxbot_common::schedule::Runner,
+        db: &Db,
+        now: &str,
+    ) -> (Option<chrono::DateTime<chrono::Utc>>, Option<String>) {
+        let mut ran = None;
+        let wake = runner
+            .round(db, now.parse().unwrap(), &mut |slot: Slot| {
+                ran = Some(slot.key());
+                async { Outcome::Done }
+            })
+            .await;
+        (wake, ran)
+    }
+
+    #[tokio::test]
+    async fn digest_times_are_local_and_each_is_a_slot_of_its_own() {
+        let job = digest_job(
+            Zone::DEFAULT,
+            &[
+                "08:00".to_owned(),
+                "nonsense".to_owned(),
+                "20:00".to_owned(),
+            ],
+        )
+        .unwrap();
+        let mut runner = mxbot_common::schedule::Runner::new(job);
+        let path = std::env::temp_dir().join(format!(
+            "radar-bot-digest-dst-{}-{}.db",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let db = Db::open(&path).unwrap();
+        db.mark_alert_seen("digest:2026-10-24 20:00", "digest")
+            .await
+            .unwrap();
+        // Saturday night before the autumn change: 08:00 CET is 07:00 UTC.
+        let (wake, ran) = digest_round(&mut runner, &db, "2026-10-24T22:00:00Z").await;
+        assert_eq!(wake, Some("2026-10-25T07:00:00Z".parse().unwrap()));
+        assert_eq!(ran, None);
+        // An hour early (where a naive sleep woke, then digested again at 08:00).
+        let (_, ran) = digest_round(&mut runner, &db, "2026-10-25T06:00:00Z").await;
+        assert_eq!(ran, None);
+        let (_, ran) = digest_round(&mut runner, &db, "2026-10-25T07:00:00Z").await;
+        assert_eq!(ran.as_deref(), Some("2026-10-25 08:00"));
+        let (_, ran) = digest_round(&mut runner, &db, "2026-10-25T07:01:00Z").await;
+        assert_eq!(ran, None);
+        let (_, ran) = digest_round(&mut runner, &db, "2026-10-25T19:00:00Z").await;
+        assert_eq!(ran.as_deref(), Some("2026-10-25 20:00"));
+        assert!(db.is_alert_seen("digest:2026-10-25 20:00").await.unwrap());
+        assert!(digest_job(Zone::DEFAULT, &["25:00".to_owned()]).is_none());
+        std::fs::remove_file(path).ok();
+    }
+
+    #[tokio::test]
+    async fn the_first_start_records_the_last_digest_instead_of_posting_it_again() {
+        let job = || digest_job(Zone::DEFAULT, &["08:00".to_owned(), "20:00".to_owned()]).unwrap();
+        let temp = |what: &str| {
+            std::env::temp_dir().join(format!(
+                "radar-bot-digest-{what}-{}-{}.db",
+                std::process::id(),
+                chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+            ))
+        };
+        let path = temp("seed");
+        let db = Db::open(&path).unwrap();
+        // The old version posted the 08:00 digest (07:00 UTC); the new one
+        // starts at 08:30 local, within CATCH_UP.
+        let restart = "2026-10-30T07:30:00Z".parse().unwrap();
+        assert!(seed_digest_ledger(&db, &job(), restart).await.unwrap());
+        assert!(db.is_alert_seen("digest:2026-10-30 08:00").await.unwrap());
+        let mut runner = mxbot_common::schedule::Runner::new(job());
+        let (wake, ran) = digest_round(&mut runner, &db, "2026-10-30T07:30:00Z").await;
+        assert_eq!(ran, None);
+        assert_eq!(wake, Some("2026-10-30T19:00:00Z".parse().unwrap()));
+        // Once: the next start finds the row and seeds nothing.
+        assert!(!seed_digest_ledger(&db, &job(), restart).await.unwrap());
+        let (_, ran) = digest_round(&mut runner, &db, "2026-10-30T19:00:00Z").await;
+        assert_eq!(ran.as_deref(), Some("2026-10-30 20:00"));
+        std::fs::remove_file(path).ok();
+
+        // A ledger with digest rows: a missed digest is caught up as usual.
+        let path = temp("seeded");
+        let db = Db::open(&path).unwrap();
+        db.mark_alert_seen("digest:2026-10-29 20:00", "digest")
+            .await
+            .unwrap();
+        assert!(!seed_digest_ledger(&db, &job(), restart).await.unwrap());
+        let mut runner = mxbot_common::schedule::Runner::new(job());
+        let (_, ran) = digest_round(&mut runner, &db, "2026-10-30T07:30:00Z").await;
+        assert_eq!(ran.as_deref(), Some("2026-10-30 08:00"));
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn a_digest_chunk_keeps_its_transaction_key_until_its_items_change() {
+        let zone = Zone::DEFAULT;
+        let rule = Rule::Daily {
+            at: vec![TimeOfDay::new(8, 0), TimeOfDay::new(20, 0)],
+        };
+        let morning = rule
+            .latest(zone, "2026-10-30T08:00:00Z".parse().unwrap())
+            .unwrap();
+        let evening = rule
+            .latest(zone, "2026-10-30T20:00:00Z".parse().unwrap())
+            .unwrap();
+        let items = ["a".to_owned(), "b".to_owned()];
+        assert_eq!(
+            digest_post_key(&morning, &items),
+            digest_post_key(&morning, &items)
+        );
+        assert_ne!(
+            digest_post_key(&morning, &items),
+            digest_post_key(&morning, &items[..1])
+        );
+        assert_ne!(
+            digest_post_key(&morning, &items),
+            digest_post_key(&evening, &items)
+        );
     }
 }

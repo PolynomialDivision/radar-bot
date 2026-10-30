@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
@@ -5,6 +6,7 @@ use anyhow::{Context, Result};
 use rusqlite::{params, Connection};
 
 use crate::FeedItem;
+use mxbot_common::schedule::{Ledger, Slot};
 
 // ── Public types ──────────────────────────────────────────────────────────────
 
@@ -20,6 +22,15 @@ pub struct DwdActiveWarning {
     pub original_plain: Option<String>,
     pub original_html: Option<String>,
     /// DWD start/end timestamps (ms) as last seen. Used to detect time updates.
+    pub start_ms: i64,
+    pub end_ms: i64,
+}
+
+/// The transaction key of an alert occurrence's post, fixed at its first
+/// attempt, with the warning's time window as it was then.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PostKey {
+    pub key: String,
     pub start_ms: i64,
     pub end_ms: i64,
 }
@@ -604,6 +615,108 @@ impl Db {
         .await?
     }
 
+    /// Whether any `alerts` row came from `source` (a scheduled job's name:
+    /// whether its ledger has been written at all).
+    pub async fn has_alerts_from(&self, source: &str) -> Result<bool> {
+        let db = self.0.clone();
+        let source = source.to_owned();
+        tokio::task::spawn_blocking(move || {
+            let conn = db.lock().unwrap_or_else(|e| e.into_inner());
+            let found: bool = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM alerts WHERE source = ?1)",
+                params![source],
+                |r| r.get(0),
+            )?;
+            Ok::<bool, anyhow::Error>(found)
+        })
+        .await?
+    }
+
+    // ── Alert post keys ───────────────────────────────────────────────────────
+
+    /// The transaction key for posting the occurrence `id` (a DWD stable key,
+    /// a NINA warning without its version): the one stored at its first
+    /// attempt, else `key` (stored now with `start_ms`/`end_ms`). A retry
+    /// after some rooms failed thus sends with the same transaction IDs even
+    /// when the warning changed in between, and rooms that have it get no
+    /// second copy. The row goes when the occurrence is stored as delivered
+    /// or ended (`mark_*_posted`, `promote_*`, `mark_*_allclear_sent`,
+    /// [`Db::forget_post_keys_except`]), so a warning that comes back later
+    /// gets a key of its own.
+    pub async fn post_key(
+        &self,
+        id: &str,
+        source: &str,
+        key: &str,
+        start_ms: i64,
+        end_ms: i64,
+    ) -> Result<PostKey> {
+        let db = self.0.clone();
+        let id = id.to_owned();
+        let source = source.to_owned();
+        let key = key.to_owned();
+        let now = chrono::Utc::now().timestamp();
+        tokio::task::spawn_blocking(move || {
+            let conn = db.lock().unwrap_or_else(|e| e.into_inner());
+            conn.execute(
+                "INSERT OR IGNORE INTO alert_post_keys
+                     (id, source, key, start_ms, end_ms, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![id, source, key, start_ms, end_ms, now],
+            )?;
+            let stored = conn.query_row(
+                "SELECT key, start_ms, end_ms FROM alert_post_keys WHERE id = ?1",
+                params![id],
+                |r| {
+                    Ok(PostKey {
+                        key: r.get(0)?,
+                        start_ms: r.get(1)?,
+                        end_ms: r.get(2)?,
+                    })
+                },
+            )?;
+            Ok::<PostKey, anyhow::Error>(stored)
+        })
+        .await?
+    }
+
+    /// Drop the post keys of `source` whose occurrence is no longer in its
+    /// feed (`current`): it ended without being delivered everywhere, and if
+    /// it comes back it is a new occurrence. Returns how many went.
+    pub async fn forget_post_keys_except(
+        &self,
+        source: &str,
+        current: &HashSet<String>,
+    ) -> Result<usize> {
+        let db = self.0.clone();
+        let source = source.to_owned();
+        let current = current.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut conn = db.lock().unwrap_or_else(|e| e.into_inner());
+            let tx = conn.transaction()?;
+            let ids = tx
+                .prepare("SELECT id FROM alert_post_keys WHERE source = ?1")?
+                .query_map(params![source], |r| r.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            let mut gone = 0;
+            for id in ids.iter().filter(|id| !current.contains(*id)) {
+                gone += tx.execute("DELETE FROM alert_post_keys WHERE id = ?1", params![id])?;
+            }
+            tx.commit()?;
+            Ok::<usize, anyhow::Error>(gone)
+        })
+        .await?
+    }
+
+    // ── Schedule ledger ───────────────────────────────────────────────────────
+
+    /// The `alerts` row that records a handled slot of a scheduled job:
+    /// `weather:2026-10-30` (the key the forecast always used),
+    /// `digest:2026-10-30 08:00`.
+    fn slot_row(job: &str, slot: &Slot) -> String {
+        format!("{job}:{}", slot.key())
+    }
+
     // ── NINA active-warning tracking ──────────────────────────────────────────
 
     pub async fn get_active_nina_warning(&self, id: &str) -> Result<Option<NinaActiveWarning>> {
@@ -648,7 +761,9 @@ impl Db {
         let original_html = original_html.to_owned();
         let now = chrono::Utc::now().timestamp();
         tokio::task::spawn_blocking(move || {
-            db.lock().unwrap_or_else(|e| e.into_inner()).execute(
+            let mut conn = db.lock().unwrap_or_else(|e| e.into_inner());
+            let tx = conn.transaction()?;
+            tx.execute(
                 "INSERT INTO nina_active_warnings
                      (id, headline, region, seen_at, event_ids_json, original_plain, original_html)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
@@ -669,6 +784,8 @@ impl Db {
                     original_html
                 ],
             )?;
+            tx.execute("DELETE FROM alert_post_keys WHERE id = ?1", params![id])?;
+            tx.commit()?;
             Ok::<(), anyhow::Error>(())
         })
         .await?
@@ -678,10 +795,12 @@ impl Db {
         let db = self.0.clone();
         let id = id.to_owned();
         tokio::task::spawn_blocking(move || {
-            db.lock().unwrap_or_else(|e| e.into_inner()).execute(
+            let conn = db.lock().unwrap_or_else(|e| e.into_inner());
+            conn.execute(
                 "DELETE FROM nina_active_warnings WHERE id = ?1",
                 params![id],
             )?;
+            conn.execute("DELETE FROM alert_post_keys WHERE id = ?1", params![id])?;
             Ok::<(), anyhow::Error>(())
         })
         .await?
@@ -745,7 +864,9 @@ impl Db {
         let original_html = original_html.to_owned();
         let now = chrono::Utc::now().timestamp();
         tokio::task::spawn_blocking(move || {
-            db.lock().unwrap_or_else(|e| e.into_inner()).execute(
+            let mut conn = db.lock().unwrap_or_else(|e| e.into_inner());
+            let tx = conn.transaction()?;
+            tx.execute(
                 "INSERT INTO dwd_active_warnings
                      (id, headline, region, event, seen_at,
                       event_ids_json, start_ms, end_ms, original_plain, original_html)
@@ -773,6 +894,8 @@ impl Db {
                     original_html
                 ],
             )?;
+            tx.execute("DELETE FROM alert_post_keys WHERE id = ?1", params![id])?;
+            tx.commit()?;
             Ok::<(), anyhow::Error>(())
         })
         .await?
@@ -862,6 +985,7 @@ impl Db {
                     original_html
                 ],
             )?;
+            tx.execute("DELETE FROM alert_post_keys WHERE id = ?1", params![new_id])?;
             tx.commit()?;
             Ok::<(), anyhow::Error>(())
         })
@@ -874,8 +998,13 @@ impl Db {
         let db = self.0.clone();
         let warning_id = warning_id.to_owned();
         tokio::task::spawn_blocking(move || {
-            db.lock().unwrap_or_else(|e| e.into_inner()).execute(
+            let conn = db.lock().unwrap_or_else(|e| e.into_inner());
+            conn.execute(
                 "DELETE FROM dwd_active_warnings WHERE id = ?1",
+                params![warning_id],
+            )?;
+            conn.execute(
+                "DELETE FROM alert_post_keys WHERE id = ?1",
                 params![warning_id],
             )?;
             Ok::<(), anyhow::Error>(())
@@ -969,6 +1098,17 @@ fn ensure_items_state_allows_candidates(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// The schedule's ledger (digest, forecast) in the `alerts` table.
+impl Ledger for Db {
+    async fn is_done(&self, job: &str, slot: &Slot) -> Result<bool> {
+        self.is_alert_seen(&Db::slot_row(job, slot)).await
+    }
+
+    async fn mark_done(&self, job: &str, slot: &Slot) -> Result<()> {
+        self.mark_alert_seen(&Db::slot_row(job, slot), job).await
+    }
+}
+
 // ── Schema ────────────────────────────────────────────────────────────────────
 
 const SCHEMA: &str = "
@@ -1025,6 +1165,16 @@ const SCHEMA: &str = "
         original_html  TEXT,
         start_ms       INTEGER NOT NULL DEFAULT 0,
         end_ms         INTEGER NOT NULL DEFAULT 0
+    );
+    -- An alert occurrence's transaction key from its first attempt, until it
+    -- is delivered everywhere or ends (Db::post_key).
+    CREATE TABLE IF NOT EXISTS alert_post_keys (
+        id         TEXT    PRIMARY KEY,
+        source     TEXT    NOT NULL,
+        key        TEXT    NOT NULL,
+        start_ms   INTEGER NOT NULL,
+        end_ms     INTEGER NOT NULL,
+        created_at INTEGER NOT NULL
     );
     CREATE TABLE IF NOT EXISTS nina_active_warnings (
         id             TEXT    PRIMARY KEY,

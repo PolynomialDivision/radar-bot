@@ -25,10 +25,11 @@ use std::sync::Arc;
 use tokio::sync::Semaphore;
 
 use anyhow::Result;
-use chrono::{Local, NaiveTime};
+use chrono::{Local, NaiveTime, Timelike};
 use mxbot_common::{
     admin::Dispatch,
-    config::{MatrixConfig, SecurityConfig},
+    clock::Zone,
+    config::{MatrixConfig, SecurityConfig, TimeOfDay},
     matrix_sdk::{
         deserialized_responses::EncryptionInfo,
         ruma::events::room::message::{
@@ -36,7 +37,8 @@ use mxbot_common::{
         },
         Room, RoomState,
     },
-    supervise::{supervise, supervise_ticking, Alive},
+    schedule::{self, Delivered},
+    supervise::{supervise_ticking, Alive},
     Bot,
 };
 
@@ -56,6 +58,39 @@ pub(crate) async fn post_to_rooms(bot: &Bot, plain: &str, html: &str) -> bool {
         error!("Failed to post to {room}: {e}");
     }
     failed.is_empty()
+}
+
+/// How long a scheduled post (digest, forecast) keeps retrying a homeserver
+/// that does not answer (a restart, an outage of minutes).
+pub(crate) const SEND_FOR: Duration = Duration::from_secs(10 * 60);
+/// When a scheduled post that did not get through (or whose forecast could
+/// not be fetched) is tried again, within its catch-up window.
+pub(crate) const RETRY_AFTER: Duration = Duration::from_secs(15 * 60);
+/// How late a digest or forecast missed by a restart still goes out.
+pub(crate) const CATCH_UP: Duration = Duration::from_secs(3 * 60 * 60);
+
+/// A scheduled post into the broadcast rooms: transaction IDs from `key`
+/// (it names the slot, so a post tried again gets no second copy where it
+/// arrived), transient failures retried until `deadline`. Failures are
+/// logged as [`post_to_rooms`] logs them.
+pub(crate) async fn post_slot(
+    bot: &Bot,
+    plain: &str,
+    html: &str,
+    key: &str,
+    deadline: std::time::Instant,
+) -> Delivered {
+    let delivered = schedule::post(
+        bot.broadcast_rooms(),
+        RoomMessageEventContent::text_html(plain, html),
+        key,
+        deadline,
+    )
+    .await;
+    for (room, e) in &delivered.failed {
+        error!("Failed to post to {room}: {e}");
+    }
+    delivered
 }
 
 // ── main ──────────────────────────────────────────────────────────────────────
@@ -102,6 +137,8 @@ async fn main() -> Result<()> {
     let test_mode = std::env::args().any(|a| a == "--test");
     let mut config: Config =
         mxbot_common::config::load_toml(&mxbot_common::config::config_path_from_args())?;
+    // `TZ` (as compose sets it), else Europe/Berlin: the digest and forecast times.
+    let zone = Zone::resolve(None)?;
 
     // radar-bot keeps its Matrix sqlite store in store/matrix_store/, next to
     // store/items.db.
@@ -284,17 +321,21 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    supervise(
-        "radar digest",
-        digest_loop(
-            bot.clone(),
-            config.schedule.digest_times.clone(),
-            db.clone(),
-            config.filter.digest_threshold,
-            config.filter.candidate_min_sources,
-            config.filter.candidate_retention_hours,
-        ),
-    );
+    if let Some(job) = digest_job(zone, &config.schedule.digest_times) {
+        // A digest's run: the DB, then its chunks retried for SEND_FOR at most.
+        let within = job.stall_after(SEND_FOR + Duration::from_secs(10 * 60));
+        supervise_ticking("radar digest", within, |alive| {
+            digest_loop(
+                bot.clone(),
+                job,
+                db.clone(),
+                config.filter.digest_threshold,
+                config.filter.candidate_min_sources,
+                config.filter.candidate_retention_hours,
+                alive,
+            )
+        });
+    }
 
     if config.emergency.enabled {
         let nina_ags = match ref_point {
@@ -338,17 +379,21 @@ async fn main() -> Result<()> {
                 NaiveTime::from_hms_opt(h, m, 0)
                     .unwrap_or_else(|| NaiveTime::from_hms_opt(8, 0, 0).unwrap())
             };
-            supervise(
-                "radar weather",
+            let post_time = TimeOfDay::new(post_time.hour(), post_time.minute());
+            let job = weather::weather_job(zone, post_time);
+            // A forecast's run: its fetch (15 s), then the post retried for SEND_FOR.
+            let within = job.stall_after(SEND_FOR + Duration::from_secs(5 * 60));
+            supervise_ticking("radar weather", within, |alive| {
                 weather::weather_loop(
                     bot.clone(),
                     http.clone(),
                     db.clone(),
                     pt,
-                    post_time,
+                    job,
                     config.weather.provider,
-                ),
-            );
+                    alive,
+                )
+            });
         } else {
             warn!("Weather forecast disabled, no reference_address configured");
         }
