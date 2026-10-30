@@ -36,6 +36,7 @@ use mxbot_common::{
         },
         Room, RoomState,
     },
+    supervise::{supervise, supervise_ticking, Alive},
     Bot,
 };
 
@@ -283,14 +284,17 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    tokio::spawn(digest_loop(
-        bot.clone(),
-        config.schedule.digest_times.clone(),
-        db.clone(),
-        config.filter.digest_threshold,
-        config.filter.candidate_min_sources,
-        config.filter.candidate_retention_hours,
-    ));
+    supervise(
+        "radar digest",
+        digest_loop(
+            bot.clone(),
+            config.schedule.digest_times.clone(),
+            db.clone(),
+            config.filter.digest_threshold,
+            config.filter.candidate_min_sources,
+            config.filter.candidate_retention_hours,
+        ),
+    );
 
     if config.emergency.enabled {
         let nina_ags = match ref_point {
@@ -300,19 +304,24 @@ async fn main() -> Result<()> {
                 None
             }
         };
-        tokio::spawn(alerts::alert_loop(
-            bot.clone(),
-            http.clone(),
-            db.clone(),
-            alerts::AlertConfig {
-                nina_ags,
-                ref_point,
-                dwd_region_keywords,
-                dwd_lead: Duration::from_secs(config.weather.warning_lead_hours * 3600),
-                max_distance_km: config.emergency.max_distance_km,
-                poll_interval_secs: config.emergency.poll_interval_secs,
-            },
-        ));
+        // A round takes well under two minutes (every request has a timeout).
+        let within = Duration::from_secs(3 * (config.emergency.poll_interval_secs + 120));
+        supervise_ticking("radar alerts", within, |alive| {
+            alerts::alert_loop(
+                bot.clone(),
+                http.clone(),
+                db.clone(),
+                alerts::AlertConfig {
+                    nina_ags,
+                    ref_point,
+                    dwd_region_keywords,
+                    dwd_lead: Duration::from_secs(config.weather.warning_lead_hours * 3600),
+                    max_distance_km: config.emergency.max_distance_km,
+                    poll_interval_secs: config.emergency.poll_interval_secs,
+                },
+                alive,
+            )
+        });
     }
 
     if config.weather.enabled {
@@ -329,31 +338,39 @@ async fn main() -> Result<()> {
                 NaiveTime::from_hms_opt(h, m, 0)
                     .unwrap_or_else(|| NaiveTime::from_hms_opt(8, 0, 0).unwrap())
             };
-            tokio::spawn(weather::weather_loop(
-                bot.clone(),
-                http.clone(),
-                db.clone(),
-                pt,
-                post_time,
-                config.weather.provider,
-            ));
+            supervise(
+                "radar weather",
+                weather::weather_loop(
+                    bot.clone(),
+                    http.clone(),
+                    db.clone(),
+                    pt,
+                    post_time,
+                    config.weather.provider,
+                ),
+            );
         } else {
             warn!("Weather forecast disabled, no reference_address configured");
         }
     }
 
-    // Spawn poll loop
-    tokio::spawn(poll_loop(
-        bot.clone(),
-        http,
-        config.sources,
-        config.filter,
-        ref_point,
-        config.schedule.poll_interval_minutes,
-        db,
-        geocode_cache,
-        bluesky_ctx,
-    ));
+    // Spawn poll loop. A round with a cold geocode cache can take several minutes
+    // (Nominatim allows one request per second), so allow ten per round.
+    let within = Duration::from_secs(3 * (config.schedule.poll_interval_minutes + 10) * 60);
+    supervise_ticking("radar poll", within, |alive| {
+        poll_loop(
+            bot.clone(),
+            http,
+            config.sources,
+            config.filter,
+            ref_point,
+            config.schedule.poll_interval_minutes,
+            db,
+            geocode_cache,
+            bluesky_ctx,
+            alive,
+        )
+    });
 
     // Continuous Matrix sync
     bot.run().await

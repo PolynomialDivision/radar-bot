@@ -498,9 +498,11 @@ pub(crate) async fn poll_loop(
     db: Db,
     geocode_cache: GeocodeCache,
     bluesky: Option<sources::BlueskyContext>,
+    alive: Alive,
 ) {
     let interval = Duration::from_secs(interval_mins * 60);
     loop {
+        alive.tick();
         poll_once(
             &client,
             &http,

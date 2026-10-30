@@ -522,7 +522,8 @@ pub(crate) async fn digest_loop(
 
     if targets.is_empty() {
         warn!("No valid digest_times configured, digest loop disabled");
-        return;
+        // Wait instead of returning: the loop is supervised, its end would restart the bot.
+        return std::future::pending().await;
     }
 
     loop {

@@ -9,6 +9,7 @@ use mxbot_common::{
         events::room::message::{ReplacementMetadata, RoomMessageEventContent},
         OwnedEventId, OwnedTransactionId,
     },
+    supervise::Alive,
     Bot,
 };
 use tokio::time::sleep;
@@ -106,11 +107,18 @@ fn known_nina_ags(city: &str) -> Option<&'static str> {
 
 // ── Main loop ─────────────────────────────────────────────────────────────────
 
-pub async fn alert_loop(client: Bot, http: reqwest::Client, db: Db, config: AlertConfig) {
+pub async fn alert_loop(
+    client: Bot,
+    http: reqwest::Client,
+    db: Db,
+    config: AlertConfig,
+    alive: Alive,
+) {
     let mut dwd_area_cache: HashMap<String, bool> = HashMap::new();
     let mut last_dwd_reconcile: Option<Instant> = None;
 
     loop {
+        alive.tick();
         if let Some(ref ags) = config.nina_ags {
             if let Err(e) = check_nina(&client, &http, &db, ags).await {
                 warn!("NINA check failed: {e:#}");
