@@ -117,11 +117,15 @@ pub async fn alert_loop(
     let mut dwd_area_cache: HashMap<String, bool> = HashMap::new();
     let mut last_dwd_reconcile: Option<Instant> = None;
 
+    alive.expect_every(Duration::from_secs(config.poll_interval_secs));
     loop {
         alive.tick();
+        // The checks that failed this round, for the status file.
+        let mut failed: Vec<(&str, String)> = Vec::new();
         if let Some(ref ags) = config.nina_ags {
             if let Err(e) = check_nina(&client, &http, &db, ags).await {
                 warn!("NINA check failed: {e:#}");
+                failed.push(("NINA", format!("{e:#}")));
             }
         }
         if !config.dwd_region_keywords.is_empty() {
@@ -140,6 +144,7 @@ pub async fn alert_loop(
             .await
             {
                 warn!("DWD weather-warning check failed: {e:#}");
+                failed.push(("DWD", format!("{e:#}")));
             } else if reconcile_active_messages {
                 last_dwd_reconcile = Some(Instant::now());
             }
@@ -154,6 +159,7 @@ pub async fn alert_loop(
         .await
         {
             warn!("USGS check failed: {e:#}");
+            failed.push(("USGS", format!("{e:#}")));
         }
         if let Err(e) = check_gdacs(
             &client,
@@ -165,9 +171,22 @@ pub async fn alert_loop(
         .await
         {
             warn!("GDACS check failed: {e:#}");
+            failed.push(("GDACS", format!("{e:#}")));
         }
+        report_round(&alive, &failed);
         sleep(Duration::from_secs(config.poll_interval_secs)).await;
     }
+}
+
+/// A round of checks for the status file: ok when every check worked, failed (naming the
+/// checks and the first error) otherwise.
+fn report_round(alive: &Alive, failed: &[(&str, String)]) {
+    let Some((_, first)) = failed.first() else {
+        alive.ok();
+        return;
+    };
+    let names: Vec<&str> = failed.iter().map(|(name, _)| *name).collect();
+    alive.failed(format!("{} check failed: {first}", names.join(", ")));
 }
 
 // ── NINA/warnung.bund.de ──────────────────────────────────────────────────────
@@ -1955,6 +1974,29 @@ fn alert_html_escape(s: &str) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn alert_rounds_are_reported_for_the_status_file() {
+        use mxbot_common::supervise::{report, snapshot};
+        let alive = report("radar alerts under test");
+        report_round(&alive, &[]);
+        report_round(
+            &alive,
+            &[
+                ("NINA", "NINA fetch timed out".to_owned()),
+                ("USGS", "USGS request failed".to_owned()),
+            ],
+        );
+        let task = snapshot()
+            .into_iter()
+            .find(|t| t.name == "radar alerts under test")
+            .unwrap();
+        assert_eq!((task.ok_total, task.failed_total), (1, 1));
+        assert_eq!(
+            task.last_err_reason.as_deref(),
+            Some("NINA, USGS check failed: NINA fetch timed out")
+        );
+    }
 
     #[test]
     fn known_nina_ags_resolves_berlin_dashboard_key() {

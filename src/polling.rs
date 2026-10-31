@@ -303,7 +303,11 @@ pub(crate) async fn poll_once(
     geocode_cache: &GeocodeCache,
     bluesky: Option<&sources::BlueskyContext>,
     test_mode: bool,
-) {
+) -> PollSummary {
+    let mut summary = PollSummary {
+        sources: sources.len(),
+        ..PollSummary::default()
+    };
     let arc_filter = Arc::new(filter.clone());
     let geocode_city: Arc<str> = Arc::from(filter.geocode_city.as_deref().unwrap_or(""));
     let limiter: NominatimLimiter = Arc::new(Semaphore::new(1));
@@ -332,10 +336,12 @@ pub(crate) async fn poll_once(
             Ok(v) => v,
             Err(e) => {
                 warn!("Source fetch task panicked: {e}");
+                summary.panicked += 1;
                 continue;
             }
         };
         *total_by_source.entry(source.name.clone()).or_default() += items.len();
+        summary.fetched += items.len();
 
         for item in items {
             let is_new = test_mode || db.is_new(&item.guid).await.unwrap_or(true);
@@ -349,6 +355,7 @@ pub(crate) async fn poll_once(
     // Geocoding tasks share the NominatimLimiter so total Nominatim traffic stays ≤ 1 req/s.
     let mut tasks: JoinSet<ProcessOutcome> = JoinSet::new();
     let n_pending = pending.len();
+    summary.new_items = n_pending;
     for (source, item) in pending {
         let attempts = if test_mode {
             0
@@ -485,6 +492,37 @@ pub(crate) async fn poll_once(
     for (reason, count) in retry_reasons {
         info!("Retry reason: {count} item(s): {reason}");
     }
+    summary
+}
+
+/// What a poll round saw, for the status file (the round does not depend on it).
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct PollSummary {
+    /// Sources asked.
+    pub sources: usize,
+    /// Items in all feeds together.
+    pub fetched: usize,
+    /// Items not seen before.
+    pub new_items: usize,
+    /// Source fetches that panicked.
+    pub panicked: usize,
+}
+
+impl PollSummary {
+    /// Failed when a fetch panicked or no source returned anything (feeds are never all
+    /// empty: the network or the sources are down; a source's own errors are logged and
+    /// return no items), ok with new items, idle without.
+    pub(crate) fn report(&self, alive: &Alive) {
+        if self.panicked > 0 {
+            alive.failed(format!("{} source fetch(es) panicked", self.panicked));
+        } else if self.sources > 0 && self.fetched == 0 {
+            alive.failed("no source returned any item");
+        } else if self.new_items > 0 {
+            alive.ok();
+        } else {
+            alive.idle();
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -501,6 +539,7 @@ pub(crate) async fn poll_loop(
     alive: Alive,
 ) {
     let interval = Duration::from_secs(interval_mins * 60);
+    alive.expect_every(interval);
     loop {
         alive.tick();
         poll_once(
@@ -514,7 +553,8 @@ pub(crate) async fn poll_loop(
             bluesky.as_ref(),
             false,
         )
-        .await;
+        .await
+        .report(&alive);
         info!("Next poll in {interval_mins}m");
         sleep(interval).await;
     }
@@ -523,6 +563,41 @@ pub(crate) async fn poll_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn poll_rounds_are_reported_for_the_status_file() {
+        use mxbot_common::supervise::{report, snapshot};
+        let alive = report("radar poll under test");
+        let summary = |fetched, new_items, panicked| PollSummary {
+            sources: 2,
+            fetched,
+            new_items,
+            panicked,
+        };
+        summary(10, 2, 0).report(&alive);
+        summary(10, 0, 0).report(&alive);
+        summary(0, 0, 0).report(&alive);
+        summary(5, 0, 1).report(&alive);
+        let task = snapshot()
+            .into_iter()
+            .find(|t| t.name == "radar poll under test")
+            .unwrap();
+        assert_eq!(
+            (task.ok_total, task.idle_total, task.failed_total),
+            (1, 1, 2)
+        );
+        assert_eq!(
+            task.last_err_reason.as_deref(),
+            Some("1 source fetch(es) panicked")
+        );
+        // No sources configured: nothing to fetch is not a failure.
+        PollSummary::default().report(&alive);
+        let task = snapshot()
+            .into_iter()
+            .find(|t| t.name == "radar poll under test")
+            .unwrap();
+        assert_eq!(task.idle_total, 2);
+    }
 
     fn source(base: Option<f64>, max_age_hours: Option<u64>) -> SourceConfig {
         SourceConfig {
