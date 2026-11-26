@@ -1,0 +1,279 @@
+[matrix]
+homeserver = "https://matrix.org"
+user_id = "@radar-bot:matrix.org"
+# Secrets may instead come from MATRIX_ACCESS_TOKEN / MATRIX_RECOVERY_KEY.
+access_token = "your_access_token_here"
+device_id = "your_device_id_here"
+# recovery_key = "EsXX xxxx xxxx xxxx xxxx xxxx xxxx xxxx"
+
+[security]
+# Users allowed to invite the bot ("all" = anyone, [] = nobody).
+# Configured admins may always open a direct chat with the bot.
+allowed_inviters = ["@you:matrix.org"]
+# Rooms the bot may join: room IDs, [] for none, or "all" for every room.
+# Required: without it the bot refuses to start.
+allowed_rooms = ["!REPLACE_ME:example.org"]
+# Members of these rooms may also open a private chat with the bot.
+# dm_rooms = ["!REPLACE_ME:example.org"]
+
+# Users allowed to run admin commands, privately in a
+# direct chat with the bot (send !admin there for help).
+# Bot-specific:
+#   !source-stats [hours]
+admin_users = ["@you:matrix.org"]
+
+# Which devices receive room keys:
+#   identity_based: only cross-signed devices (default, recommended)
+#   only_trusted: only explicitly verified devices
+#   all_devices: all devices, no restriction
+encryption_strategy = "all_devices"
+
+# ── Bluesky ───────────────────────────────────────────────────────────────────
+# Required if you have any [[sources]] with type = "bluesky".
+# Create an App Password in Bluesky → Settings → Privacy and Security → App Passwords.
+# Do NOT use your real account password here.
+[bluesky]
+identifier = "@you.bsky.social"
+password = "xxxx-xxxx-xxxx-xxxx"
+
+[schedule]
+# How often to poll all RSS/Atom sources (minutes).
+poll_interval_minutes = 30
+# Times to post a digest of queued items (HH:MM, 24h). Each posting drains the
+# queue, so digests never overlap. Add as many times as you like.
+digest_times = ["08:00", "20:00"]
+
+# ── Filter ────────────────────────────────────────────────────────────────────
+[filter]
+# City-level guard: at least one must appear in the item (used for national feeds).
+# City-specific sources can override this per-source with required = [].
+required = ["Yourcity"]
+
+# Minimum distance score (1–5) to include in the daily digest.
+digest_threshold = 2
+
+# Weak local items are kept temporarily as candidates instead of being dropped
+# immediately. If another source reports the same incident, duplicate clustering
+# can promote them into the next digest. This improves recall without lowering
+# the final digest threshold for single-source items.
+candidate_min_score = 1
+candidate_min_sources = 2
+candidate_retention_hours = 24
+
+# Drop items published longer ago than this (hours), for sources without their
+# own max_age_hours. Checked after the article page is fetched, so the page's
+# own publish date (article:published_time / JSON-LD datePublished) can unmask
+# an old article that a feed or search re-lists with a fresh date.
+# max_age_hours = 72
+
+# Your reference address: geocoded once at startup. All distances are measured from here.
+reference_address = "Yourstreet 1, 10000 Yourcity"
+
+# City string appended to Nominatim queries when geocoding street mentions from articles.
+# Keeps results anchored to the right city.
+geocode_city = "Yourcity, Yourcountry"
+
+# Blocklist: items matching any of these are always dropped.
+blocklist = [
+    "Motorway A1",
+    "Motorway A2",
+]
+
+# ── Area groups ───────────────────────────────────────────────────────────────
+# Each group maps keywords to an implied distance from your reference point.
+# Every match (area term, configured place, geocoded street, the source's
+# base_implied_meters) is one piece of evidence; the strongest decides the score.
+#
+# Terms match at word starts: "Charlottenburg" matches "Berlin-Charlottenburg"
+# and "Charlottenburger", but not "Charlottenburg-Wilmersdorf" (the whole borough,
+# add that as its own term with a larger distance if you want it). Postal codes
+# and terms shorter than five letters must match as whole words.
+#
+# Besides terms, the bot uses coordinates a source attaches itself (GeoRSS in
+# the feed, a schema.org Event venue on the article page), geocoded street
+# mentions (a long street named without house number counts its whole extent
+# and scores lower), and your [[filter.places]].
+#
+# Mentions in the title, feed description or the article lead count fully.
+# Mentions only further down the article score one tier lower: those are mostly
+# asides, lists of places or teasers. Press-office contact blocks ("Hinweise
+# nimmt … Weserstraße 10, 10585 Berlin") are ignored.
+#
+# Terms don't have to be street names. Any location-specific keyword works:
+# building names, landmarks, organisation abbreviations, event keywords, etc.
+#
+# Distance → score mapping:
+#   < 200m  → 5 🔴   < 500m → 4 🟠   < 1km → 3 🟡
+#   < 2km   → 2 🟢   < 10km → 1 🔵   else → 0 ⚪
+
+# Your immediate street(s): treated as ~300m away
+[[filter.area]]
+implied_meters = 300
+terms = [
+    "Yourstreet",
+]
+
+# Nearby postal codes: treated as ~800m away
+[[filter.area]]
+implied_meters = 800
+terms = ["10000", "10001"]
+
+# Your district / nearby landmarks: treated as ~1500m away
+[[filter.area]]
+implied_meters = 1500
+terms = [
+    "YourDistrict",
+    "NearbyStreet",
+    "LocalLandmark",
+]
+
+# Places that are NOT near you. An item whose title names one of these, but none
+# of your own area terms or places, scores one tier lower on location evidence
+# taken from its text. Polizei Berlin reports are also checked automatically:
+# their "Ereignisort" Bezirk is compared with the Bezirk of reference_address.
+# elsewhere = ["Kreuzberg", "Neukölln", "Mitte"]
+
+# Explicit local places with coordinates. Use this for stations, venues, squares,
+# parks, housing projects, and local nicknames that Nominatim may not geocode from
+# article text. If an item mentions any alias, the bot scores it by distance to
+# this coordinate.
+[[filter.places]]
+name = "Local Station"
+lat = 52.46000
+lon = 13.40000
+aliases = ["Local U-Bahn", "Local S-Bahn", "Station Nickname"]
+
+# ── Sources ───────────────────────────────────────────────────────────────────
+# Each source needs a name and a type (default: "rss"). Shared optional fields:
+#   filter              = true (default): apply location filter and scoring
+#   filter              = false: skip location filter, include everything
+#   required            = ["keyword"]: overrides global filter.required for this source.
+#                         Set to [] to skip the city check for city-specific sources.
+#   base_implied_meters = N: fallback distance when neither area keywords nor geocoding
+#                             produce a result.
+#                             City-wide feeds: ~9000 (score 1 🔵)
+#                             District feeds:  ~1500 (score 2 🟢)
+#
+# RSS/Atom sources (type = "rss", the default, so "type" can be omitted):
+#   url = "https://..."    : required
+#
+# Google News search RSS sources (type = "google_news"):
+#   query = "\"Yourstreet\" Yourcity Unfall OR Brand OR Polizei"
+#   max_age_hours = 48: recommended, keeps search results fresh
+#   Keep filter = true. Use narrow street/district queries to reduce false positives.
+#
+# Bluesky sources (type = "bluesky"):
+#   query = "#Hashtag"     : keyword or hashtag search query, required
+#   limit = 25             : max posts per poll (default 25, API max 100)
+#
+# Posts are normalized to the same FeedItem as RSS entries and pass through
+# the same location filter, geocoding, and scoring pipeline unchanged.
+
+# City-specific source: skip the city required check, use base_implied_meters as floor score.
+[[sources]]
+name = "Local Police"
+url = "https://example.com/police/rss.xml"
+filter = true
+required = []
+base_implied_meters = 9000
+
+[[sources]]
+name = "Local Public Broadcaster"
+url = "https://example.com/news/rss.xml"
+filter = true
+required = []
+base_implied_meters = 9000
+
+# National source: keep the city required check so items from other cities are dropped.
+[[sources]]
+name = "National News"
+url = "https://example.com/national/rss.xml"
+filter = true
+
+# Google News can discover articles from publishers that have no useful direct RSS.
+# Keep these searches local and incident-focused; the normal bot filter still applies.
+[[sources]]
+name = "Google News Yourstreet"
+type = "google_news"
+query = "\"Yourstreet\" Yourcity Unfall OR Brand OR Polizei OR Feuerwehr OR Sperrung"
+filter = true
+required = []
+max_age_hours = 48
+
+# Hyper-local source: no filtering, all items are assumed to be in your district.
+[[sources]]
+name = "Neighbourhood Blog"
+url = "https://example.com/local/rss.xml"
+filter = false
+base_implied_meters = 1500
+
+# Bluesky keyword search: posts are filtered and scored like RSS items.
+# Use a city-level hashtag as the query so only relevant posts get through.
+# Omit filter.required check for hashtag searches (the hashtag already scopes them).
+[[sources]]
+name = "Bluesky #YourCity"
+type = "bluesky"
+query = "#YourCity"
+limit = 25
+max_age_hours = 24        # only fetch posts newer than this (default 24)
+filter = true
+required = []
+base_implied_meters = 9000
+
+# ── Weather forecast ─────────────────────────────────────────────────────────
+# Posts a daily weather forecast using Open-Meteo (free, no API key needed).
+# Coordinates are taken from reference_address. The forecast is posted once
+# per day at post_time (defaults to the first digest time).
+[weather]
+enabled = true
+provider = "brightsky"  # "brightsky" (DWD, default) or "openmeteo"
+# post_time = "08:00"   # defaults to first digest_time
+
+# DWD weather warnings are sent immediately through the emergency alert loop.
+# If omitted, the bot derives this from filter.geocode_city/reference_address.
+alerts_enabled = true
+# warning_region_keywords = ["Yourcity"]
+# Post DWD warnings this many hours before they take effect (default 3).
+# warning_lead_hours = 3
+
+# ── Emergency alerts ──────────────────────────────────────────────────────────
+# Polls NINA (Germany civil protection), USGS (earthquakes), and GDACS (global
+# disasters) every poll_interval_secs and sends an immediate Matrix message,
+# bypassing the normal digest queue.
+#
+# NINA is automatically configured from your reference_address above:
+#   - Nominatim reverse geocode → city name
+#   - NINA completion API → AGS (Amtlicher Gemeindeschlüssel)
+# NINA is skipped if reference_address is outside Germany.
+#
+# USGS sends significant earthquakes within max_distance_km of your
+# reference_address (default 500 km).
+# GDACS covers major global disasters (earthquakes, floods, cyclones, volcanoes).
+[emergency]
+enabled = true
+# max_distance_km = 200    # USGS/GDACS radius; default 500, e.g. 20000 = worldwide
+poll_interval_secs = 120
+
+[security.verification]
+# Users allowed to complete first-time verification. If omitted or empty,
+# an explicit allowed_inviters list is used as the fallback.
+allowed_users = ["@you:matrix.org"]
+# Also allow first-time verification for users sharing a joined room with the bot.
+allow_users_from_joined_rooms = false
+# SAS-only verification limits.
+flow_timeout_secs = 300
+grant_ttl_secs = 600
+max_concurrent = 8
+
+[security.admin_dm]
+# Admins can open a direct chat with the bot and manage it there:
+#   !admin status | verify | settings | set <key> <value> | unset <key>
+# `!admin verify` starts mutual emoji (SAS) verification with you.
+enabled = true
+# Only accept admin commands in end-to-end encrypted direct chats.
+require_encryption = true
+# Only accept admin commands from devices the bot has verified (recommended
+# once you and the bot have verified each other).
+require_verified_device = false
+# Also deliver broadcast posts (summaries, digests, …) into admin chats.
+receive_broadcasts = false

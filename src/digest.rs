@@ -1,0 +1,939 @@
+//! Digest formatting, duplicate clustering, chunking and the digest loop.
+
+use super::*;
+use mxbot_common::schedule::{Delivery, Job, Ledger, Outcome, Rule, Slot};
+
+// ── Message formatting ────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+pub(crate) struct DigestItem {
+    pub(crate) guids: Vec<String>,
+    pub(crate) source_name: String,
+    pub(crate) source_count: usize,
+    pub(crate) title: String,
+    pub(crate) link: Option<String>,
+    pub(crate) link_note: Option<String>,
+    pub(crate) score: i32,
+    pub(crate) max_score: i32,
+    pub(crate) distance_meters: Option<f64>,
+    pub(crate) location_label: Option<String>,
+}
+
+impl DigestItem {
+    pub(crate) fn from_db(item: db::DbItem) -> Self {
+        Self {
+            guids: vec![item.guid],
+            source_name: item.source_name,
+            source_count: 1,
+            title: item.title,
+            link: item.link,
+            link_note: item.link_note,
+            score: item.score,
+            max_score: item.max_score,
+            distance_meters: item.distance_meters,
+            location_label: item.location_label,
+        }
+    }
+}
+
+/// One item per block, laid out for a phone: the title on its own line, then
+/// source and score, then the place, then the link. A blank line separates
+/// the items.
+pub(crate) fn format_digest(items: &[DigestItem], header: &str) -> (String, String) {
+    let mut plain = vec![format!("📡 {header}")];
+    let mut html = vec![format!("📡 <strong>{}</strong>", html_escape(header))];
+
+    for item in items {
+        let color = score_color(item.score);
+        plain.push(String::new());
+        html.push(String::new());
+        plain.push(format!("{color} {}", item.title));
+        html.push(format!(
+            "{color} <strong>{}</strong>",
+            html_escape(&item.title)
+        ));
+
+        let mut meta = vec![format!("📰 {}", item.source_name)];
+        if item.max_score > 0 {
+            meta.push(format!("⭐ {}/{}", item.score, item.max_score));
+        }
+        if item.source_count > 1 {
+            meta.push(format!("👥 {} sources", item.source_count));
+        }
+        let meta = meta.join(" · ");
+        plain.push(meta.clone());
+        html.push(html_escape(&meta));
+
+        let label = item
+            .location_label
+            .as_deref()
+            .map(str::trim)
+            .filter(|label| !label.is_empty());
+        let place = match (item.distance_meters, label) {
+            (Some(d), Some(label)) => Some(format!("📍 {} · {}", format_distance(d), label)),
+            (Some(d), None) => Some(format!("📍 {}", format_distance(d))),
+            (None, Some(label)) => Some(format!("📍 {label}")),
+            (None, None) => None,
+        };
+        if let Some(place) = place {
+            html.push(html_escape(&place));
+            plain.push(place);
+        }
+
+        let note_p = item
+            .link_note
+            .as_deref()
+            .map(|note| format!(" ({note})"))
+            .unwrap_or_default();
+        let note_h = item
+            .link_note
+            .as_deref()
+            .map(|note| format!(" <em>({})</em>", html_escape(note)))
+            .unwrap_or_default();
+        if let Some(link) = item.link.as_deref() {
+            plain.push(format!("🔗 {link}{note_p}"));
+            html.push(format!(
+                "🔗 <a href=\"{}\">Open</a>{note_h}",
+                html_escape(link)
+            ));
+        }
+    }
+
+    (plain.join("\n"), html.join("<br>"))
+}
+
+pub(crate) fn unique_source_names(names: &[String]) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for name in names {
+        if seen.insert(name.to_lowercase()) {
+            out.push(name.clone());
+        }
+    }
+    out
+}
+
+pub(crate) fn normalized_location_label(item: &db::DbItem) -> Option<String> {
+    item.location_label
+        .as_deref()
+        .map(normalize)
+        .map(|s| s.trim().to_owned())
+        .filter(|s| !s.is_empty())
+}
+
+pub(crate) fn locations_compatible(a: &db::DbItem, b: &db::DbItem) -> bool {
+    match (normalized_location_label(a), normalized_location_label(b)) {
+        (Some(la), Some(lb)) if la == lb => return true,
+        _ => {}
+    }
+
+    match (a.distance_meters, b.distance_meters) {
+        (Some(da), Some(db)) => (da - db).abs() <= 300.0,
+        _ => false,
+    }
+}
+
+/// Shared significant title words, and the word count of the shorter title.
+pub(crate) fn title_overlap(a: &str, b: &str) -> (usize, usize) {
+    let a_words: HashSet<String> = significant_words(a).into_iter().collect();
+    let b_words: HashSet<String> = significant_words(b).into_iter().collect();
+    (
+        a_words.intersection(&b_words).count(),
+        a_words.len().min(b_words.len()),
+    )
+}
+
+/// Titles about the same subject: at least two shared words making up half
+/// of the shorter title. Two "Brand in Wohnung in <district>" headlines
+/// qualify, so this only counts together with a matching location.
+pub(crate) fn titles_related(a: &str, b: &str) -> bool {
+    let (shared, shorter) = title_overlap(a, b);
+    shared >= 2 && shared * 2 >= shorter
+}
+
+/// Titles so alike that they are the same story whatever location each
+/// report resolved to: three or more shared words, two thirds of the shorter.
+pub(crate) fn titles_same_story(a: &str, b: &str) -> bool {
+    let (shared, shorter) = title_overlap(a, b);
+    shared >= 3 && shared * 3 >= shorter * 2
+}
+
+/// Link identity ignoring scheme, "www.", fragments, trailing slashes and
+/// tracking parameters.
+pub(crate) fn canonical_link(link: &str) -> String {
+    let link = link.trim();
+    let link = link.split('#').next().unwrap_or(link);
+    let (base, query) = link.split_once('?').unwrap_or((link, ""));
+    let base = base
+        .trim_start_matches("https://")
+        .trim_start_matches("http://")
+        .trim_start_matches("www.")
+        .trim_end_matches('/')
+        .to_lowercase();
+    let kept: Vec<&str> = query
+        .split('&')
+        .filter(|pair| !pair.is_empty())
+        .filter(|pair| {
+            let key = pair.split('=').next().unwrap_or("").to_lowercase();
+            !(key.starts_with("utm_")
+                || key.starts_with("at_")
+                || matches!(
+                    key.as_str(),
+                    "fbclid" | "gclid" | "ref" | "source" | "wt_mc"
+                ))
+        })
+        .collect();
+    if kept.is_empty() {
+        base
+    } else {
+        format!("{base}?{}", kept.join("&"))
+    }
+}
+
+pub(crate) fn same_link(a: &db::DbItem, b: &db::DbItem) -> bool {
+    match (a.link.as_deref(), b.link.as_deref()) {
+        (Some(la), Some(lb)) => canonical_link(la) == canonical_link(lb),
+        _ => false,
+    }
+}
+
+pub(crate) fn normalized_source_name(name: &str) -> String {
+    normalize(name).trim().to_owned()
+}
+
+pub(crate) fn same_source_family(a: &db::DbItem, b: &db::DbItem) -> bool {
+    normalized_source_name(&a.source_name) == normalized_source_name(&b.source_name)
+}
+
+pub(crate) fn title_terms(s: &str) -> Vec<String> {
+    let mut terms = Vec::new();
+    let mut current = String::new();
+    for ch in normalize(s).chars() {
+        if ch.is_alphanumeric() {
+            current.push(ch);
+        } else if !current.is_empty() {
+            terms.push(std::mem::take(&mut current));
+        }
+    }
+    if !current.is_empty() {
+        terms.push(current);
+    }
+    terms
+}
+
+pub(crate) fn contains_any_term(terms: &[String], needles: &[&str]) -> bool {
+    terms
+        .iter()
+        .any(|term| needles.iter().any(|needle| term == needle))
+}
+
+pub(crate) fn title_date_signals(s: &str) -> HashSet<String> {
+    let terms = title_terms(s);
+    let mut dates = HashSet::new();
+
+    for window in terms.windows(3) {
+        let [day, month, year] = window else {
+            continue;
+        };
+        if day.len() <= 2
+            && month.len() <= 2
+            && year.len() == 4
+            && day.chars().all(|c| c.is_ascii_digit())
+            && month.chars().all(|c| c.is_ascii_digit())
+            && year.chars().all(|c| c.is_ascii_digit())
+        {
+            dates.insert(format!("{:0>2}.{:0>2}.{}", day, month, year));
+        }
+    }
+
+    dates
+}
+
+pub(crate) fn title_event_class(s: &str) -> Option<&'static str> {
+    let terms = title_terms(s);
+    if contains_any_term(
+        &terms,
+        &[
+            "ankündigung",
+            "ankuendigung",
+            "announcement",
+            "announce",
+            "announcing",
+        ],
+    ) {
+        return Some("announcement");
+    }
+    if contains_any_term(
+        &terms,
+        &["demo", "demonstration", "kundgebung", "protest", "rally"],
+    ) {
+        return Some("protest");
+    }
+    if contains_any_term(
+        &terms,
+        &[
+            "veranstaltung",
+            "event",
+            "termin",
+            "date",
+            "konzert",
+            "concert",
+        ],
+    ) {
+        return Some("event");
+    }
+    None
+}
+
+pub(crate) fn translated_event_duplicate(a: &db::DbItem, b: &db::DbItem) -> bool {
+    if !same_source_family(a, b) || !locations_compatible(a, b) {
+        return false;
+    }
+
+    let Some(class_a) = title_event_class(&a.title) else {
+        return false;
+    };
+    let Some(class_b) = title_event_class(&b.title) else {
+        return false;
+    };
+    if class_a != class_b {
+        return false;
+    }
+
+    let dates_a = title_date_signals(&a.title);
+    let dates_b = title_date_signals(&b.title);
+    !dates_a.is_empty() && !dates_b.is_empty() && !dates_a.is_disjoint(&dates_b)
+}
+
+pub(crate) fn likely_same_incident(item: &db::DbItem, cluster: &[db::DbItem]) -> bool {
+    cluster.iter().any(|other| {
+        same_link(item, other)
+            || translated_event_duplicate(item, other)
+            || titles_same_story(&item.title, &other.title)
+            || (locations_compatible(item, other) && titles_related(&item.title, &other.title))
+    })
+}
+
+/// How long a posted story suppresses re-reports of itself.
+pub(crate) const ALREADY_POSTED_WINDOW_SECS: i64 = 48 * 3600;
+
+/// Split digest items into new ones and repeats of a recently posted story
+/// (same article, or a clearly identical headline). Looser matches stay, so
+/// a follow-up ("…: Tatverdächtiger festgenommen") is still reported.
+pub(crate) fn split_already_posted(
+    items: Vec<db::DbItem>,
+    posted: &[db::DbItem],
+) -> (Vec<db::DbItem>, Vec<db::DbItem>) {
+    items.into_iter().partition(|item| {
+        !posted
+            .iter()
+            .any(|old| same_link(item, old) || titles_same_story(&item.title, &old.title))
+    })
+}
+
+pub(crate) fn cluster_digest_items(items: Vec<db::DbItem>) -> Vec<DigestItem> {
+    let mut sorted = items;
+    sorted.sort_by_key(|item| std::cmp::Reverse(item.score));
+
+    let mut clusters: Vec<Vec<db::DbItem>> = Vec::new();
+    for item in sorted {
+        if let Some(cluster) = clusters
+            .iter_mut()
+            .find(|cluster| likely_same_incident(&item, cluster))
+        {
+            cluster.push(item);
+        } else {
+            clusters.push(vec![item]);
+        }
+    }
+
+    clusters
+        .into_iter()
+        .map(|cluster| {
+            let mut iter = cluster.into_iter();
+            let first = iter.next().expect("cluster is never empty");
+            let mut digest = DigestItem::from_db(first.clone());
+            let mut source_names = vec![first.source_name.clone()];
+            let mut best_score = digest.score;
+
+            for item in iter {
+                digest.guids.push(item.guid.clone());
+                source_names.push(item.source_name.clone());
+                if item.score > best_score {
+                    best_score = item.score;
+                    digest.title = item.title.clone();
+                    digest.link = item.link.clone();
+                    digest.link_note = item.link_note.clone();
+                    digest.distance_meters = item.distance_meters;
+                    digest.location_label = item.location_label.clone();
+                    digest.max_score = item.max_score;
+                }
+            }
+
+            let unique_sources = unique_source_names(&source_names);
+            digest.source_count = unique_sources.len();
+            digest.source_name = unique_sources.join(" + ");
+            digest.score = if digest.source_count > 1 {
+                (best_score + 1).min(5)
+            } else {
+                best_score
+            };
+            digest
+        })
+        .collect()
+}
+
+pub(crate) fn cluster_db_items(items: Vec<db::DbItem>) -> Vec<Vec<db::DbItem>> {
+    let mut sorted = items;
+    sorted.sort_by_key(|item| std::cmp::Reverse(item.score));
+
+    let mut clusters: Vec<Vec<db::DbItem>> = Vec::new();
+    for item in sorted {
+        if let Some(cluster) = clusters
+            .iter_mut()
+            .find(|cluster| likely_same_incident(&item, cluster))
+        {
+            cluster.push(item);
+        } else {
+            clusters.push(vec![item]);
+        }
+    }
+    clusters
+}
+
+pub(crate) async fn promote_candidate_clusters(
+    db: &Db,
+    min_score: i32,
+    candidate_min_sources: usize,
+    candidate_retention_hours: u64,
+) -> Result<usize> {
+    let retention_secs = (candidate_retention_hours.max(1) as i64) * 3600;
+    let expired = db.prune_old_candidates(retention_secs).await?;
+    if expired > 0 {
+        info!("Expired {expired} old news candidate(s) before digest");
+    }
+
+    let pending = db.list_pending_for_clustering(retention_secs).await?;
+    if pending.is_empty() {
+        return Ok(0);
+    }
+
+    let candidate_guids: HashSet<String> = pending
+        .iter()
+        .filter(|p| p.state == "candidate")
+        .map(|p| p.item.guid.clone())
+        .collect();
+    if candidate_guids.is_empty() {
+        return Ok(0);
+    }
+
+    let clusters = cluster_db_items(pending.into_iter().map(|p| p.item).collect());
+    let mut to_promote = Vec::new();
+    for cluster in clusters {
+        let best_score = cluster.iter().map(|item| item.score).max().unwrap_or(0);
+        let sources: Vec<String> = cluster
+            .iter()
+            .map(|item| item.source_name.clone())
+            .collect();
+        let unique_sources = unique_source_names(&sources);
+        let corroborated = unique_sources.len() >= candidate_min_sources.max(2);
+        let strong_after_boost = if unique_sources.len() > 1 {
+            (best_score + 1).min(5) >= min_score
+        } else {
+            best_score >= min_score
+        };
+
+        if corroborated && strong_after_boost {
+            to_promote.extend(
+                cluster
+                    .iter()
+                    .filter(|item| candidate_guids.contains(&item.guid))
+                    .map(|item| item.guid.clone()),
+            );
+        }
+    }
+
+    let promoted = db
+        .promote_candidates(
+            &to_promote,
+            min_score,
+            "promoted by duplicate-source clustering",
+        )
+        .await?;
+    if promoted > 0 {
+        info!("Promoted {promoted} news candidate(s) after duplicate-source clustering");
+    }
+    Ok(promoted)
+}
+
+// ── Digest chunking ───────────────────────────────────────────────────────────
+
+pub(crate) const MAX_DIGEST_BYTES: usize = 8_000;
+pub(crate) const MAX_DIGEST_ITEMS: usize = 15;
+
+/// Sort by score descending then split into chunks under size and item-count limits.
+pub(crate) fn chunk_digest(items: &[DigestItem]) -> Vec<Vec<DigestItem>> {
+    let mut sorted = items.to_vec();
+    sorted.sort_by_key(|item| std::cmp::Reverse(item.score));
+
+    let mut chunks: Vec<Vec<DigestItem>> = Vec::new();
+    let mut current: Vec<DigestItem> = Vec::new();
+    let mut current_bytes: usize = 0;
+
+    for item in sorted {
+        let item_bytes = item.title.len()
+            + item.source_name.len()
+            + item.link.as_deref().map_or(0, |l| l.len())
+            + item.source_count * 8
+            + 50;
+        let would_overflow =
+            current_bytes + item_bytes > MAX_DIGEST_BYTES || current.len() >= MAX_DIGEST_ITEMS;
+        if would_overflow && !current.is_empty() {
+            chunks.push(std::mem::take(&mut current));
+            current_bytes = 0;
+        }
+        current_bytes += item_bytes;
+        current.push(item);
+    }
+    if !current.is_empty() {
+        chunks.push(current);
+    }
+    chunks
+}
+
+// ── Digest loop ───────────────────────────────────────────────────────────────
+
+/// The digest as a scheduled job: at each of `digest_times` (local time), a
+/// digest missed by a restart caught up within [`CATCH_UP`], recorded in
+/// the `alerts` table once handled (`digest:2026-10-30 08:00`). `None` when
+/// no time is valid.
+pub(crate) fn digest_job(zone: Zone, digest_times: &[String]) -> Option<Job> {
+    let targets: Vec<TimeOfDay> = digest_times
+        .iter()
+        .filter_map(|s| match s.parse() {
+            Ok(time) => Some(time),
+            Err(e) => {
+                warn!("Ignoring digest time {s:?}: {e:#}");
+                None
+            }
+        })
+        .collect();
+
+    if targets.is_empty() {
+        warn!("No valid digest_times configured, digest loop disabled");
+        return None;
+    }
+    let rule = Rule::Daily { at: targets };
+    Some(Job::new(
+        "digest",
+        zone,
+        Delivery::AtLeastOnce,
+        CATCH_UP,
+        move || Some(rule.clone()),
+    ))
+}
+
+pub(crate) async fn digest_loop(
+    client: Bot,
+    job: Job,
+    db: Db,
+    min_score: i32,
+    candidate_min_sources: usize,
+    candidate_retention_hours: u64,
+    alive: Alive,
+) {
+    if let Err(e) = seed_digest_ledger(&db, &job, chrono::Utc::now()).await {
+        warn!("Digest: could not seed the ledger: {e:#}");
+    }
+    let ledger = db.clone();
+    schedule::run(job, ledger, alive, move |slot: Slot| {
+        let client = client.clone();
+        let db = db.clone();
+        async move {
+            post_digest(
+                &client,
+                &db,
+                &slot,
+                min_score,
+                candidate_min_sources,
+                candidate_retention_hours,
+            )
+            .await
+        }
+    })
+    .await
+}
+
+/// The first start of the version that records digests in the ledger: the
+/// version before wrote no `digest:` rows, so a digest it posted within
+/// [`CATCH_UP`] would run again. With no digest row at all, the latest slot
+/// is recorded as handled instead of run (items it did not post stay queued
+/// for the next digest). Whether it seeded.
+pub(crate) async fn seed_digest_ledger(
+    db: &Db,
+    job: &Job,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<bool> {
+    let entry = job.ledger_entry();
+    if db.has_alerts_from(entry).await? {
+        return Ok(false);
+    }
+    let Some(slot) = job.latest(now) else {
+        return Ok(false);
+    };
+    db.mark_done(entry, &slot).await?;
+    info!(
+        "Digest: no digest recorded yet (first start of this version), counting the one of {} as posted",
+        slot.local.format("%a %d %b %H:%M")
+    );
+    Ok(true)
+}
+
+/// The digest of `slot`: everything queued since the last one. Chunks that
+/// did not get through are requeued and the digest is tried again after
+/// [`RETRY_AFTER`]; each chunk's transaction IDs name the slot and its
+/// items, so rooms that already have it get no second copy.
+async fn post_digest(
+    client: &Bot,
+    db: &Db,
+    slot: &Slot,
+    min_score: i32,
+    candidate_min_sources: usize,
+    candidate_retention_hours: u64,
+) -> Outcome {
+    if let Err(e) = promote_candidate_clusters(
+        db,
+        min_score,
+        candidate_min_sources,
+        candidate_retention_hours,
+    )
+    .await
+    {
+        warn!("Digest: candidate promotion failed, continuing with queued items: {e}");
+    }
+
+    let items = match db.take_for_digest(min_score).await {
+        Ok(v) => v,
+        Err(e) => {
+            error!("Digest: failed to query DB: {e}");
+            return Outcome::RetryIn(RETRY_AFTER);
+        }
+    };
+
+    let posted = match db.list_recent_posted(ALREADY_POSTED_WINDOW_SECS).await {
+        Ok(v) => v,
+        Err(e) => {
+            warn!("Digest: failed to load recently posted items: {e}");
+            Vec::new()
+        }
+    };
+    let (items, repeats) = split_already_posted(items, &posted);
+    if !repeats.is_empty() {
+        info!(
+            "Digest: {} item(s) repeat an already posted story, not posting",
+            repeats.len()
+        );
+        let guids: Vec<String> = repeats.into_iter().map(|item| item.guid).collect();
+        if let Err(e) = db
+            .drop_processing(&guids, "same story already posted")
+            .await
+        {
+            warn!("Digest: failed to drop repeated items: {e}");
+        }
+    }
+
+    if items.is_empty() {
+        info!("Digest: no pending items, staying silent");
+        return Outcome::Skipped;
+    }
+
+    let day_str = Local::now().format("%A, %d %b %Y").to_string();
+    let header = format!("Digest · {day_str}");
+    let clustered_items = cluster_digest_items(items);
+    info!(
+        "Posting digest with {} clustered item(s)",
+        clustered_items.len()
+    );
+    let chunks = chunk_digest(&clustered_items);
+    let total = chunks.len();
+    let deadline = std::time::Instant::now() + SEND_FOR;
+    let mut outcome = Outcome::Done;
+    for (i, chunk) in chunks.into_iter().enumerate() {
+        let chunk_header = if total > 1 {
+            format!("{header} ({}/{})", i + 1, total)
+        } else {
+            header.clone()
+        };
+        let (plain, html) = format_digest(&chunk, &chunk_header);
+        let guids: Vec<String> = chunk
+            .iter()
+            .flat_map(|it| it.guids.iter().cloned())
+            .collect();
+        let key = digest_post_key(slot, &guids);
+        let delivered = post_slot(client, &plain, &html, &key, deadline).await;
+        if let Outcome::RetryIn(after) = delivered.outcome(RETRY_AFTER) {
+            warn!(
+                "Digest: post failed, requeueing {} item(s) for retry",
+                guids.len()
+            );
+            db.requeue_failed(&guids, "post_to_rooms failed").await.ok();
+            outcome = Outcome::RetryIn(after);
+        } else if let Err(e) = db.mark_posted(&guids).await {
+            error!("Digest: failed to mark items posted: {e}");
+        }
+        if total > 1 {
+            sleep(Duration::from_millis(500)).await;
+        }
+    }
+    outcome
+}
+
+/// The key of a digest chunk's transaction IDs: the slot and the items in
+/// it. A chunk tried again with the same items is the same post.
+fn digest_post_key(slot: &Slot, guids: &[String]) -> String {
+    format!("radar-bot:digest:{}:{}", slot.key(), guids.join(","))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn db_item(guid: &str, source: &str, title: &str, link: &str) -> db::DbItem {
+        db::DbItem {
+            guid: guid.to_owned(),
+            source_name: source.to_owned(),
+            title: title.to_owned(),
+            link: Some(link.to_owned()),
+            link_note: None,
+            score: 1,
+            max_score: 5,
+            distance_meters: None,
+            location_label: None,
+        }
+    }
+
+    #[test]
+    fn same_story_merges_even_when_locations_resolved_differently() {
+        // Posted three times on 2026-09-25: one rbb version had a place
+        // mention, the other only the city-wide default.
+        let mut a = db_item(
+            "a",
+            "rbb Berlin",
+            "Kameras werden am Kottbusser Tor installiert - Testbetrieb startet in vier Wochen",
+            "https://rbb.test/1",
+        );
+        a.distance_meters = Some(1231.0);
+        a.location_label = Some("Lübecker Brücke".to_owned());
+        let b = db_item(
+            "b",
+            "rbb Berlin",
+            "Kameras am Kottbusser Tor werden eingerichtet - Testbetrieb in vier Wochen",
+            "https://rbb.test/2",
+        );
+
+        assert_eq!(cluster_digest_items(vec![a, b]).len(), 1);
+    }
+
+    #[test]
+    fn city_wide_items_with_related_titles_stay_separate() {
+        // Both only carry the source default. Nothing says they happened at
+        // the same place, so "Brand in Wohnung" alone must not merge them.
+        let a = db_item(
+            "a",
+            "Polizei Berlin",
+            "Brand in Wohnung in Neukölln",
+            "https://p.test/1",
+        );
+        let b = db_item(
+            "b",
+            "rbb Berlin",
+            "Brand in Wohnung in Spandau",
+            "https://r.test/2",
+        );
+
+        assert_eq!(cluster_digest_items(vec![a, b]).len(), 2);
+    }
+
+    #[test]
+    fn links_compare_without_tracking_noise() {
+        assert_eq!(
+            canonical_link("https://www.rbb24.de/panorama/a.html?utm_source=rss#top"),
+            canonical_link("http://rbb24.de/panorama/a.html/")
+        );
+        assert_ne!(
+            canonical_link("https://example.test/article?id=1"),
+            canonical_link("https://example.test/article?id=2")
+        );
+    }
+
+    #[test]
+    fn repeats_of_posted_stories_are_split_off_but_follow_ups_stay() {
+        let posted = vec![db_item(
+            "old",
+            "Morgenpost",
+            "Messerangriff in der Perleberger Straße",
+            "https://m.test/1",
+        )];
+        let repeat = db_item(
+            "r",
+            "taz",
+            "Messerangriff in der Perleberger Straße",
+            "https://www.m.test/1?utm_medium=feed",
+        );
+        let follow_up = db_item(
+            "f",
+            "rbb Berlin",
+            "Nach Messerangriff in der Perleberger Straße: Tatverdächtiger festgenommen",
+            "https://r.test/9",
+        );
+
+        let (fresh, repeats) = split_already_posted(vec![repeat, follow_up], &posted);
+
+        assert_eq!(fresh.len(), 1);
+        assert_eq!(fresh[0].guid, "f");
+        assert_eq!(repeats[0].guid, "r");
+    }
+
+    #[test]
+    fn digest_shows_a_keyword_label_without_a_distance() {
+        let item = DigestItem {
+            guids: vec!["1".to_owned()],
+            source_name: "Polizei Berlin".to_owned(),
+            source_count: 1,
+            title: "Einsatz".to_owned(),
+            link: None,
+            link_note: None,
+            score: 2,
+            max_score: 5,
+            distance_meters: None,
+            location_label: Some("Charlottenburg".to_owned()),
+        };
+
+        let (plain, _) = format_digest(&[item], "Test");
+
+        assert!(plain.contains("⭐ 2/5"));
+        assert!(plain.contains("📍 Charlottenburg"));
+    }
+
+    /// One round of the digest job at `now`; the slot it ran, if any.
+    async fn digest_round(
+        runner: &mut mxbot_common::schedule::Runner,
+        db: &Db,
+        now: &str,
+    ) -> (Option<chrono::DateTime<chrono::Utc>>, Option<String>) {
+        let mut ran = None;
+        let wake = runner
+            .round(db, now.parse().unwrap(), &mut |slot: Slot| {
+                ran = Some(slot.key());
+                async { Outcome::Done }
+            })
+            .await;
+        (wake, ran)
+    }
+
+    #[tokio::test]
+    async fn digest_times_are_local_and_each_is_a_slot_of_its_own() {
+        let job = digest_job(
+            Zone::DEFAULT,
+            &[
+                "08:00".to_owned(),
+                "nonsense".to_owned(),
+                "20:00".to_owned(),
+            ],
+        )
+        .unwrap();
+        let mut runner = mxbot_common::schedule::Runner::new(job);
+        let path = std::env::temp_dir().join(format!(
+            "radar-bot-digest-dst-{}-{}.db",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let db = Db::open(&path).unwrap();
+        db.mark_alert_seen("digest:2026-10-24 20:00", "digest")
+            .await
+            .unwrap();
+        // Saturday night before the autumn change: 08:00 CET is 07:00 UTC.
+        let (wake, ran) = digest_round(&mut runner, &db, "2026-10-24T22:00:00Z").await;
+        assert_eq!(wake, Some("2026-10-25T07:00:00Z".parse().unwrap()));
+        assert_eq!(ran, None);
+        // An hour early (where a naive sleep woke, then digested again at 08:00).
+        let (_, ran) = digest_round(&mut runner, &db, "2026-10-25T06:00:00Z").await;
+        assert_eq!(ran, None);
+        let (_, ran) = digest_round(&mut runner, &db, "2026-10-25T07:00:00Z").await;
+        assert_eq!(ran.as_deref(), Some("2026-10-25 08:00"));
+        let (_, ran) = digest_round(&mut runner, &db, "2026-10-25T07:01:00Z").await;
+        assert_eq!(ran, None);
+        let (_, ran) = digest_round(&mut runner, &db, "2026-10-25T19:00:00Z").await;
+        assert_eq!(ran.as_deref(), Some("2026-10-25 20:00"));
+        assert!(db.is_alert_seen("digest:2026-10-25 20:00").await.unwrap());
+        assert!(digest_job(Zone::DEFAULT, &["25:00".to_owned()]).is_none());
+        std::fs::remove_file(path).ok();
+    }
+
+    #[tokio::test]
+    async fn the_first_start_records_the_last_digest_instead_of_posting_it_again() {
+        let job = || digest_job(Zone::DEFAULT, &["08:00".to_owned(), "20:00".to_owned()]).unwrap();
+        let temp = |what: &str| {
+            std::env::temp_dir().join(format!(
+                "radar-bot-digest-{what}-{}-{}.db",
+                std::process::id(),
+                chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+            ))
+        };
+        let path = temp("seed");
+        let db = Db::open(&path).unwrap();
+        // The old version posted the 08:00 digest (07:00 UTC); the new one
+        // starts at 08:30 local, within CATCH_UP.
+        let restart = "2026-10-30T07:30:00Z".parse().unwrap();
+        assert!(seed_digest_ledger(&db, &job(), restart).await.unwrap());
+        assert!(db.is_alert_seen("digest:2026-10-30 08:00").await.unwrap());
+        let mut runner = mxbot_common::schedule::Runner::new(job());
+        let (wake, ran) = digest_round(&mut runner, &db, "2026-10-30T07:30:00Z").await;
+        assert_eq!(ran, None);
+        assert_eq!(wake, Some("2026-10-30T19:00:00Z".parse().unwrap()));
+        // Once: the next start finds the row and seeds nothing.
+        assert!(!seed_digest_ledger(&db, &job(), restart).await.unwrap());
+        let (_, ran) = digest_round(&mut runner, &db, "2026-10-30T19:00:00Z").await;
+        assert_eq!(ran.as_deref(), Some("2026-10-30 20:00"));
+        std::fs::remove_file(path).ok();
+
+        // A ledger with digest rows: a missed digest is caught up as usual.
+        let path = temp("seeded");
+        let db = Db::open(&path).unwrap();
+        db.mark_alert_seen("digest:2026-10-29 20:00", "digest")
+            .await
+            .unwrap();
+        assert!(!seed_digest_ledger(&db, &job(), restart).await.unwrap());
+        let mut runner = mxbot_common::schedule::Runner::new(job());
+        let (_, ran) = digest_round(&mut runner, &db, "2026-10-30T07:30:00Z").await;
+        assert_eq!(ran.as_deref(), Some("2026-10-30 08:00"));
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn a_digest_chunk_keeps_its_transaction_key_until_its_items_change() {
+        let zone = Zone::DEFAULT;
+        let rule = Rule::Daily {
+            at: vec![TimeOfDay::new(8, 0), TimeOfDay::new(20, 0)],
+        };
+        let morning = rule
+            .latest(zone, "2026-10-30T08:00:00Z".parse().unwrap())
+            .unwrap();
+        let evening = rule
+            .latest(zone, "2026-10-30T20:00:00Z".parse().unwrap())
+            .unwrap();
+        let items = ["a".to_owned(), "b".to_owned()];
+        assert_eq!(
+            digest_post_key(&morning, &items),
+            digest_post_key(&morning, &items)
+        );
+        assert_ne!(
+            digest_post_key(&morning, &items),
+            digest_post_key(&morning, &items[..1])
+        );
+        assert_ne!(
+            digest_post_key(&morning, &items),
+            digest_post_key(&evening, &items)
+        );
+    }
+}

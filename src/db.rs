@@ -1,0 +1,1188 @@
+use std::collections::HashSet;
+use std::path::Path;
+use std::sync::{Arc, Mutex};
+
+use anyhow::{Context, Result};
+use rusqlite::{params, Connection};
+
+use crate::FeedItem;
+use mxbot_common::schedule::{Ledger, Slot};
+
+// ── Public types ──────────────────────────────────────────────────────────────
+
+/// A DWD warning that was posted and is currently tracked as active.
+#[derive(Debug, Clone)]
+pub struct DwdActiveWarning {
+    pub id: String,
+    pub headline: String,
+    pub region: String,
+    /// JSON-encoded map of room_id → event_id for the original warning posts.
+    /// None when event IDs were not recorded (e.g. first run after upgrade).
+    pub event_ids_json: Option<String>,
+    pub original_plain: Option<String>,
+    pub original_html: Option<String>,
+    /// DWD start/end timestamps (ms) as last seen. Used to detect time updates.
+    pub start_ms: i64,
+    pub end_ms: i64,
+}
+
+/// The transaction key of an alert occurrence's post, fixed at its first
+/// attempt, with the warning's time window as it was then.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PostKey {
+    pub key: String,
+    pub start_ms: i64,
+    pub end_ms: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct NinaActiveWarning {
+    pub headline: String,
+    pub event_ids_json: String,
+    pub original_plain: String,
+    pub original_html: String,
+}
+
+/// A row from the items table, sufficient to format and post a digest.
+#[derive(Debug, Clone)]
+pub struct DbItem {
+    pub guid: String,
+    pub source_name: String,
+    pub title: String,
+    pub link: Option<String>,
+    pub link_note: Option<String>,
+    pub score: i32,
+    pub max_score: i32,
+    pub distance_meters: Option<f64>,
+    pub location_label: Option<String>,
+}
+
+/// A digest candidate or queued item used for pre-digest clustering.
+#[derive(Debug, Clone)]
+pub struct PendingItem {
+    pub item: DbItem,
+    pub state: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct SourcePollStat {
+    pub source_name: String,
+    pub total: usize,
+    pub queued: usize,
+    pub candidate: usize,
+    pub dropped: usize,
+    pub retry_later: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct SourceStatSummary {
+    pub source_name: String,
+    pub total: i64,
+    pub queued: i64,
+    pub candidate: i64,
+    pub dropped: i64,
+    pub retry_later: i64,
+}
+
+// ── Db handle ─────────────────────────────────────────────────────────────────
+
+#[derive(Clone)]
+pub struct Db(Arc<Mutex<Connection>>);
+
+impl Db {
+    pub fn open(path: &Path) -> Result<Self> {
+        let conn = Connection::open(path).context("Failed to open items DB")?;
+        conn.pragma_update(None, "journal_mode", "WAL")?;
+        // Wait up to 5 s instead of immediately returning SQLITE_BUSY.
+        conn.pragma_update(None, "busy_timeout", 5_000i64)?;
+        conn.execute_batch(SCHEMA)
+            .context("Failed to initialise DB schema")?;
+        ensure_column(&conn, "items", "location_label", "TEXT")?;
+        ensure_column(&conn, "items", "link_note", "TEXT")?;
+        ensure_items_state_allows_candidates(&conn)?;
+        ensure_column(&conn, "dwd_active_warnings", "event_ids_json", "TEXT")?;
+        ensure_column(&conn, "dwd_active_warnings", "original_plain", "TEXT")?;
+        ensure_column(&conn, "dwd_active_warnings", "original_html", "TEXT")?;
+        ensure_column(
+            &conn,
+            "dwd_active_warnings",
+            "start_ms",
+            "INTEGER NOT NULL DEFAULT 0",
+        )?;
+        ensure_column(
+            &conn,
+            "dwd_active_warnings",
+            "end_ms",
+            "INTEGER NOT NULL DEFAULT 0",
+        )?;
+        ensure_column(&conn, "nina_active_warnings", "event_ids_json", "TEXT")?;
+        ensure_column(&conn, "nina_active_warnings", "original_plain", "TEXT")?;
+        ensure_column(&conn, "nina_active_warnings", "original_html", "TEXT")?;
+        Ok(Db(Arc::new(Mutex::new(conn))))
+    }
+
+    // ── Poll phase ────────────────────────────────────────────────────────────
+
+    /// Returns true if this guid has never been seen before (any state).
+    pub async fn is_new(&self, guid: &str) -> Result<bool> {
+        let db = self.0.clone();
+        let guid = guid.to_owned();
+        tokio::task::spawn_blocking(move || {
+            let conn = db.lock().unwrap_or_else(|e| e.into_inner());
+            let n: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM items WHERE guid = ?1",
+                params![guid],
+                |r| r.get(0),
+            )?;
+            Ok::<bool, anyhow::Error>(n == 0)
+        })
+        .await?
+    }
+
+    /// Persist a scored item that passed all filters. No-op if guid already exists.
+    pub async fn insert_queued(&self, item: &FeedItem) -> Result<()> {
+        self.insert_item_with_state(item, "queued", None).await
+    }
+
+    /// Persist a weak-but-local item so duplicate clustering can promote it later.
+    pub async fn insert_candidate(&self, item: &FeedItem, reason: &str) -> Result<()> {
+        self.insert_item_with_state(item, "candidate", Some(reason))
+            .await
+    }
+
+    async fn insert_item_with_state(
+        &self,
+        item: &FeedItem,
+        state: &'static str,
+        reason: Option<&str>,
+    ) -> Result<()> {
+        let db = self.0.clone();
+        let guid = item.guid.clone();
+        let source_name = item.source_name.clone();
+        let title = item.title.clone();
+        let link = item.link.clone();
+        let link_note = item.link_note.clone();
+        let score = item.score;
+        let max_score = item.max_score;
+        let distance_m = item.distance_meters;
+        let location = item.location_label.clone();
+        let reason = reason.map(str::to_owned);
+        let now = chrono::Utc::now().timestamp();
+
+        tokio::task::spawn_blocking(move || {
+            let conn = db.lock().unwrap_or_else(|e| e.into_inner());
+            conn.execute(
+                "INSERT OR IGNORE INTO items
+                 (guid, source_name, title, link, link_note, score, max_score, distance_m, location_label, discovered_at, state, error)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                params![guid, source_name, title, link, link_note, score, max_score, distance_m, location, now, state, reason],
+            )?;
+            conn.execute("DELETE FROM retry_attempts WHERE guid = ?1", params![guid])?;
+            Ok::<(), anyhow::Error>(())
+        })
+        .await?
+    }
+
+    /// Persist a filtered-out item as 'dropped' so it is not reprocessed next poll.
+    pub async fn insert_dropped(
+        &self,
+        guid: &str,
+        source_name: &str,
+        title: &str,
+        link: Option<&str>,
+        reason: &str,
+    ) -> Result<()> {
+        let db = self.0.clone();
+        let guid = guid.to_owned();
+        let source_name = source_name.to_owned();
+        let title = title.to_owned();
+        let link = link.map(|s| s.to_owned());
+        let reason = reason.to_owned();
+        let now = chrono::Utc::now().timestamp();
+
+        tokio::task::spawn_blocking(move || {
+            let conn = db.lock().unwrap_or_else(|e| e.into_inner());
+            conn.execute(
+                "INSERT OR IGNORE INTO items
+                 (guid, source_name, title, link, score, max_score, discovered_at, state, error)
+                 VALUES (?1, ?2, ?3, ?4, 0, 0, ?5, 'dropped', ?6)",
+                params![guid, source_name, title, link, now, reason],
+            )?;
+            conn.execute("DELETE FROM retry_attempts WHERE guid = ?1", params![guid])?;
+            Ok::<(), anyhow::Error>(())
+        })
+        .await?
+    }
+
+    // ── Digest phase ──────────────────────────────────────────────────────────
+
+    /// Return queued and candidate rows recent enough to participate in pre-digest clustering.
+    pub async fn list_pending_for_clustering(
+        &self,
+        candidate_retention_secs: i64,
+    ) -> Result<Vec<PendingItem>> {
+        let db = self.0.clone();
+        let cutoff = chrono::Utc::now().timestamp() - candidate_retention_secs;
+
+        tokio::task::spawn_blocking(move || {
+            let conn = db.lock().unwrap_or_else(|e| e.into_inner());
+            let mut stmt = conn.prepare(
+                "SELECT guid, source_name, title, link, link_note, score, max_score, distance_m, location_label, state
+                 FROM items
+                 WHERE state = 'queued'
+                    OR (state = 'candidate' AND discovered_at >= ?1)
+                 ORDER BY score DESC",
+            )?;
+            let rows = stmt
+                .query_map(params![cutoff], |row| {
+                    Ok(PendingItem {
+                        item: DbItem {
+                            guid:            row.get(0)?,
+                            source_name:     row.get(1)?,
+                            title:           row.get(2)?,
+                            link:            row.get(3)?,
+                            link_note:       row.get(4)?,
+                            score:           row.get(5)?,
+                            max_score:       row.get(6)?,
+                            distance_meters: row.get(7)?,
+                            location_label:  row.get(8)?,
+                        },
+                        state: row.get(9)?,
+                    })
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok::<Vec<PendingItem>, anyhow::Error>(rows)
+        })
+        .await?
+    }
+
+    pub async fn promote_candidates(
+        &self,
+        guids: &[String],
+        min_score: i32,
+        reason: &str,
+    ) -> Result<usize> {
+        if guids.is_empty() {
+            return Ok(0);
+        }
+        let db = self.0.clone();
+        let guids = guids.to_vec();
+        let reason = reason.to_owned();
+
+        tokio::task::spawn_blocking(move || {
+            let conn = db.lock().unwrap_or_else(|e| e.into_inner());
+            let mut n = 0;
+            for guid in &guids {
+                n += conn.execute(
+                    "UPDATE items
+                     SET state = 'queued',
+                         score = MAX(score, ?1),
+                         error = ?2
+                     WHERE guid = ?3 AND state = 'candidate'",
+                    params![min_score, reason, guid],
+                )?;
+            }
+            Ok::<usize, anyhow::Error>(n)
+        })
+        .await?
+    }
+
+    pub async fn prune_old_candidates(&self, candidate_retention_secs: i64) -> Result<usize> {
+        let db = self.0.clone();
+        let cutoff = chrono::Utc::now().timestamp() - candidate_retention_secs;
+        tokio::task::spawn_blocking(move || {
+            let n = db.lock().unwrap_or_else(|e| e.into_inner()).execute(
+                "UPDATE items
+                 SET state = 'dropped', error = 'candidate expired before corroboration'
+                 WHERE state = 'candidate' AND discovered_at < ?1",
+                params![cutoff],
+            )?;
+            Ok::<usize, anyhow::Error>(n)
+        })
+        .await?
+    }
+
+    pub async fn record_source_stats(&self, stats: Vec<SourcePollStat>) -> Result<()> {
+        if stats.is_empty() {
+            return Ok(());
+        }
+        let db = self.0.clone();
+        let now = chrono::Utc::now().timestamp();
+        let cutoff = now - 30 * 86_400;
+
+        tokio::task::spawn_blocking(move || {
+            let mut conn = db.lock().unwrap_or_else(|e| e.into_inner());
+            let tx = conn.transaction()?;
+            for stat in stats {
+                tx.execute(
+                    "INSERT INTO source_poll_stats
+                     (ts, source_name, total, queued, candidate, dropped, retry_later)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    params![
+                        now,
+                        stat.source_name,
+                        stat.total as i64,
+                        stat.queued as i64,
+                        stat.candidate as i64,
+                        stat.dropped as i64,
+                        stat.retry_later as i64
+                    ],
+                )?;
+            }
+            tx.execute(
+                "DELETE FROM source_poll_stats WHERE ts < ?1",
+                params![cutoff],
+            )?;
+            tx.commit()?;
+            Ok::<(), anyhow::Error>(())
+        })
+        .await?
+    }
+
+    pub async fn source_stats_summary(&self, hours: u32) -> Result<Vec<SourceStatSummary>> {
+        let db = self.0.clone();
+        let hours = hours.clamp(1, 24 * 30);
+        let cutoff = chrono::Utc::now().timestamp() - hours as i64 * 3600;
+
+        tokio::task::spawn_blocking(move || {
+            let conn = db.lock().unwrap_or_else(|e| e.into_inner());
+            let mut stmt = conn.prepare(
+                "SELECT source_name,
+                        COALESCE(SUM(total), 0),
+                        COALESCE(SUM(queued), 0),
+                        COALESCE(SUM(candidate), 0),
+                        COALESCE(SUM(dropped), 0),
+                        COALESCE(SUM(retry_later), 0)
+                 FROM source_poll_stats
+                 WHERE ts >= ?1
+                 GROUP BY source_name
+                 ORDER BY SUM(queued) DESC, SUM(candidate) DESC, SUM(total) DESC
+                 LIMIT 25",
+            )?;
+            let rows = stmt
+                .query_map(params![cutoff], |row| {
+                    Ok(SourceStatSummary {
+                        source_name: row.get(0)?,
+                        total: row.get(1)?,
+                        queued: row.get(2)?,
+                        candidate: row.get(3)?,
+                        dropped: row.get(4)?,
+                        retry_later: row.get(5)?,
+                    })
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok::<Vec<SourceStatSummary>, anyhow::Error>(rows)
+        })
+        .await?
+    }
+
+    /// Atomically:
+    ///   1. Move queued items → 'processing'.
+    ///   2. Return them sorted by score descending.
+    ///
+    /// Caller MUST call mark_posted() or requeue_failed() for the returned items.
+    pub async fn take_for_digest(&self, min_score: i32) -> Result<Vec<DbItem>> {
+        let db = self.0.clone();
+        let now = chrono::Utc::now().timestamp();
+
+        tokio::task::spawn_blocking(move || {
+            let mut conn = db.lock().unwrap_or_else(|e| e.into_inner());
+            let tx = conn.transaction()?;
+
+            tx.execute(
+                "UPDATE items SET state = 'dropped', error = 'queued item below digest threshold'
+                 WHERE state = 'queued' AND score < ?1",
+                params![min_score],
+            )?;
+            tx.execute(
+                "UPDATE items SET state = 'processing', last_attempt_at = ?1
+                 WHERE state = 'queued' AND score >= ?2",
+                params![now, min_score],
+            )?;
+
+            let mut stmt = tx.prepare(
+                "SELECT guid, source_name, title, link, link_note, score, max_score, distance_m, location_label
+                 FROM items WHERE state = 'processing'
+                 ORDER BY score DESC",
+            )?;
+            let items: Vec<DbItem> = stmt.query_map([], |row| {
+                Ok(DbItem {
+                    guid:            row.get(0)?,
+                    source_name:     row.get(1)?,
+                    title:           row.get(2)?,
+                    link:            row.get(3)?,
+                    link_note:       row.get(4)?,
+                    score:           row.get(5)?,
+                    max_score:       row.get(6)?,
+                    distance_meters: row.get(7)?,
+                    location_label:  row.get(8)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+            drop(stmt);
+
+            tx.commit()?;
+            Ok::<Vec<DbItem>, anyhow::Error>(items)
+        })
+        .await?
+    }
+
+    /// Mark items as successfully posted. Call after post_to_rooms confirms delivery.
+    pub async fn mark_posted(&self, guids: &[String]) -> Result<()> {
+        if guids.is_empty() {
+            return Ok(());
+        }
+        let db = self.0.clone();
+        let guids = guids.to_vec();
+        let now = chrono::Utc::now().timestamp();
+
+        tokio::task::spawn_blocking(move || {
+            let conn = db.lock().unwrap_or_else(|e| e.into_inner());
+            for guid in &guids {
+                conn.execute(
+                    "UPDATE items SET state = 'posted', posted_at = ?1, error = NULL
+                     WHERE guid = ?2 AND state = 'processing'",
+                    params![now, guid],
+                )?;
+            }
+            Ok::<(), anyhow::Error>(())
+        })
+        .await?
+    }
+
+    /// Post failed: move items back to 'queued' so the next digest retries them.
+    pub async fn requeue_failed(&self, guids: &[String], error: &str) -> Result<()> {
+        if guids.is_empty() {
+            return Ok(());
+        }
+        let db = self.0.clone();
+        let guids = guids.to_vec();
+        let error = error.to_owned();
+
+        tokio::task::spawn_blocking(move || {
+            let conn = db.lock().unwrap_or_else(|e| e.into_inner());
+            for guid in &guids {
+                conn.execute(
+                    "UPDATE items SET state = 'queued', error = ?1
+                     WHERE guid = ?2 AND state = 'processing'",
+                    params![error, guid],
+                )?;
+            }
+            Ok::<(), anyhow::Error>(())
+        })
+        .await?
+    }
+
+    /// Items posted within the last `window_secs`, to recognise re-reports.
+    pub async fn list_recent_posted(&self, window_secs: i64) -> Result<Vec<DbItem>> {
+        let db = self.0.clone();
+        let cutoff = chrono::Utc::now().timestamp() - window_secs;
+
+        tokio::task::spawn_blocking(move || {
+            let conn = db.lock().unwrap_or_else(|e| e.into_inner());
+            let mut stmt = conn.prepare(
+                "SELECT guid, source_name, title, link, link_note, score, max_score, distance_m, location_label
+                 FROM items WHERE state = 'posted' AND posted_at >= ?1",
+            )?;
+            let items = stmt
+                .query_map(params![cutoff], |row| {
+                    Ok(DbItem {
+                        guid:            row.get(0)?,
+                        source_name:     row.get(1)?,
+                        title:           row.get(2)?,
+                        link:            row.get(3)?,
+                        link_note:       row.get(4)?,
+                        score:           row.get(5)?,
+                        max_score:       row.get(6)?,
+                        distance_meters: row.get(7)?,
+                        location_label:  row.get(8)?,
+                    })
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok::<Vec<DbItem>, anyhow::Error>(items)
+        })
+        .await?
+    }
+
+    /// Drop items taken for a digest without posting them.
+    pub async fn drop_processing(&self, guids: &[String], reason: &str) -> Result<()> {
+        if guids.is_empty() {
+            return Ok(());
+        }
+        let db = self.0.clone();
+        let guids = guids.to_vec();
+        let reason = reason.to_owned();
+
+        tokio::task::spawn_blocking(move || {
+            let conn = db.lock().unwrap_or_else(|e| e.into_inner());
+            for guid in &guids {
+                conn.execute(
+                    "UPDATE items SET state = 'dropped', error = ?1
+                     WHERE guid = ?2 AND state = 'processing'",
+                    params![reason, guid],
+                )?;
+            }
+            Ok::<(), anyhow::Error>(())
+        })
+        .await?
+    }
+
+    /// How many polls ended in "retry later" for this guid.
+    pub async fn retry_attempts(&self, guid: &str) -> Result<u32> {
+        let db = self.0.clone();
+        let guid = guid.to_owned();
+        tokio::task::spawn_blocking(move || {
+            let conn = db.lock().unwrap_or_else(|e| e.into_inner());
+            let n: Option<u32> = conn
+                .query_row(
+                    "SELECT attempts FROM retry_attempts WHERE guid = ?1",
+                    params![guid],
+                    |r| r.get(0),
+                )
+                .ok();
+            Ok::<u32, anyhow::Error>(n.unwrap_or(0))
+        })
+        .await?
+    }
+
+    pub async fn record_retry(&self, guid: &str) -> Result<()> {
+        let db = self.0.clone();
+        let guid = guid.to_owned();
+        let now = chrono::Utc::now().timestamp();
+        tokio::task::spawn_blocking(move || {
+            let conn = db.lock().unwrap_or_else(|e| e.into_inner());
+            conn.execute(
+                "INSERT INTO retry_attempts (guid, attempts, last_at) VALUES (?1, 1, ?2)
+                 ON CONFLICT(guid) DO UPDATE SET attempts = attempts + 1, last_at = ?2",
+                params![guid, now],
+            )?;
+            // Items that left their feed while still retrying.
+            conn.execute(
+                "DELETE FROM retry_attempts WHERE last_at < ?1",
+                params![now - 7 * 86_400],
+            )?;
+            Ok::<(), anyhow::Error>(())
+        })
+        .await?
+    }
+
+    // ── Startup / crash recovery ──────────────────────────────────────────────
+
+    /// Reset any 'processing' rows to 'queued'. These were in-flight when the bot
+    /// last crashed. Returns the number of rows recovered.
+    pub async fn recover_processing(&self) -> Result<usize> {
+        let db = self.0.clone();
+        tokio::task::spawn_blocking(move || {
+            let n = db.lock().unwrap_or_else(|e| e.into_inner()).execute(
+                "UPDATE items SET state = 'queued', error = 'recovered after crash'
+                 WHERE state = 'processing'",
+                [],
+            )?;
+            Ok::<usize, anyhow::Error>(n)
+        })
+        .await?
+    }
+
+    // ── Emergency alerts ──────────────────────────────────────────────────────
+
+    pub async fn is_alert_seen(&self, id: &str) -> Result<bool> {
+        let db = self.0.clone();
+        let id = id.to_owned();
+        tokio::task::spawn_blocking(move || {
+            let conn = db.lock().unwrap_or_else(|e| e.into_inner());
+            let n: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM alerts WHERE id = ?1",
+                params![id],
+                |r| r.get(0),
+            )?;
+            Ok::<bool, anyhow::Error>(n > 0)
+        })
+        .await?
+    }
+
+    pub async fn mark_alert_seen(&self, id: &str, source: &str) -> Result<()> {
+        let db = self.0.clone();
+        let id = id.to_owned();
+        let source = source.to_owned();
+        let now = chrono::Utc::now().timestamp();
+        tokio::task::spawn_blocking(move || {
+            db.lock().unwrap_or_else(|e| e.into_inner()).execute(
+                "INSERT OR IGNORE INTO alerts (id, source, sent_at) VALUES (?1, ?2, ?3)",
+                params![id, source, now],
+            )?;
+            Ok::<(), anyhow::Error>(())
+        })
+        .await?
+    }
+
+    /// Whether any `alerts` row came from `source` (a scheduled job's name:
+    /// whether its ledger has been written at all).
+    pub async fn has_alerts_from(&self, source: &str) -> Result<bool> {
+        let db = self.0.clone();
+        let source = source.to_owned();
+        tokio::task::spawn_blocking(move || {
+            let conn = db.lock().unwrap_or_else(|e| e.into_inner());
+            let found: bool = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM alerts WHERE source = ?1)",
+                params![source],
+                |r| r.get(0),
+            )?;
+            Ok::<bool, anyhow::Error>(found)
+        })
+        .await?
+    }
+
+    // ── Alert post keys ───────────────────────────────────────────────────────
+
+    /// The transaction key for posting the occurrence `id` (a DWD stable key,
+    /// a NINA warning without its version): the one stored at its first
+    /// attempt, else `key` (stored now with `start_ms`/`end_ms`). A retry
+    /// after some rooms failed thus sends with the same transaction IDs even
+    /// when the warning changed in between, and rooms that have it get no
+    /// second copy. The row goes when the occurrence is stored as delivered
+    /// or ended (`mark_*_posted`, `promote_*`, `mark_*_allclear_sent`,
+    /// [`Db::forget_post_keys_except`]), so a warning that comes back later
+    /// gets a key of its own.
+    pub async fn post_key(
+        &self,
+        id: &str,
+        source: &str,
+        key: &str,
+        start_ms: i64,
+        end_ms: i64,
+    ) -> Result<PostKey> {
+        let db = self.0.clone();
+        let id = id.to_owned();
+        let source = source.to_owned();
+        let key = key.to_owned();
+        let now = chrono::Utc::now().timestamp();
+        tokio::task::spawn_blocking(move || {
+            let conn = db.lock().unwrap_or_else(|e| e.into_inner());
+            conn.execute(
+                "INSERT OR IGNORE INTO alert_post_keys
+                     (id, source, key, start_ms, end_ms, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![id, source, key, start_ms, end_ms, now],
+            )?;
+            let stored = conn.query_row(
+                "SELECT key, start_ms, end_ms FROM alert_post_keys WHERE id = ?1",
+                params![id],
+                |r| {
+                    Ok(PostKey {
+                        key: r.get(0)?,
+                        start_ms: r.get(1)?,
+                        end_ms: r.get(2)?,
+                    })
+                },
+            )?;
+            Ok::<PostKey, anyhow::Error>(stored)
+        })
+        .await?
+    }
+
+    /// Drop the post keys of `source` whose occurrence is no longer in its
+    /// feed (`current`): it ended without being delivered everywhere, and if
+    /// it comes back it is a new occurrence. Returns how many went.
+    pub async fn forget_post_keys_except(
+        &self,
+        source: &str,
+        current: &HashSet<String>,
+    ) -> Result<usize> {
+        let db = self.0.clone();
+        let source = source.to_owned();
+        let current = current.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut conn = db.lock().unwrap_or_else(|e| e.into_inner());
+            let tx = conn.transaction()?;
+            let ids = tx
+                .prepare("SELECT id FROM alert_post_keys WHERE source = ?1")?
+                .query_map(params![source], |r| r.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            let mut gone = 0;
+            for id in ids.iter().filter(|id| !current.contains(*id)) {
+                gone += tx.execute("DELETE FROM alert_post_keys WHERE id = ?1", params![id])?;
+            }
+            tx.commit()?;
+            Ok::<usize, anyhow::Error>(gone)
+        })
+        .await?
+    }
+
+    // ── Schedule ledger ───────────────────────────────────────────────────────
+
+    /// The `alerts` row that records a handled slot of a scheduled job:
+    /// `weather:2026-10-30` (the key the forecast always used),
+    /// `digest:2026-10-30 08:00`.
+    fn slot_row(job: &str, slot: &Slot) -> String {
+        format!("{job}:{}", slot.key())
+    }
+
+    // ── NINA active-warning tracking ──────────────────────────────────────────
+
+    pub async fn get_active_nina_warning(&self, id: &str) -> Result<Option<NinaActiveWarning>> {
+        let db = self.0.clone();
+        let id = id.to_owned();
+        tokio::task::spawn_blocking(move || {
+            let conn = db.lock().unwrap_or_else(|e| e.into_inner());
+            let mut stmt = conn.prepare(
+                "SELECT headline, event_ids_json, original_plain, original_html
+                 FROM nina_active_warnings
+                 WHERE id = ?1",
+            )?;
+            let mut rows = stmt.query(params![id])?;
+            let Some(row) = rows.next()? else {
+                return Ok::<Option<NinaActiveWarning>, anyhow::Error>(None);
+            };
+            Ok(Some(NinaActiveWarning {
+                headline: row.get(0)?,
+                event_ids_json: row.get(1)?,
+                original_plain: row.get(2)?,
+                original_html: row.get(3)?,
+            }))
+        })
+        .await?
+    }
+
+    pub async fn mark_nina_alert_posted(
+        &self,
+        id: &str,
+        headline: &str,
+        region: &str,
+        event_ids_json: &str,
+        original_plain: &str,
+        original_html: &str,
+    ) -> Result<()> {
+        let db = self.0.clone();
+        let id = id.to_owned();
+        let headline = headline.to_owned();
+        let region = region.to_owned();
+        let event_ids_json = event_ids_json.to_owned();
+        let original_plain = original_plain.to_owned();
+        let original_html = original_html.to_owned();
+        let now = chrono::Utc::now().timestamp();
+        tokio::task::spawn_blocking(move || {
+            let mut conn = db.lock().unwrap_or_else(|e| e.into_inner());
+            let tx = conn.transaction()?;
+            tx.execute(
+                "INSERT INTO nina_active_warnings
+                     (id, headline, region, seen_at, event_ids_json, original_plain, original_html)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                 ON CONFLICT(id) DO UPDATE SET
+                     headline       = excluded.headline,
+                     region         = excluded.region,
+                     seen_at        = excluded.seen_at,
+                     event_ids_json = excluded.event_ids_json,
+                     original_plain = excluded.original_plain,
+                     original_html  = excluded.original_html",
+                params![
+                    id,
+                    headline,
+                    region,
+                    now,
+                    event_ids_json,
+                    original_plain,
+                    original_html
+                ],
+            )?;
+            tx.execute("DELETE FROM alert_post_keys WHERE id = ?1", params![id])?;
+            tx.commit()?;
+            Ok::<(), anyhow::Error>(())
+        })
+        .await?
+    }
+
+    pub async fn mark_nina_allclear_sent(&self, id: &str) -> Result<()> {
+        let db = self.0.clone();
+        let id = id.to_owned();
+        tokio::task::spawn_blocking(move || {
+            let conn = db.lock().unwrap_or_else(|e| e.into_inner());
+            conn.execute(
+                "DELETE FROM nina_active_warnings WHERE id = ?1",
+                params![id],
+            )?;
+            conn.execute("DELETE FROM alert_post_keys WHERE id = ?1", params![id])?;
+            Ok::<(), anyhow::Error>(())
+        })
+        .await?
+    }
+
+    // ── DWD active-warning tracking ───────────────────────────────────────────
+
+    pub async fn list_active_dwd_warnings(&self) -> Result<Vec<DwdActiveWarning>> {
+        let db = self.0.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = db.lock().unwrap_or_else(|e| e.into_inner());
+            let mut stmt = conn.prepare(
+                "SELECT id, headline, region, event_ids_json, original_plain, original_html,
+                        start_ms, end_ms
+                 FROM dwd_active_warnings",
+            )?;
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok(DwdActiveWarning {
+                        id: row.get(0)?,
+                        headline: row.get(1)?,
+                        region: row.get(2)?,
+                        event_ids_json: row.get(3)?,
+                        original_plain: row.get(4)?,
+                        original_html: row.get(5)?,
+                        start_ms: row.get(6)?,
+                        end_ms: row.get(7)?,
+                    })
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok::<Vec<DwdActiveWarning>, anyhow::Error>(rows)
+        })
+        .await?
+    }
+
+    /// Atomically insert a fresh DWD warning into `dwd_active_warnings`.
+    ///
+    /// The stable key (event+level+region, no timestamps) is used as the primary key,
+    /// so this is also the correct upsert when the same warning reappears after an all-clear.
+    /// No `alerts` row is written; presence in `dwd_active_warnings` IS the "seen" check.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn mark_dwd_alert_posted(
+        &self,
+        id: &str,
+        headline: &str,
+        region: &str,
+        event: &str,
+        event_ids_json: &str,
+        start_ms: i64,
+        end_ms: i64,
+        original_plain: &str,
+        original_html: &str,
+    ) -> Result<()> {
+        let db = self.0.clone();
+        let id = id.to_owned();
+        let headline = headline.to_owned();
+        let region = region.to_owned();
+        let event = event.to_owned();
+        let event_ids_json = event_ids_json.to_owned();
+        let original_plain = original_plain.to_owned();
+        let original_html = original_html.to_owned();
+        let now = chrono::Utc::now().timestamp();
+        tokio::task::spawn_blocking(move || {
+            let mut conn = db.lock().unwrap_or_else(|e| e.into_inner());
+            let tx = conn.transaction()?;
+            tx.execute(
+                "INSERT INTO dwd_active_warnings
+                     (id, headline, region, event, seen_at,
+                      event_ids_json, start_ms, end_ms, original_plain, original_html)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                 ON CONFLICT(id) DO UPDATE SET
+                     headline       = excluded.headline,
+                     region         = excluded.region,
+                     event          = excluded.event,
+                     seen_at        = excluded.seen_at,
+                     event_ids_json = excluded.event_ids_json,
+                     start_ms       = excluded.start_ms,
+                     end_ms         = excluded.end_ms,
+                     original_plain = excluded.original_plain,
+                     original_html  = excluded.original_html",
+                params![
+                    id,
+                    headline,
+                    region,
+                    event,
+                    now,
+                    event_ids_json,
+                    start_ms,
+                    end_ms,
+                    original_plain,
+                    original_html
+                ],
+            )?;
+            tx.execute("DELETE FROM alert_post_keys WHERE id = ?1", params![id])?;
+            tx.commit()?;
+            Ok::<(), anyhow::Error>(())
+        })
+        .await?
+    }
+
+    /// Update the stored time window and message content after a time-change edit.
+    ///
+    /// `plain` / `html` use COALESCE so passing `None` preserves the stored content
+    /// (used when we acknowledge a time change but have no event IDs to edit with).
+    pub async fn update_dwd_active_warning(
+        &self,
+        id: &str,
+        start_ms: i64,
+        end_ms: i64,
+        plain: Option<&str>,
+        html: Option<&str>,
+    ) -> Result<()> {
+        let db = self.0.clone();
+        let id = id.to_owned();
+        let plain = plain.map(str::to_owned);
+        let html = html.map(str::to_owned);
+        tokio::task::spawn_blocking(move || {
+            db.lock().unwrap_or_else(|e| e.into_inner()).execute(
+                "UPDATE dwd_active_warnings
+                 SET start_ms       = ?2,
+                     end_ms         = ?3,
+                     original_plain = COALESCE(?4, original_plain),
+                     original_html  = COALESCE(?5, original_html)
+                 WHERE id = ?1",
+                params![id, start_ms, end_ms, plain, html],
+            )?;
+            Ok::<(), anyhow::Error>(())
+        })
+        .await?
+    }
+
+    /// Atomically replace an active-warning row with a new one for a different level,
+    /// transferring the Matrix event IDs so the same message can continue to be edited.
+    /// Used when a warning escalates or de-escalates: the old-level row is deleted and
+    /// a new-level row is inserted with the same event_ids_json.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn promote_dwd_active_warning(
+        &self,
+        old_id: &str,
+        new_id: &str,
+        headline: &str,
+        region: &str,
+        event: &str,
+        event_ids_json: &str,
+        start_ms: i64,
+        end_ms: i64,
+        original_plain: &str,
+        original_html: &str,
+    ) -> Result<()> {
+        let db = self.0.clone();
+        let old_id = old_id.to_owned();
+        let new_id = new_id.to_owned();
+        let headline = headline.to_owned();
+        let region = region.to_owned();
+        let event = event.to_owned();
+        let event_ids_json = event_ids_json.to_owned();
+        let original_plain = original_plain.to_owned();
+        let original_html = original_html.to_owned();
+        let now = chrono::Utc::now().timestamp();
+        tokio::task::spawn_blocking(move || {
+            let mut conn = db.lock().unwrap_or_else(|e| e.into_inner());
+            let tx = conn.transaction()?;
+            tx.execute(
+                "DELETE FROM dwd_active_warnings WHERE id = ?1",
+                params![old_id],
+            )?;
+            tx.execute(
+                "INSERT INTO dwd_active_warnings
+                     (id, headline, region, event, seen_at,
+                      event_ids_json, start_ms, end_ms, original_plain, original_html)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                params![
+                    new_id,
+                    headline,
+                    region,
+                    event,
+                    now,
+                    event_ids_json,
+                    start_ms,
+                    end_ms,
+                    original_plain,
+                    original_html
+                ],
+            )?;
+            tx.execute("DELETE FROM alert_post_keys WHERE id = ?1", params![new_id])?;
+            tx.commit()?;
+            Ok::<(), anyhow::Error>(())
+        })
+        .await?
+    }
+
+    /// Remove the active-warning row once an all-clear has been delivered.
+    /// The next occurrence of the same warning type is then treated as fresh.
+    pub async fn mark_dwd_allclear_sent(&self, warning_id: &str) -> Result<()> {
+        let db = self.0.clone();
+        let warning_id = warning_id.to_owned();
+        tokio::task::spawn_blocking(move || {
+            let conn = db.lock().unwrap_or_else(|e| e.into_inner());
+            conn.execute(
+                "DELETE FROM dwd_active_warnings WHERE id = ?1",
+                params![warning_id],
+            )?;
+            conn.execute(
+                "DELETE FROM alert_post_keys WHERE id = ?1",
+                params![warning_id],
+            )?;
+            Ok::<(), anyhow::Error>(())
+        })
+        .await?
+    }
+
+    // ── Maintenance ───────────────────────────────────────────────────────────
+
+    /// Delete posted/dropped items older than keep_days. Returns rows deleted.
+    #[allow(dead_code)]
+    pub async fn prune_old(&self, keep_days: u32) -> Result<u64> {
+        let db = self.0.clone();
+        let cutoff = chrono::Utc::now().timestamp() - (keep_days as i64 * 86_400);
+        tokio::task::spawn_blocking(move || {
+            let n = db.lock().unwrap_or_else(|e| e.into_inner()).execute(
+                "DELETE FROM items
+                 WHERE state IN ('posted', 'dropped') AND discovered_at < ?1",
+                params![cutoff],
+            )?;
+            Ok::<u64, anyhow::Error>(n as u64)
+        })
+        .await?
+    }
+}
+
+fn ensure_column(conn: &Connection, table: &str, column: &str, definition: &str) -> Result<()> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let exists = stmt
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<rusqlite::Result<Vec<_>>>()?
+        .iter()
+        .any(|name| name == column);
+
+    if !exists {
+        conn.execute(
+            &format!("ALTER TABLE {table} ADD COLUMN {column} {definition}"),
+            [],
+        )?;
+    }
+    Ok(())
+}
+
+fn ensure_items_state_allows_candidates(conn: &Connection) -> Result<()> {
+    let sql: String = conn.query_row(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'items'",
+        [],
+        |row| row.get(0),
+    )?;
+    if sql.contains("'candidate'") {
+        return Ok(());
+    }
+
+    conn.execute_batch(
+        "
+        PRAGMA foreign_keys = OFF;
+        BEGIN TRANSACTION;
+        ALTER TABLE items RENAME TO items_old;
+        CREATE TABLE items (
+            guid             TEXT    PRIMARY KEY,
+            source_name      TEXT    NOT NULL,
+            title            TEXT    NOT NULL,
+            link             TEXT,
+            link_note        TEXT,
+            score            INTEGER NOT NULL DEFAULT 0,
+            max_score        INTEGER NOT NULL DEFAULT 0,
+            distance_m       REAL,
+            location_label   TEXT,
+            discovered_at    INTEGER NOT NULL,
+            state            TEXT    NOT NULL DEFAULT 'queued'
+                             CHECK(state IN ('queued','candidate','processing','posted','dropped')),
+            last_attempt_at  INTEGER,
+            posted_at        INTEGER,
+            error            TEXT
+        );
+        INSERT INTO items
+            (guid, source_name, title, link, link_note, score, max_score, distance_m,
+             location_label, discovered_at, state, last_attempt_at, posted_at, error)
+        SELECT
+            guid, source_name, title, link, link_note, score, max_score, distance_m,
+            location_label, discovered_at, state, last_attempt_at, posted_at, error
+        FROM items_old;
+        DROP TABLE items_old;
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_source_guid ON items(source_name, guid);
+        CREATE INDEX IF NOT EXISTS idx_state ON items(state);
+        COMMIT;
+        PRAGMA foreign_keys = ON;
+        ",
+    )
+    .context("Failed to migrate items table for candidate state")?;
+    Ok(())
+}
+
+/// The schedule's ledger (digest, forecast) in the `alerts` table.
+impl Ledger for Db {
+    async fn is_done(&self, job: &str, slot: &Slot) -> Result<bool> {
+        self.is_alert_seen(&Db::slot_row(job, slot)).await
+    }
+
+    async fn mark_done(&self, job: &str, slot: &Slot) -> Result<()> {
+        self.mark_alert_seen(&Db::slot_row(job, slot), job).await
+    }
+}
+
+// ── Schema ────────────────────────────────────────────────────────────────────
+
+const SCHEMA: &str = "
+    CREATE TABLE IF NOT EXISTS items (
+        guid             TEXT    PRIMARY KEY,
+        source_name      TEXT    NOT NULL,
+        title            TEXT    NOT NULL,
+        link             TEXT,
+        link_note        TEXT,
+        score            INTEGER NOT NULL DEFAULT 0,
+        max_score        INTEGER NOT NULL DEFAULT 0,
+        distance_m       REAL,
+        location_label   TEXT,
+        discovered_at    INTEGER NOT NULL,
+        state            TEXT    NOT NULL DEFAULT 'queued'
+                         CHECK(state IN ('queued','candidate','processing','posted','dropped')),
+        last_attempt_at  INTEGER,
+        posted_at        INTEGER,
+        error            TEXT
+    );
+    -- Secondary index makes (source_name, guid) unique as a safety net for
+    -- feeds that reuse short numeric IDs across different sources.
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_source_guid  ON items(source_name, guid);
+    CREATE        INDEX IF NOT EXISTS idx_state        ON items(state);
+    CREATE TABLE IF NOT EXISTS retry_attempts (
+        guid     TEXT PRIMARY KEY,
+        attempts INTEGER NOT NULL,
+        last_at  INTEGER NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS source_poll_stats (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        ts          INTEGER NOT NULL,
+        source_name TEXT    NOT NULL,
+        total       INTEGER NOT NULL,
+        queued      INTEGER NOT NULL,
+        candidate   INTEGER NOT NULL,
+        dropped     INTEGER NOT NULL,
+        retry_later INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_source_poll_stats_ts ON source_poll_stats(ts);
+    CREATE TABLE IF NOT EXISTS alerts (
+        id       TEXT    PRIMARY KEY,
+        source   TEXT    NOT NULL,
+        sent_at  INTEGER NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS dwd_active_warnings (
+        id             TEXT    PRIMARY KEY,
+        headline       TEXT    NOT NULL,
+        region         TEXT    NOT NULL,
+        event          TEXT    NOT NULL,
+        seen_at        INTEGER NOT NULL,
+        event_ids_json TEXT,
+        original_plain TEXT,
+        original_html  TEXT,
+        start_ms       INTEGER NOT NULL DEFAULT 0,
+        end_ms         INTEGER NOT NULL DEFAULT 0
+    );
+    -- An alert occurrence's transaction key from its first attempt, until it
+    -- is delivered everywhere or ends (Db::post_key).
+    CREATE TABLE IF NOT EXISTS alert_post_keys (
+        id         TEXT    PRIMARY KEY,
+        source     TEXT    NOT NULL,
+        key        TEXT    NOT NULL,
+        start_ms   INTEGER NOT NULL,
+        end_ms     INTEGER NOT NULL,
+        created_at INTEGER NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS nina_active_warnings (
+        id             TEXT    PRIMARY KEY,
+        headline       TEXT    NOT NULL,
+        region         TEXT    NOT NULL,
+        seen_at        INTEGER NOT NULL,
+        event_ids_json TEXT    NOT NULL,
+        original_plain TEXT    NOT NULL,
+        original_html  TEXT    NOT NULL
+    );
+";
