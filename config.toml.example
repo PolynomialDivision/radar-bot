@@ -153,6 +153,13 @@ aliases = ["Local U-Bahn", "Local S-Bahn", "Station Nickname"]
 #   filter              = false: skip location filter, include everything
 #   required            = ["keyword"]: overrides global filter.required for this source.
 #                         Set to [] to skip the city check for city-specific sources.
+#   id = "local-police" : the source's identity in the store (default: the name as
+#                         a slug). Change `name` freely, never `id`: before renaming a
+#                         source, set `id` to the slug of its old name.
+#   scope = "city"      : "local" (all about the neighbourhood), "city" or "wide";
+#                         default from filter/required/base_implied_meters
+#   official = true     : police, fire brigade, district office
+#   category = "incident": the category when no keyword gives one
 #   stale_after_days = N: the newest entry of an RSS feed older than this (default
 #     45) makes the source "stale", and the admins are told once
 #   base_implied_meters = N: fallback distance when neither area keywords nor geocoding

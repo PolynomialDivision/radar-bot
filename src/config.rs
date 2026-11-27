@@ -165,8 +165,23 @@ impl Default for WeatherConfig {
 #[derive(Deserialize, Clone)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct SourceConfig {
-    /// Display name shown in posted messages.
+    /// Display name shown in posted messages. It may change freely; `id` may not.
     pub(crate) name: String,
+    /// The source's identity in the store, forever (default: the name as a slug). Set it
+    /// before renaming a source, to the slug of its old name.
+    #[serde(default)]
+    pub(crate) id: Option<String>,
+    /// What the source covers: "local" (the neighbourhood), "city" or "wide". Default from
+    /// the old keys: `filter = false` is local, `required = []` with
+    /// `base_implied_meters >= 5000` is city, anything else wide.
+    #[serde(default)]
+    pub(crate) scope: Option<crate::model::Scope>,
+    /// A police, fire brigade or district office feed (counts like a second publisher).
+    #[serde(default)]
+    pub(crate) official: bool,
+    /// The category its items have when no keyword says otherwise.
+    #[serde(default)]
+    pub(crate) category: Option<crate::model::Category>,
     /// Source type. Defaults to "rss" so existing configs need no changes.
     #[serde(rename = "type", default)]
     pub(crate) source_type: sources::SourceType,
@@ -202,10 +217,36 @@ pub(crate) struct SourceConfig {
 }
 
 impl SourceConfig {
-    /// The source's identity: its name lower-cased, each run of other characters than letters
-    /// and digits one `-` ("Polizei Berlin" → "polizei-berlin").
+    /// The source's identity: `id`, else its name lower-cased, each run of other characters
+    /// than letters and digits one `-` ("Polizei Berlin" → "polizei-berlin").
     pub(crate) fn id(&self) -> String {
-        slug(&self.name)
+        self.id
+            .as_deref()
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+            .map_or_else(|| slug(&self.name), str::to_owned)
+    }
+
+    /// The scope: configured, or from the old keys.
+    pub(crate) fn scope(&self) -> crate::model::Scope {
+        use crate::model::Scope;
+        if let Some(scope) = self.scope {
+            return scope;
+        }
+        let city_wide = self.required.as_ref().is_some_and(Vec::is_empty)
+            && self.base_implied_meters.is_some_and(|m| m >= 5_000.0);
+        if !self.filter {
+            Scope::Local
+        } else if city_wide {
+            Scope::City
+        } else {
+            Scope::Wide
+        }
+    }
+
+    /// A social network search rather than a publisher.
+    pub(crate) fn social(&self) -> bool {
+        matches!(self.source_type, sources::SourceType::Bluesky)
     }
 }
 
@@ -362,6 +403,14 @@ impl Config {
                 names.insert(source.name.trim().to_lowercase()),
                 "Two sources are named {:?}: statistics and health are kept by name",
                 source.name
+            );
+        }
+        let mut ids = std::collections::HashSet::new();
+        for source in &self.sources {
+            ensure!(
+                ids.insert(source.id()),
+                "Two sources have the id {:?}: give one an `id` of its own",
+                source.id()
             );
         }
         let bluesky = self
@@ -626,5 +675,34 @@ mod tests {
         config.validate().unwrap();
         config.filter.lon = Some(213.42);
         assert!(format!("{:#}", config.validate().unwrap_err()).contains("no coordinate"));
+    }
+
+    #[test]
+    fn sources_get_a_scope_and_an_id() {
+        use crate::model::Scope;
+        let config = example();
+        let scope = |name: &str| {
+            config
+                .sources
+                .iter()
+                .find(|s| s.name == name)
+                .unwrap()
+                .scope()
+        };
+        assert_eq!(scope("Local Police"), Scope::City);
+        assert_eq!(scope("Neighbourhood Blog"), Scope::Local);
+        assert_eq!(scope("National News"), Scope::Wide);
+
+        let mut renamed = config.sources[0].clone();
+        renamed.id = Some("local-police".to_owned());
+        renamed.name = "Police".to_owned();
+        assert_eq!(renamed.id(), config.sources[0].id());
+
+        let mut twice = example();
+        let mut copy = twice.sources[1].clone();
+        copy.name = "Another name".to_owned();
+        copy.id = Some(twice.sources[0].id());
+        twice.sources.push(copy);
+        assert!(format!("{:#}", twice.validate().unwrap_err()).contains("id"));
     }
 }

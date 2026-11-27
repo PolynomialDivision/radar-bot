@@ -54,6 +54,10 @@ pub(crate) async fn run(config: Config, fixtures: Option<&Path>, db: Option<&Pat
         }
         println!("{}", chunk.plain);
     }
+    // The shadow decisions of this round next to the digest (S2).
+    let rows = db.compare_since(0).await?;
+    println!();
+    println!("{}", crate::compare::comparison_report(&rows, 1));
     Ok(())
 }
 

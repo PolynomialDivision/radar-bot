@@ -1,4 +1,6 @@
 mod alerts;
+mod classify;
+mod compare;
 mod config;
 mod digest;
 mod dry_run;
@@ -11,6 +13,9 @@ mod filter;
 mod geo;
 #[cfg(test)]
 mod hostile_input;
+mod model;
+mod pipeline;
+mod policy;
 mod polling;
 mod profile;
 mod sources;
@@ -110,9 +115,65 @@ pub(crate) async fn post_slot(
 // ── main ──────────────────────────────────────────────────────────────────────
 
 /// The bot's chat commands (`!admin …` is mxbot-common's).
-const COMMANDS: Commands = Commands::flat(&[Spec::new("source-stats", "📊", "items per source")
-    .usage("[hours]")
-    .admin()]);
+const COMMANDS: Commands = Commands::flat(&[
+    Spec::new("source-stats", "📊", "items per source")
+        .usage("[hours]")
+        .admin(),
+    Spec::new("radar", "🔍", "shadow comparison, corpus candidates")
+        .usage("vergleich [days] | korpus <words>")
+        .admin(),
+]);
+
+/// Admin-only `!radar vergleich [days]` and `!radar korpus <words>`.
+async fn radar_reply(db: &Db, args: &str, store_dir: &std::path::Path) -> String {
+    let (sub, rest) = args.trim().split_once(' ').unwrap_or((args.trim(), ""));
+    match sub {
+        "vergleich" => {
+            let days = compare::days_of(rest);
+            let since = chrono::Utc::now().timestamp() - i64::from(days) * 86_400;
+            match db.compare_since(since).await {
+                Ok(rows) => compare::comparison_report(&rows, days),
+                Err(e) => {
+                    warn!("!radar vergleich failed: {e:#}");
+                    "❌ Vergleich fehlgeschlagen.".to_owned()
+                }
+            }
+        }
+        "korpus" if !rest.trim().is_empty() => {
+            let words: Vec<String> = rest.split_whitespace().map(str::to_owned).collect();
+            match corpus_candidate(db, words, store_dir).await {
+                Ok(Some(title)) => format!("📝 Vorgemerkt: {title}"),
+                Ok(None) => "🤷 Keine Beobachtung mit diesen Wörtern im Titel.".to_owned(),
+                Err(e) => {
+                    warn!("!radar korpus failed: {e:#}");
+                    "❌ Vormerken fehlgeschlagen.".to_owned()
+                }
+            }
+        }
+        _ => "🔍 !radar vergleich [Tage] · !radar korpus <Wörter>".to_owned(),
+    }
+}
+
+/// Appends the newest observation titled with `words` to `corpus-candidates.jsonl` in the
+/// store directory, with an empty `class`, for the owner to anonymise and label. Never into
+/// the repository.
+async fn corpus_candidate(
+    db: &Db,
+    words: Vec<String>,
+    store_dir: &std::path::Path,
+) -> Result<Option<String>> {
+    use std::io::Write;
+    let Some(entry) = db.newest_observation_titled(words).await? else {
+        return Ok(None);
+    };
+    let path = store_dir.join("corpus-candidates.jsonl");
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)?;
+    writeln!(file, "{entry}")?;
+    Ok(entry["title"].as_str().map(str::to_owned))
+}
 
 /// Admin-only `!source-stats [hours]`: the failing, stale and silent sources, then one line
 /// per source with what it gave in the last `hours` (sources with nothing left out).
@@ -394,10 +455,12 @@ async fn main() -> Result<()> {
     bot.client.add_event_handler({
         let bot = bot.clone();
         let db = db.clone();
+        let store_dir = store_dir.clone();
         move |ev: OriginalSyncRoomMessageEvent, room: Room, encryption: Option<EncryptionInfo>| {
             let bot = bot.clone();
             let db = db.clone();
             let source_configs = source_configs.clone();
+            let store_dir = store_dir.clone();
             async move {
                 if ev.sender == bot.user_id || room.state() != RoomState::Joined {
                     return;
@@ -415,8 +478,14 @@ async fn main() -> Result<()> {
                             .await
                             .ok();
                     }
+                    Parsed::Run(command) if command.is("radar") => {
+                        let reply = radar_reply(&db, command.rest, &store_dir).await;
+                        room.send(RoomMessageEventContent::text_plain(reply))
+                            .await
+                            .ok();
+                    }
                     Parsed::Refused(_) => {
-                        warn!("!source-stats from non-admin {}, ignored", ev.sender);
+                        warn!("Admin command from non-admin {}, ignored", ev.sender);
                     }
                     _ => {}
                 }

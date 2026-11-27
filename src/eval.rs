@@ -1,7 +1,8 @@
-//! The labelled corpus (`eval/corpus.jsonl`) through today's scoring, offline: streets come
-//! from `eval/geography.json` instead of Nominatim. Prints how far the result is from the
-//! expected ring; categories are listed but not assigned before the classifier exists.
-//! No floor yet (`cargo test eval_corpus -- --nocapture` shows the table).
+//! The labelled corpus (`eval/corpus.jsonl`) through today's scoring and the new decision,
+//! offline: streets come from `eval/geography.json` instead of Nominatim. Holds floors on the
+//! precision and recall of "delivered" (expected class `urgent` or `briefing`), on category
+//! accuracy and on the ring within one (`cargo test eval_corpus -- --nocapture` shows the
+//! table).
 
 use crate::polling::PollCtx;
 use std::{collections::HashMap, path::PathBuf, sync::Arc};
@@ -31,7 +32,16 @@ pub(crate) struct Entry {
     pub(crate) teaser: String,
     pub(crate) body: String,
     pub(crate) ring: i32,
+    /// One of the nine categories, or "noise".
     pub(crate) category: String,
+    /// `urgent`, `briefing`, `archive` or `drop`.
+    pub(crate) class: String,
+    /// Entries with the same label must end in one story (S3).
+    #[serde(default)]
+    pub(crate) story: Option<String>,
+    /// From an official source (police, fire brigade, district office).
+    #[serde(default)]
+    pub(crate) official: bool,
     pub(crate) note: String,
 }
 
@@ -83,6 +93,10 @@ fn source(entry: &Entry) -> SourceConfig {
     };
     SourceConfig {
         name: format!("eval {}", entry.source_scope),
+        id: None,
+        scope: crate::model::Scope::parse(&entry.source_scope),
+        official: entry.official,
+        category: None,
         source_type: if entry.social {
             SourceType::Bluesky
         } else {
@@ -149,8 +163,15 @@ fn geocode_cache(item: &FeedItem, geo: &Geography) -> GeocodeCache {
     cache
 }
 
-/// The ring today's code gives each entry.
-async fn rings_today() -> Vec<(Entry, i32)> {
+/// What the code gives an entry: today's ring, and the new category, noise and class.
+struct Result_ {
+    ring: i32,
+    category: String,
+    class: String,
+}
+
+/// Today's ring and the shadow decision for each entry.
+async fn rings_today() -> Vec<(Entry, Result_)> {
     let geo = geography();
     let filter = Arc::new(FilterConfig {
         required: vec![geo.city.clone()],
@@ -168,43 +189,94 @@ async fn rings_today() -> Vec<(Entry, i32)> {
         let item = item(&entry);
         let mut ctx = PollCtx::new(Http::offline(), (*filter).clone(), Some(geo.reference));
         ctx.geocoder.cache = geocode_cache(&item, &geo);
-        let outcome = process_item(ctx, source(&entry), item, true).await;
-        let ring = match outcome {
+        let source = source(&entry);
+        let outcome = process_item(ctx, source.clone(), item, true).await;
+        let item = match outcome {
             ProcessOutcome::Queued(item)
             | ProcessOutcome::Candidate { item, .. }
             | ProcessOutcome::Dropped { item, .. }
-            | ProcessOutcome::Retry { item, .. } => item.score,
+            | ProcessOutcome::Retry { item, .. } => item,
         };
-        out.push((entry, ring));
+        let now = chrono::Utc::now().timestamp();
+        let observation = crate::pipeline::observation(&source, &item, "fetch", now);
+        let category = if observation.noise.is_some() {
+            "noise".to_owned()
+        } else {
+            observation.category
+        };
+        out.push((
+            entry,
+            Result_ {
+                ring: item.score,
+                category,
+                class: observation.class,
+            },
+        ));
     }
     out
+}
+
+/// The floors: measured minus 0.03 (round 2, S2: precision 0.89, recall 0.94, category 0.89,
+/// ring within one 0.97 on 62 entries).
+const PRECISION_FLOOR: f64 = 0.86;
+const RECALL_FLOOR: f64 = 0.91;
+const CATEGORY_FLOOR: f64 = 0.86;
+const RING_FLOOR: f64 = 0.94;
+
+fn delivered(class: &str) -> bool {
+    matches!(class, "urgent" | "briefing")
 }
 
 #[tokio::test]
 async fn eval_corpus() {
     let results = rings_today().await;
-    assert!(results.len() >= 30, "the corpus has at least 30 entries");
+    assert!(results.len() >= 60, "the corpus has at least 60 entries");
 
-    let exact = results.iter().filter(|(e, r)| *r == e.ring).count();
-    let within_one = results
-        .iter()
-        .filter(|(e, r)| (r - e.ring).abs() <= 1)
-        .count();
     println!(
-        "{:<22} {:>8} {:>5}  {:<10} note",
-        "id", "expected", "today", "category"
+        "{:<22} {:>4} {:>4}  {:<10} {:<10}  {:<9} {:<9} note",
+        "id", "ring", "got", "category", "got", "class", "got"
     );
-    for (entry, ring) in &results {
-        let mark = if *ring == entry.ring { " " } else { "✗" };
+    for (entry, got) in &results {
+        let mark = |ok: bool| if ok { " " } else { "✗" };
         println!(
-            "{:<22} {:>8} {:>5}{mark} {:<10} {}",
-            entry.id, entry.ring, ring, entry.category, entry.note
+            "{:<22} {:>4} {:>4}{} {:<10} {:<10}{} {:<9} {:<9}{} {}",
+            entry.id,
+            entry.ring,
+            got.ring,
+            mark((got.ring - entry.ring).abs() <= 1),
+            entry.category,
+            got.category,
+            mark(got.category == entry.category),
+            entry.class,
+            got.class,
+            mark(delivered(&got.class) == delivered(&entry.class)),
+            entry
+                .story
+                .as_deref()
+                .map_or(entry.note.clone(), |story| format!(
+                    "[{story}] {}",
+                    entry.note
+                ))
         );
     }
-    let n = results.len();
+    let n = results.len() as f64;
+    let count =
+        |f: &dyn Fn(&(Entry, Result_)) -> bool| results.iter().filter(|r| f(r)).count() as f64;
+    let true_positive = count(&|(e, g)| delivered(&e.class) && delivered(&g.class));
+    let precision = true_positive / count(&|(_, g)| delivered(&g.class)).max(1.0);
+    let recall = true_positive / count(&|(e, _)| delivered(&e.class)).max(1.0);
+    let category = count(&|(e, g)| e.category == g.category) / n;
+    let ring = count(&|(e, g)| (g.ring - e.ring).abs() <= 1) / n;
+    let exact_class = count(&|(e, g)| e.class == g.class) / n;
     println!(
-        "ring exact {exact}/{n} ({:.2}), within one {within_one}/{n} ({:.2}); category: not assigned yet",
-        exact as f64 / n as f64,
-        within_one as f64 / n as f64
+        "delivered: precision {precision:.2}, recall {recall:.2}; category {category:.2}; \
+         ring within one {ring:.2}; class exact {exact_class:.2} ({n} entries)"
     );
+    assert!(precision >= PRECISION_FLOOR, "precision {precision:.2}");
+    assert!(recall >= RECALL_FLOOR, "recall {recall:.2}");
+    assert!(
+        category >= CATEGORY_FLOOR,
+        "category accuracy {category:.2}"
+    );
+    assert!(ring >= RING_FLOOR, "ring within one {ring:.2}");
 }

@@ -8,6 +8,7 @@
 
 mod alerts;
 mod items;
+mod observations;
 mod profile;
 mod sources;
 
@@ -23,6 +24,7 @@ use mxbot_common::sqlite::{
 
 pub use alerts::{DwdActiveWarning, PostKey};
 pub use items::DbItem;
+pub use observations::{Compared, Observation};
 pub use sources::{SourceHealth, SourcePollStat, FAILING_AFTER};
 
 /// The store, shared by the bot's tasks.
@@ -35,6 +37,7 @@ pub(crate) const MIGRATIONS: &Migrations = &[
     (2, LEDGER_V2),
     (3, SOURCE_STATE_V3),
     (4, ROUND_2_V4),
+    (5, OBSERVATIONS_V5),
 ];
 
 /// How long rows that only record "seen" or "done" are kept: past every feed's memory
@@ -94,6 +97,18 @@ impl Db {
                 n += tx.execute(
                     "DELETE FROM items WHERE state IN ('posted', 'dropped')
                          AND COALESCE(last_seen_at, discovered_at) < ?1",
+                    params![seen],
+                )?;
+                // Observations keep their text for replay and "why" for two weeks, the row
+                // for the seen-set as long as `items` does.
+                let text = now - observations::KEEP_TEXT_DAYS * 86_400;
+                tx.execute(
+                    "UPDATE observation SET body = NULL, evidence = NULL
+                     WHERE first_seen_at < ?1 AND (body IS NOT NULL OR evidence IS NOT NULL)",
+                    params![text],
+                )?;
+                n += tx.execute(
+                    "DELETE FROM observation WHERE first_seen_at < ?1",
                     params![seen],
                 )?;
                 tx.commit()?;
@@ -391,6 +406,59 @@ const ROUND_2_V4: &str = "
     ALTER TABLE source_state ADD COLUMN reported TEXT;
     ALTER TABLE items ADD COLUMN last_seen_at INTEGER;
     UPDATE items SET last_seen_at = discovered_at;
+";
+
+/// Migration 5: observations with their shadow decision, and the tables the switch to stories
+/// (S3) needs, created empty here so that the switch is a code change without a migration.
+const OBSERVATIONS_V5: &str = "
+    CREATE TABLE observation (
+      id            INTEGER PRIMARY KEY,
+      source_id     TEXT    NOT NULL,
+      ext_id        TEXT    NOT NULL,
+      first_seen_at INTEGER NOT NULL,
+      state         TEXT    NOT NULL CHECK (state IN ('pending','decided')),
+      attempts      INTEGER NOT NULL DEFAULT 0,
+      url TEXT, canonical_url TEXT, linked_url TEXT,
+      publisher TEXT, social INTEGER NOT NULL DEFAULT 0, lang TEXT,
+      title TEXT NOT NULL, teaser TEXT,
+      body TEXT,
+      published_at INTEGER,
+      category TEXT, noise TEXT,
+      lat REAL, lon REAL, distance_m REAL,
+      precision TEXT,
+      place_key TEXT,
+      ring INTEGER, label TEXT,
+      evidence TEXT,
+      class TEXT,
+      decision TEXT,
+      story_id INTEGER,
+      UNIQUE (source_id, ext_id)
+    );
+    CREATE INDEX observation_seen  ON observation(first_seen_at);
+    CREATE INDEX observation_story ON observation(story_id);
+    CREATE TABLE story (
+      id INTEGER PRIMARY KEY,
+      category TEXT NOT NULL,
+      title TEXT NOT NULL, summary TEXT, url TEXT,
+      lat REAL, lon REAL, distance_m REAL, precision TEXT, place_key TEXT,
+      ring INTEGER NOT NULL, label TEXT,
+      happened_at INTEGER,
+      first_seen_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
+      publishers INTEGER NOT NULL DEFAULT 1, official INTEGER NOT NULL DEFAULT 0,
+      reports INTEGER NOT NULL DEFAULT 1,
+      class TEXT NOT NULL CHECK (class IN ('urgent','briefing','archive')),
+      decision TEXT NOT NULL
+    );
+    CREATE TABLE delivery (
+      id INTEGER PRIMARY KEY,
+      story_id INTEGER NOT NULL REFERENCES story(id),
+      room_id TEXT NOT NULL,
+      kind TEXT NOT NULL CHECK (kind IN ('briefing','update','urgent')),
+      slot TEXT NOT NULL,
+      event_id TEXT,
+      selected_at INTEGER NOT NULL, posted_at INTEGER,
+      UNIQUE (story_id, room_id, slot)
+    );
 ";
 
 #[cfg(test)]

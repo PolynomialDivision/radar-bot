@@ -40,6 +40,9 @@ pub(crate) struct FeedItem {
     /// Event geo on the page), as (lat, lon).
     #[serde(default)]
     pub(crate) coords: Option<(f64, f64)>,
+    /// The location evidence the score was chosen from (set by `process_item`).
+    #[serde(skip)]
+    pub(crate) evidence: Vec<crate::geo::LocationEvidence>,
     /// The feed marks the item as paid content (`<dcterms:accessRights>paid`): its page is
     /// not fetched, the item is decided on title and teaser.
     pub(crate) paywalled: bool,

@@ -106,6 +106,48 @@ pub(crate) enum TermMatch {
     /// Sub-city place (area terms): additionally rejects hyphenated
     /// compounds with another place.
     Place,
+    /// A keyword of the classifier: after the term only an inflection ending
+    /// ([`INFLECTIONS`]), then no further letter ("Brand", "Brände" no,
+    /// "Brandes" yes, "Brandenburg" no). See [`find_word`] for compounds.
+    Word,
+}
+
+/// Endings that keep a word the same word.
+pub(crate) const INFLECTIONS: &[&str] = &["e", "en", "er", "es", "s", "n", "ern"];
+
+/// Byte position of the first mention of `term` in `text` (both normalized) as a word of its
+/// own: at a word start, followed by nothing, an inflection ending, or one of `tails` (a
+/// compound that still means the term: "brand" + "stiftung") with an optional inflection.
+pub(crate) fn find_word(text: &str, term: &str, tails: &[&str]) -> Option<usize> {
+    let term = term.trim();
+    if term.is_empty() {
+        return None;
+    }
+    let mut from = 0;
+    while let Some(offset) = text[from..].find(term) {
+        let start = from + offset;
+        let end = start + term.len();
+        from = start + term.chars().next().map_or(1, char::len_utf8);
+        if text[..start]
+            .chars()
+            .next_back()
+            .is_some_and(char::is_alphanumeric)
+        {
+            continue;
+        }
+        let rest: String = text[end..]
+            .chars()
+            .take_while(|c| c.is_alphanumeric())
+            .collect();
+        let inflected = |word: &str| word.is_empty() || INFLECTIONS.contains(&word);
+        let compound = tails
+            .iter()
+            .any(|tail| rest.strip_prefix(tail).is_some_and(inflected));
+        if inflected(&rest) || compound {
+            return Some(start);
+        }
+    }
+    None
 }
 
 /// Byte position of the first real mention of `term` in `text`, both already
@@ -117,6 +159,9 @@ pub(crate) enum TermMatch {
 /// compound with another place does not count ("Charlottenburg-Wilmersdorf" is
 /// the whole borough) while "Berlin-Charlottenburg" and "Karl-Marx-Straße" do.
 pub(crate) fn find_term(text: &str, term: &str, mode: TermMatch) -> Option<usize> {
+    if mode == TermMatch::Word {
+        return find_word(text, term, &[]);
+    }
     let term = term.trim();
     if term.is_empty() {
         return None;

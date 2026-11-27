@@ -259,6 +259,7 @@ pub(crate) async fn process_item(
     // The strongest single piece of evidence decides. A source default only
     // sets a floor: it neither shows as a location nor makes two city-wide
     // items look like they happened at the same place.
+    item.evidence = evidence.clone();
     let best = best_evidence(evidence);
     let score = best.as_ref().map_or(0, LocationEvidence::score);
     item.score = score;
@@ -411,7 +412,7 @@ pub(crate) async fn poll_once(
         summary.fetched += items.len();
 
         let guids = items.iter().map(|item| item.guid.clone()).collect();
-        let seen = match db.seen_guids(guids).await {
+        let seen = match db.seen_by_source(&source.id(), guids).await {
             Ok(seen) => seen,
             Err(e) => {
                 // Without the seen-set every item would look new: skip the source this round.
@@ -451,7 +452,18 @@ pub(crate) async fn poll_once(
     let mut in_task: HashMap<tokio::task::Id, (FeedItem, u32)> = HashMap::new();
     let n_pending = pending.len();
     summary.new_items = n_pending;
+    // For the observations: each item's source, and what the gate would do with its page
+    // (judged on the feed item, before any page is read).
+    let by_name: HashMap<String, SourceConfig> = sources
+        .iter()
+        .map(|s| (s.name.clone(), s.clone()))
+        .collect();
+    let mut gates: HashMap<(String, String), &'static str> = HashMap::new();
     for (source, item) in pending {
+        gates.insert(
+            (source.name.clone(), item.guid.clone()),
+            crate::pipeline::gate(&source, &item, &ctx.filter),
+        );
         let attempts = db.retry_attempts(&item.guid).await.unwrap_or(0);
         let about = item.clone();
         let handle = tasks.spawn(process_item(
@@ -502,6 +514,7 @@ pub(crate) async fn poll_once(
                     .entry(item.source_name.clone())
                     .or_default() += 1;
                 db.insert_queued(&item).await.ok();
+                observe(db, &by_name, &gates, &item).await;
             }
             Ok(ProcessOutcome::Candidate { item, reason }) => {
                 *candidate_by_source
@@ -509,6 +522,7 @@ pub(crate) async fn poll_once(
                     .or_default() += 1;
                 *candidate_reasons.entry(reason.clone()).or_default() += 1;
                 db.insert_candidate(&item, &reason).await.ok();
+                observe(db, &by_name, &gates, &item).await;
             }
             Ok(ProcessOutcome::Dropped { item, reason }) => {
                 *dropped_by_source
@@ -524,6 +538,7 @@ pub(crate) async fn poll_once(
                 )
                 .await
                 .ok();
+                observe(db, &by_name, &gates, &item).await;
             }
             Ok(ProcessOutcome::Retry { item, reason }) => {
                 *retried_by_source
@@ -576,6 +591,27 @@ pub(crate) async fn poll_once(
         info!("Retry reason: {count} item(s): {reason}");
     }
     summary
+}
+
+/// Writes the observation of a decided item (S2: the shadow decision next to the digest).
+async fn observe(
+    db: &Db,
+    by_name: &HashMap<String, SourceConfig>,
+    gates: &HashMap<(String, String), &'static str>,
+    item: &FeedItem,
+) {
+    let Some(source) = by_name.get(&item.source_name) else {
+        return;
+    };
+    let gate = gates
+        .get(&(item.source_name.clone(), item.guid.clone()))
+        .copied()
+        .unwrap_or("fetch");
+    let observation =
+        crate::pipeline::observation(source, item, gate, chrono::Utc::now().timestamp());
+    if let Err(e) = db.insert_observation(observation).await {
+        warn!("Failed to store the observation of {:?}: {e:#}", item.title);
+    }
 }
 
 /// An item whose task panicked: counted like a retry, and after [`MAX_RETRY_ATTEMPTS`] (or in
@@ -982,6 +1018,10 @@ mod tests {
     fn source(base: Option<f64>, max_age_hours: Option<u64>) -> SourceConfig {
         SourceConfig {
             name: "Polizei Berlin".to_owned(),
+            id: None,
+            scope: None,
+            official: false,
+            category: None,
             source_type: sources::SourceType::Rss,
             url: None,
             query: None,
@@ -1577,5 +1617,68 @@ mod tests {
 
         assert!(matches!(outcome, ProcessOutcome::Candidate { .. }));
         assert!(recorded.calls().is_empty(), "{:?}", recorded.calls());
+    }
+
+    #[tokio::test]
+    async fn every_decided_item_is_observed_once_with_its_shadow_decision() {
+        let (db, _dir) = crate::testing::test_db();
+        let http = Http::recorded(Arc::new(crate::fetch::Recorded::new().route(
+            "https://ok.test/",
+            200,
+            &police_feed(),
+        )));
+        let sources = [feed("Fine Feed", "https://ok.test/rss")];
+
+        rounds(&http, &sources, &db, 1).await;
+        let first = db.observation_rows().await.unwrap();
+        rounds(&http, &sources, &db, 1).await;
+        let second = db.observation_rows().await.unwrap();
+
+        let items = crate::feed::parse_feed(&police_feed(), "x").len();
+        assert_eq!(first.len(), items);
+        assert_eq!(second, first, "a second round observes nothing new");
+        for (source_id, _, category, class, decision) in &first {
+            assert_eq!(source_id, "fine-feed", "no id: the slug of the name");
+            assert!(
+                crate::model::Category::parse(category).is_some(),
+                "{category}"
+            );
+            assert!(crate::model::Class::parse(class).is_some(), "{class}");
+            let record: serde_json::Value = serde_json::from_str(decision).unwrap();
+            assert!(
+                record["rule"].is_string() && record["gate"].is_string(),
+                "{record}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_renamed_source_with_the_same_id_observes_nothing_new() {
+        let (db, _dir) = crate::testing::test_db();
+        let http = Http::recorded(Arc::new(crate::fetch::Recorded::new().route(
+            "https://ok.test/",
+            200,
+            &police_feed(),
+        )));
+        rounds(
+            &http,
+            &[feed("Local Police", "https://ok.test/rss")],
+            &db,
+            1,
+        )
+        .await;
+        let before = db.observation_rows().await.unwrap().len();
+
+        let mut renamed = feed("Police of the city", "https://ok.test/rss");
+        renamed.id = Some("local-police".to_owned());
+        rounds(&http, &[renamed], &db, 1).await;
+
+        assert_eq!(db.observation_rows().await.unwrap().len(), before);
+        assert!(db
+            .observation_rows()
+            .await
+            .unwrap()
+            .iter()
+            .all(|row| row.0 == "local-police"));
     }
 }

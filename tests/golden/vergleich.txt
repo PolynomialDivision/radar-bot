@@ -1,0 +1,10 @@
+🔍 Vergleich, letzte 3 Tage: 4 Beobachtungen
+
+Geliefert, im Schatten auch: 1
+• Brand in der Britzer Allee (briefing)
+
+Geliefert, im Schatten nicht (archive/drop): 1
+• Wohnung zu vermieten (drop: table: other ring 2 → drop)
+
+Nicht geliefert, im Schatten schon (briefing/urgent): 1
+• Straßenfest in der Musterstraße (briefing: table: other ring 2 → briefing)
