@@ -31,6 +31,7 @@ use crate::digest::digest_loop;
 use crate::polling::poll_loop;
 use crate::polling::source_verdict;
 use crate::polling::PollCtx;
+use crate::polling::{names_in, source_reports, PollLinks, SourceState};
 use fetch::Http;
 // Reached as `crate::…` by the warning and source modules.
 use feed::{parse_feed, parse_feed_date, parse_feed_entries, FeedItem};
@@ -113,65 +114,110 @@ const COMMANDS: Commands = Commands::flat(&[Spec::new("source-stats", "📊", "i
     .usage("[hours]")
     .admin()]);
 
-/// Admin-only `!source-stats [hours]`: items per source, then the failing and silent ones.
-async fn source_stats_reply(db: &Db, args: &str, source_names: &[String]) -> String {
-    let mut reply = source_counts_reply(db, args).await;
-    match db.source_health().await {
-        Ok(health) => {
-            let (failing, silent) =
-                source_verdict(&health, source_names, chrono::Utc::now().timestamp());
-            if !failing.is_empty() {
-                reply.push_str(&format!(
-                    "\n\n⚠️ Failing {} polls in a row: {}",
-                    store::FAILING_AFTER,
-                    failing.join(", ")
-                ));
-            }
-            if !silent.is_empty() {
-                reply.push_str(&format!(
-                    "\n\n🔇 No new item for 30 days: {}",
-                    silent.join(", ")
-                ));
-            }
-        }
-        Err(e) => warn!("!source-stats: source states failed: {e:#}"),
-    }
-    reply
-}
-
-/// Items per source in the last `args` hours (default 24).
-async fn source_counts_reply(db: &Db, args: &str) -> String {
+/// Admin-only `!source-stats [hours]`: the failing, stale and silent sources, then one line
+/// per source with what it gave in the last `hours` (sources with nothing left out).
+async fn source_stats_reply(db: &Db, args: &str, sources: &[SourceConfig]) -> String {
     let hours = args
         .split_whitespace()
         .next()
         .and_then(|s| s.parse::<u32>().ok())
         .unwrap_or(24)
         .clamp(1, 24 * 30);
-    match db.source_stats_summary(hours).await {
-        Ok(stats) if stats.is_empty() => {
-            format!("🤷 No source stats in the last {hours}h.")
-        }
-        Ok(stats) => {
-            let mut lines = vec![format!("📊 Source stats, last {hours}h")];
-            for stat in stats {
-                lines.push(String::new());
-                lines.push(format!(
-                    "📰 {}\n📥 {} total · 📬 {} queued\n🔎 {} candidate · 🗑️ {} dropped · 🔁 {} retry",
-                    stat.source_name,
-                    stat.total,
-                    stat.queued,
-                    stat.candidate,
-                    stat.dropped,
-                    stat.retry_later
-                ));
+    let now = chrono::Utc::now().timestamp();
+    let mut lines = vec![format!("📊 Source stats, last {hours}h")];
+    let names: Vec<String> = sources.iter().map(|s| s.name.clone()).collect();
+    match (
+        db.source_health().await,
+        source_reports(db, sources, now).await,
+    ) {
+        (Ok(health), Ok(reports)) => {
+            let (failing, _) = source_verdict(&health, &names, now);
+            for (label, group) in [
+                (
+                    format!("⚠️ Failing {} polls in a row", store::FAILING_AFTER),
+                    failing,
+                ),
+                (
+                    "🕸️ Stale, newest entry too old".to_owned(),
+                    names_in(&reports, SourceState::Stale),
+                ),
+                (
+                    "🔇 No new item for 30 days".to_owned(),
+                    names_in(&reports, SourceState::Silent),
+                ),
+            ] {
+                if !group.is_empty() {
+                    lines.push(format!("{label}: {}", group.join(", ")));
+                }
             }
-            lines.join("\n")
+        }
+        (Err(e), _) | (_, Err(e)) => warn!("!source-stats: source states failed: {e:#}"),
+    }
+    match db.source_stats_summary(hours).await {
+        Ok(stats) => {
+            let active: Vec<String> = stats
+                .iter()
+                .filter(|s| s.total + s.queued + s.candidate + s.dropped + s.retry_later > 0)
+                .map(|s| {
+                    format!(
+                        "📰 {}: 📥 {} · 📬 {} · 🔎 {} · 🗑️ {} · 🔁 {}",
+                        s.source_name, s.total, s.queued, s.candidate, s.dropped, s.retry_later
+                    )
+                })
+                .collect();
+            if active.is_empty() {
+                lines.push(format!("🤷 No source gave anything in the last {hours}h."));
+            } else {
+                lines.push(String::new());
+                lines.extend(active);
+            }
         }
         Err(e) => {
             warn!("!source-stats failed: {e}");
-            "❌ Source stats query failed.".to_owned()
+            lines.push("❌ Source stats query failed.".to_owned());
         }
     }
+    lines.join("\n")
+}
+
+/// `text` to the admins, in their direct chats with the bot; without one it is only logged.
+async fn tell_admins(bot: &Bot, text: &str) {
+    let chats: Vec<Room> = bot
+        .client
+        .joined_rooms()
+        .into_iter()
+        .filter(|room| bot.admin.is_admin_dm(room))
+        .collect();
+    if chats.is_empty() {
+        warn!("No admin chat for: {text}");
+        return;
+    }
+    for room in chats {
+        let content = RoomMessageEventContent::text_plain(text);
+        if let Err(e) = mxbot_common::send::send_with_retry(&room, content).await {
+            error!("Failed to tell the admins in {}: {e}", room.room_id());
+        }
+    }
+}
+
+/// The weekly summary of sources that are not ok: Monday, at the first digest time.
+fn source_summary_job(zone: Zone, schedule: &ScheduleConfig) -> schedule::Job {
+    let at = schedule
+        .digest_times
+        .first()
+        .and_then(|t| t.parse::<mxbot_common::config::TimeOfDay>().ok())
+        .unwrap_or(mxbot_common::config::TimeOfDay::new(8, 0));
+    let rule = schedule::Rule::Weekly {
+        day: chrono::Weekday::Mon,
+        at,
+    };
+    schedule::Job::new(
+        "source-summary",
+        zone,
+        schedule::Delivery::AtLeastOnce,
+        CATCH_UP,
+        move || Some(rule.clone()),
+    )
 }
 
 /// The command line: `radar-bot [--dry-run [--fixtures DIR] [--db FILE]] [CONFIG.toml]`, or
@@ -324,8 +370,7 @@ async fn main() -> Result<()> {
     mxbot_common::logging::init("radar_bot");
     let config: Config = mxbot_common::config::load_toml(&args.config)?;
     config.validate()?;
-    let source_names: Arc<Vec<String>> =
-        Arc::new(config.sources.iter().map(|s| s.name.clone()).collect());
+    let source_configs: Arc<Vec<SourceConfig>> = Arc::new(config.sources.clone());
     // `TZ` (as compose sets it), else Europe/Berlin: the digest and forecast times.
     let zone = Zone::resolve(None)?;
 
@@ -352,7 +397,7 @@ async fn main() -> Result<()> {
         move |ev: OriginalSyncRoomMessageEvent, room: Room, encryption: Option<EncryptionInfo>| {
             let bot = bot.clone();
             let db = db.clone();
-            let source_names = source_names.clone();
+            let source_configs = source_configs.clone();
             async move {
                 if ev.sender == bot.user_id || room.state() != RoomState::Joined {
                     return;
@@ -365,7 +410,7 @@ async fn main() -> Result<()> {
                 };
                 match COMMANDS.parse_as(&text.body, || bot.is_admin(&ev.sender)) {
                     Parsed::Run(command) if command.is("source-stats") => {
-                        let reply = source_stats_reply(&db, command.rest, &source_names).await;
+                        let reply = source_stats_reply(&db, command.rest, &source_configs).await;
                         room.send(RoomMessageEventContent::text_plain(reply))
                             .await
                             .ok();
@@ -426,7 +471,7 @@ async fn main() -> Result<()> {
         });
     }
 
-    let address = config.filter.reference_address.clone();
+    let home = profile::HomeConfig::of(&config.filter);
     let loops = Loops {
         bot: bot.clone(),
         http: http.clone(),
@@ -440,19 +485,17 @@ async fn main() -> Result<()> {
         dwd_region_keywords,
         bluesky,
     };
-    match address {
-        // The loops that measure from the reference point start once it is known.
-        Some(address) => {
+    match home {
+        Some(home) => {
+            let (publish, profile) = tokio::sync::watch::channel(None);
             supervise("radar profile", async move {
                 let alive = supervise::report("radar profile");
-                profile::keep_profile(db, http, address, alive, profile::RETRY, move |profile| {
-                    loops.start(Some(profile))
-                })
-                .await
+                profile::keep_profile(db, http, home, alive, profile::RETRY, publish).await
             });
+            loops.start(Some(profile));
         }
         None => {
-            warn!("No reference_address configured: distance scoring, weather and NINA disabled");
+            warn!("No reference_address or lat/lon configured: distance scoring, weather and NINA disabled");
             loops.start(None);
         }
     }
@@ -499,8 +542,92 @@ struct Loops {
 }
 
 impl Loops {
-    fn start(self, profile: Option<profile::HomeProfile>) {
+    /// The warnings start at once (with the home profile once `home` has it); the loops that
+    /// measure from the point (forecast, poll) start once it is known, or at once without a
+    /// configured home.
+    fn start(self, home: Option<HomeUpdates>) {
         let Loops {
+            bot,
+            http,
+            db,
+            zone,
+            sources,
+            filter,
+            schedule,
+            weather,
+            emergency,
+            dwd_region_keywords,
+            bluesky,
+        } = self;
+
+        if emergency.enabled {
+            // Without a configured home: a channel that stays empty.
+            let profile = home
+                .clone()
+                .unwrap_or_else(|| tokio::sync::watch::channel(None).1);
+            // A round takes well under two minutes (every request has a timeout).
+            let within = Duration::from_secs(3 * (emergency.poll_interval_secs + 120));
+            let config = alerts::AlertConfig {
+                home: profile,
+                dwd_region_keywords,
+                dwd_lead: Duration::from_secs(weather.warning_lead_hours * 3600),
+                max_distance_km: emergency.max_distance_km,
+                poll_interval_secs: emergency.poll_interval_secs,
+                quakes: emergency.quakes,
+            };
+            supervise_ticking("radar alerts", within, |alive| {
+                alerts::alert_loop(bot.clone(), http.clone(), db.clone(), config, alive)
+            });
+        }
+
+        let measured = Measured {
+            bot,
+            http,
+            db,
+            zone,
+            sources,
+            filter,
+            schedule,
+            weather,
+            bluesky,
+        };
+        match home {
+            None => measured.start(None, None),
+            Some(mut updates) => {
+                tokio::spawn(async move {
+                    let first = match updates.wait_for(Option::is_some).await {
+                        Ok(profile) => profile.clone(),
+                        Err(_) => {
+                            error!("The home profile task ended before a profile was known");
+                            return;
+                        }
+                    };
+                    measured.start(first, Some(updates));
+                });
+            }
+        }
+    }
+}
+
+/// The home profile as the profile task publishes it.
+type HomeUpdates = tokio::sync::watch::Receiver<Option<profile::HomeProfile>>;
+
+/// The loops that measure from the reference point and what they run with.
+struct Measured {
+    bot: Bot,
+    http: Http,
+    db: Db,
+    zone: Zone,
+    sources: Vec<SourceConfig>,
+    filter: FilterConfig,
+    schedule: ScheduleConfig,
+    weather: WeatherConfig,
+    bluesky: Option<sources::BlueskyContext>,
+}
+
+impl Measured {
+    fn start(self, profile: Option<profile::HomeProfile>, updates: Option<HomeUpdates>) {
+        let Measured {
             bot,
             http,
             db,
@@ -509,31 +636,9 @@ impl Loops {
             mut filter,
             schedule,
             weather,
-            emergency,
-            dwd_region_keywords,
             bluesky,
         } = self;
         let ref_point = apply_profile(profile.as_ref(), &mut filter);
-
-        if emergency.enabled {
-            let nina_ags = profile.as_ref().and_then(|p| p.nina_ags.clone());
-            if nina_ags.is_none() {
-                warn!("No NINA region for the reference address, NINA alerts disabled");
-            }
-            // A round takes well under two minutes (every request has a timeout).
-            let within = Duration::from_secs(3 * (emergency.poll_interval_secs + 120));
-            let config = alerts::AlertConfig {
-                nina_ags,
-                ref_point,
-                dwd_region_keywords,
-                dwd_lead: Duration::from_secs(weather.warning_lead_hours * 3600),
-                max_distance_km: emergency.max_distance_km,
-                poll_interval_secs: emergency.poll_interval_secs,
-            };
-            supervise_ticking("radar alerts", within, |alive| {
-                alerts::alert_loop(bot.clone(), http.clone(), db.clone(), config, alive)
-            });
-        }
 
         if weather.enabled {
             if let Some(pt) = ref_point {
@@ -564,10 +669,47 @@ impl Loops {
         // A round with a cold geocode cache can take several minutes (Nominatim allows one
         // request per second), so allow ten per round.
         let minutes = schedule.poll_interval_minutes;
-        let within = Duration::from_secs(3 * (minutes + 10) * 60);
+        let within_poll = Duration::from_secs(3 * (minutes + 10) * 60);
         let ctx = PollCtx::new(http.clone(), filter, ref_point);
-        supervise_ticking("radar poll", within, |alive| {
-            poll_loop(ctx, db.clone(), sources, minutes, bluesky, alive)
+        let (admins, mut notices) = tokio::sync::mpsc::unbounded_channel::<String>();
+        {
+            let bot = bot.clone();
+            tokio::spawn(async move {
+                while let Some(notice) = notices.recv().await {
+                    tell_admins(&bot, &notice).await;
+                }
+            });
+        }
+        let job = source_summary_job(zone, &schedule);
+        let within = job.stall_after(SEND_FOR);
+        {
+            let (bot, db, sources) = (bot.clone(), db.clone(), sources.clone());
+            supervise_ticking("radar source summary", within, |alive| {
+                schedule::run(job, db.clone(), alive, move |_slot| {
+                    let (bot, db, sources) = (bot.clone(), db.clone(), sources.clone());
+                    async move {
+                        let now = chrono::Utc::now().timestamp();
+                        match polling::weekly_source_summary(&db, &sources, now).await {
+                            Ok(Some(summary)) => {
+                                tell_admins(&bot, &summary).await;
+                                schedule::Outcome::Done
+                            }
+                            Ok(None) => schedule::Outcome::Skipped,
+                            Err(e) => {
+                                warn!("Weekly source summary failed: {e:#}");
+                                schedule::Outcome::RetryIn(RETRY_AFTER)
+                            }
+                        }
+                    }
+                })
+            });
+        }
+        let links = PollLinks {
+            home: updates,
+            admins: Some(admins),
+        };
+        supervise_ticking("radar poll", within_poll, |alive| {
+            poll_loop(ctx, db.clone(), sources, minutes, bluesky, links, alive)
         });
     }
 }

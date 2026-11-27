@@ -12,6 +12,9 @@ use std::time::{Duration, Instant};
 use html5ever::tendril::{StrTendril, TendrilSink};
 use scraper::{node::Node, ElementRef, Html, HtmlTreeSink, Selector};
 
+/// A node of a parsed document (ego_tree's, which scraper does not re-export).
+type NodeRef<'a> = <ElementRef<'a> as std::ops::Deref>::Target;
+
 use crate::feed::parse_feed_date;
 use crate::fetch::{FetchError, Http, MAX_PAGE_BYTES};
 use crate::filter::{is_invisible, normalize};
@@ -22,6 +25,10 @@ use crate::filter::{is_invisible, normalize};
 const NOT_TEXT: &[&str] = &[
     "script", "style", "nav", "header", "footer", "aside", "noscript", "template",
 ];
+
+/// [`NOT_TEXT`] inside the chosen container: an article's own `header` holds its headline and
+/// lead, its `footer` the byline; both are part of it.
+const NOT_TEXT_INSIDE: &[&str] = &["script", "style", "nav", "aside", "noscript", "template"];
 
 /// Candidate containers of the article, in the order they are considered.
 const CONTAINERS: &[&str] = &["article", "main", "section", "div"];
@@ -183,6 +190,11 @@ impl<'a> PageText<'a> {
     }
 
     fn of(doc: &'a Html) -> Result<Self, TooComplex> {
+        Self::below(doc.tree.root(), NOT_TEXT)
+    }
+
+    /// The text below `root`, leaving out the elements of `skip`.
+    fn below(root: NodeRef<'a>, skip: &[&str]) -> Result<Self, TooComplex> {
         let mut page = PageText {
             text: String::new(),
             words: 0,
@@ -191,7 +203,6 @@ impl<'a> PageText<'a> {
         };
         // Containers that are open at the current node, innermost last.
         let mut open: Vec<usize> = Vec::new();
-        let root = doc.tree.root();
         let mut node = root;
         let mut depth = 0;
         let mut visited = 0;
@@ -205,7 +216,7 @@ impl<'a> PageText<'a> {
                 Node::Text(text) => page.push_text(text),
                 Node::Element(element) => {
                     let name = element.name();
-                    if NOT_TEXT.contains(&name) || is_not_body(element) {
+                    if skip.contains(&name) || is_not_body(element) {
                         descend = false;
                     } else if CONTAINERS.contains(&name) {
                         open.push(page.containers.len());
@@ -275,19 +286,16 @@ impl<'a> PageText<'a> {
     }
 }
 
-/// The opening tag as text (`<div class="article-body">`), for [`container_score`].
-fn opening_tag(element: ElementRef<'_>) -> String {
-    let attrs: Vec<String> = element
-        .value()
-        .attrs()
-        .map(|(name, value)| format!("{name}=\"{value}\""))
-        .collect();
-    format!("<{} {}>", element.value().name(), attrs.join(" "))
-}
-
-/// Score of a container from its opening tag and its number of words.
-fn container_score(tag: &str, words: usize) -> i32 {
-    let tag = tag.to_lowercase();
+/// Score of a container from its tag name, its class and id tokens and its number of words.
+/// A token counts for a needle when it is the needle or, for the article words, begins with it
+/// ("articlebody"); so "lead" or "download" do not count as "ad", nor "context" as "text".
+fn container_score(element: ElementRef<'_>, words: usize) -> i32 {
+    let tokens = element_tokens(element);
+    let has = |needle: &str, prefix: bool| {
+        tokens
+            .iter()
+            .any(|t| t == needle || (prefix && t.starts_with(needle)))
+    };
     let mut score = 0;
     for needle in [
         "article",
@@ -301,7 +309,7 @@ fn container_score(tag: &str, words: usize) -> i32 {
         "meldung",
         "text",
     ] {
-        if tag.contains(needle) {
+        if has(needle, true) {
             score += 4;
         }
     }
@@ -309,11 +317,27 @@ fn container_score(tag: &str, words: usize) -> i32 {
         "nav", "menu", "footer", "header", "aside", "comment", "related", "teaser", "ad", "advert",
         "social",
     ] {
-        if tag.contains(needle) {
+        // Longer page-part words also as the start of a token ("comments", "teaserlist").
+        if has(needle, needle.len() >= 5) {
             score -= 5;
         }
     }
     score + (words / 80).min(8) as i32
+}
+
+/// The tag name and the class and id tokens of `element`, lower-cased.
+fn element_tokens(element: ElementRef<'_>) -> Vec<String> {
+    let value = element.value();
+    std::iter::once(value.name().to_owned())
+        .chain(
+            ["class", "id"]
+                .iter()
+                .filter_map(|attr| value.attr(attr))
+                .flat_map(|v| v.split(|c: char| !c.is_alphanumeric()))
+                .filter(|t| !t.is_empty())
+                .map(str::to_lowercase),
+        )
+        .collect()
 }
 
 /// Extract only the article body from a full HTML page.
@@ -337,7 +361,7 @@ fn article_body_in(doc: &Html) -> Result<String, TooComplex> {
             if len < 200 {
                 return None;
             }
-            let score = container_score(&opening_tag(container.element), page.words_of(container));
+            let score = container_score(container.element, page.words_of(container));
             (score > 0).then_some((index, score, len))
         })
         .collect();
@@ -372,7 +396,10 @@ fn article_body_in(doc: &Html) -> Result<String, TooComplex> {
             None => break,
         }
     }
-    Ok(page.text_of(&page.containers[chosen.0]).to_owned())
+    // The chosen container's text again, now with its own header and footer.
+    let element = page.containers[chosen.0].element;
+    let inside = PageText::below(*element, NOT_TEXT_INSIDE)?;
+    Ok(inside.text.trim().to_owned())
 }
 
 #[derive(Debug, Clone)]
@@ -386,6 +413,22 @@ pub(crate) struct ArticleFetch {
     pub(crate) event: EventLocation,
     /// District the page files the item under (Polizei Berlin "Ereignisort").
     pub(crate) district: Option<String>,
+    /// The page says it is for subscribers: its text is not the article.
+    pub(crate) paywalled: bool,
+}
+
+impl ArticleFetch {
+    fn paywalled() -> Self {
+        ArticleFetch {
+            text: String::new(),
+            resolved_link: None,
+            link_note: None,
+            published_at: None,
+            event: EventLocation::default(),
+            district: None,
+            paywalled: true,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -403,23 +446,9 @@ pub(crate) fn page_event_location(html: &str) -> EventLocation {
 }
 
 fn event_location_in(doc: &Html) -> EventLocation {
-    for script in doc.select(&selector("script[type]")) {
-        let is_json_ld = script
-            .value()
-            .attr("type")
-            .is_some_and(|t| t.trim().eq_ignore_ascii_case("application/ld+json"));
-        if !is_json_ld {
-            continue;
-        }
-        let body: String = script.text().collect();
-        let Ok(json) = serde_json::from_str::<serde_json::Value>(body.trim()) else {
-            continue;
-        };
-        if let Some(found) = find_event_location(&json) {
-            return found;
-        }
-    }
-    EventLocation::default()
+    json_ld_blocks(doc)
+        .find_map(|json| find_event_location(&json))
+        .unwrap_or_default()
 }
 
 fn find_event_location(value: &serde_json::Value) -> Option<EventLocation> {
@@ -500,10 +529,10 @@ fn district_in(doc: &Html) -> Option<String> {
 /// updated old article is still an old event.
 #[cfg(test)]
 pub(crate) fn page_published_at(html: &str) -> Option<i64> {
-    published_at_in(&Html::parse_document(html), html)
+    published_at_in(&Html::parse_document(html))
 }
 
-fn published_at_in(doc: &Html, html: &str) -> Option<i64> {
+fn published_at_in(doc: &Html) -> Option<i64> {
     const META_NAMES: &[&str] = &[
         "article:published_time",
         "og:article:published_time",
@@ -516,16 +545,72 @@ fn published_at_in(doc: &Html, html: &str) -> Option<i64> {
     META_NAMES
         .iter()
         .find_map(|name| meta_content_in(doc, name))
-        .or_else(|| json_ld_date_published(html))
+        .or_else(|| {
+            json_ld_article(doc)?["datePublished"]
+                .as_str()
+                .map(str::to_owned)
+        })
         .and_then(|value| parse_page_date(&value))
 }
 
-fn json_ld_date_published(html: &str) -> Option<String> {
-    let pos = html.find("\"datePublished\"")?;
-    let rest = &html[pos + "\"datePublished\"".len()..];
-    let rest = rest.trim_start().strip_prefix(':')?.trim_start();
-    let rest = rest.strip_prefix('"')?;
-    Some(rest[..rest.find('"')?].to_owned())
+/// schema.org types of a news article.
+const ARTICLE_TYPES: &[&str] = &[
+    "NewsArticle",
+    "Article",
+    "ReportageNewsArticle",
+    "BlogPosting",
+];
+
+/// The page's own article in its JSON-LD (an object of an [`ARTICLE_TYPES`] type, also inside
+/// `@graph` or a list), not data about other articles that the page embeds.
+fn json_ld_article(doc: &Html) -> Option<serde_json::Value> {
+    fn find(value: &serde_json::Value) -> Option<&serde_json::Value> {
+        match value {
+            serde_json::Value::Array(items) => items.iter().find_map(find),
+            serde_json::Value::Object(obj) => {
+                let is_article = match obj.get("@type") {
+                    Some(serde_json::Value::String(t)) => ARTICLE_TYPES.contains(&t.as_str()),
+                    Some(serde_json::Value::Array(ts)) => ts
+                        .iter()
+                        .any(|t| t.as_str().is_some_and(|t| ARTICLE_TYPES.contains(&t))),
+                    _ => false,
+                };
+                if is_article {
+                    Some(value)
+                } else {
+                    obj.get("@graph").and_then(find)
+                }
+            }
+            _ => None,
+        }
+    }
+    json_ld_blocks(doc).find_map(|json| find(&json).cloned())
+}
+
+/// The parsed JSON-LD blocks of the page.
+fn json_ld_blocks(doc: &Html) -> impl Iterator<Item = serde_json::Value> + '_ {
+    static SCRIPTS: std::sync::LazyLock<Selector> =
+        std::sync::LazyLock::new(|| selector("script[type]"));
+    doc.select(&SCRIPTS)
+        .filter(|script| {
+            script
+                .value()
+                .attr("type")
+                .is_some_and(|t| t.trim().eq_ignore_ascii_case("application/ld+json"))
+        })
+        .filter_map(|script| {
+            let body: String = script.text().collect();
+            serde_json::from_str(body.trim()).ok()
+        })
+}
+
+/// Whether the page's article says it is not free to read (`"isAccessibleForFree": false`).
+fn paywalled_in(doc: &Html) -> bool {
+    json_ld_article(doc).is_some_and(|article| match &article["isAccessibleForFree"] {
+        serde_json::Value::Bool(free) => !free,
+        serde_json::Value::String(free) => free.trim().eq_ignore_ascii_case("false"),
+        _ => false,
+    })
 }
 
 fn parse_page_date(value: &str) -> Option<i64> {
@@ -749,6 +834,31 @@ fn is_html(content_type: &str) -> bool {
     content_type.to_ascii_lowercase().contains("html")
 }
 
+/// The page as text: by the charset of its `Content-Type`, else by a `<meta charset>` (or
+/// `http-equiv` content type) in its first 1,024 bytes, else as UTF-8.
+fn page_text(response: &crate::fetch::Response) -> String {
+    let header = response
+        .content_type
+        .as_deref()
+        .and_then(crate::fetch::charset_of);
+    if header.is_some() {
+        return response.body.clone();
+    }
+    let head = String::from_utf8_lossy(&response.bytes[..response.bytes.len().min(1024)])
+        .to_ascii_lowercase();
+    let declared = head.find("charset=").and_then(|at| {
+        let value = head[at + "charset=".len()..].trim_start_matches(['"', '\'', ' ']);
+        let end = value
+            .find(|c: char| !(c.is_ascii_alphanumeric() || c == '-' || c == '_'))
+            .unwrap_or(value.len());
+        encoding_rs::Encoding::for_label(&value.as_bytes()[..end])
+    });
+    match declared {
+        Some(encoding) => encoding.decode(&response.bytes).0.into_owned(),
+        None => response.body.clone(),
+    }
+}
+
 /// Fetch a URL and return the article body plus resolved link metadata.
 pub(crate) async fn fetch_article(http: &Http, url: &str, title: &str) -> Page {
     let response = match http
@@ -756,7 +866,9 @@ pub(crate) async fn fetch_article(http: &Http, url: &str, title: &str) -> Page {
         .await
     {
         Ok(response) => response,
-        Err(e @ FetchError::TooLarge(_)) => return Page::NotAnArticle(e.to_string()),
+        Err(e @ (FetchError::TooLarge(_) | FetchError::Refused(_))) => {
+            return Page::NotAnArticle(e.to_string())
+        }
         Err(e) => {
             tracing::debug!("article fetch failed {url}: {e}");
             return Page::Failed;
@@ -775,13 +887,16 @@ pub(crate) async fn fetch_article(http: &Http, url: &str, title: &str) -> Page {
             return Page::NotAnArticle(content_type.to_owned());
         }
     }
-    let html = response.body;
+    let html = page_text(&response);
 
     // Parsing a large page takes a while: off the async runtime, with a deadline.
     let title = title.to_owned();
     let feed_url = url.to_owned();
     let reading = tokio::task::spawn_blocking(move || read_page(&feed_url, &html, &title));
     match tokio::time::timeout(READ_TIMEOUT, reading).await {
+        Ok(Ok(Ok(Some(article)))) if article.paywalled => {
+            Page::NotAnArticle("paywalled".to_owned())
+        }
         Ok(Ok(Ok(Some(article)))) => Page::Article(article),
         Ok(Ok(Err(TooComplex))) | Err(_) => Page::NotAnArticle("too complex".to_owned()),
         Ok(Ok(Ok(None))) | Ok(Err(_)) => Page::Failed,
@@ -795,6 +910,9 @@ pub(crate) fn read_page(
     title: &str,
 ) -> Result<Option<ArticleFetch>, TooComplex> {
     let doc = parse_page(html)?;
+    if paywalled_in(&doc) {
+        return Ok(Some(ArticleFetch::paywalled()));
+    }
     let text = article_body_in(&doc)?;
     if text.is_empty() {
         return Ok(None);
@@ -803,10 +921,11 @@ pub(crate) fn read_page(
     Ok(Some(ArticleFetch {
         resolved_link,
         link_note,
-        published_at: published_at_in(&doc, html),
+        published_at: published_at_in(&doc),
         event: event_location_in(&doc),
         district: district_in(&doc),
         text,
+        paywalled: false,
     }))
 }
 
@@ -1042,5 +1161,97 @@ mod tests {
 
         assert!(body.contains("Brand in der Perleberger Straße"));
         assert!(!body.contains("Impressum Datenschutz"));
+    }
+
+    #[test]
+    fn an_articles_own_header_with_its_lead_is_kept() {
+        let html = r#"<html><body><header>Startseite Lokales Polizei</header>
+            <article><header><h1>Wasserrohrbruch</h1>
+            <p class="lead">In der Britzer Allee ist eine Leitung gebrochen.</p></header>
+            <p>Die Wasserbetriebe haben die Leitung am Vormittag abgesperrt. Rund vierzig Wohnungen
+            waren bis zum Nachmittag ohne Wasser, ein Tankwagen stand an der Ecke Musterstraße.
+            Die Straße bleibt bis zum Freitag zwischen den beiden Kreuzungen gesperrt.</p>
+            <footer>Von unserer Redaktion</footer></article></body></html>"#;
+
+        let body = extract_article_body(html);
+
+        assert!(
+            body.starts_with("Wasserrohrbruch In der Britzer Allee"),
+            "{body}"
+        );
+        assert!(body.ends_with("Von unserer Redaktion"), "{body}");
+        assert!(!body.contains("Startseite"), "{body}");
+    }
+
+    #[test]
+    fn containers_are_scored_on_their_tokens() {
+        let doc = Html::parse_document(
+            r#"<div class="article-lead" id="x"></div><div class="download-box"></div>
+               <div data-role="article" style="content"></div><div class="articleBody"></div>
+               <div class="comments-list"></div>"#,
+        );
+        let score = |class: &str| {
+            let element = doc
+                .select(&selector("div"))
+                .find(|d| {
+                    d.value().attr("class") == Some(class)
+                        || d.value().attr("data-role") == Some(class)
+                })
+                .unwrap();
+            container_score(element, 0)
+        };
+
+        assert_eq!(score("article-lead"), 4, "not penalised for \"ad\"");
+        assert_eq!(score("download-box"), 0);
+        assert_eq!(
+            score("article"),
+            0,
+            "data- and style attributes do not count"
+        );
+        assert_eq!(score("articleBody"), 8);
+        assert_eq!(score("comments-list"), -5);
+    }
+
+    #[test]
+    fn the_publish_date_is_the_articles_own() {
+        let html = r#"<script>window.state = {"related": [{"datePublished": "2019-03-01T08:00:00Z"}]};</script>
+            <script type="application/ld+json">{"@graph": [
+              {"@type": "ItemList", "itemListElement": [{"@type": "NewsArticle", "datePublished": "2020-01-01T08:00:00Z"}]},
+              {"@type": "NewsArticle", "headline": "Brand", "datePublished": "2024-03-01T07:00:00Z"}]}</script>"#;
+
+        assert_eq!(page_published_at(html), Some(1_709_276_400));
+    }
+
+    #[test]
+    fn a_page_without_a_header_charset_is_read_by_its_meta_charset() {
+        let mut page = b"<html><head><meta charset=\"iso-8859-1\"></head><body><p>Stra".to_vec();
+        page.push(0xDF);
+        page.extend_from_slice(b"e</p></body></html>");
+
+        let named = crate::fetch::Response::for_test(200, Some("text/html"), page.clone());
+        let header =
+            crate::fetch::Response::for_test(200, Some("text/html; charset=windows-1252"), page);
+
+        assert!(page_text(&named).contains("Straße"));
+        assert!(page_text(&header).contains("Straße"));
+    }
+
+    #[tokio::test]
+    async fn a_paywalled_page_is_not_the_article() {
+        let page = r#"<html><head><script type="application/ld+json">{"@type": "NewsArticle",
+            "isAccessibleForFree": false, "datePublished": "2026-11-20T08:00:00+01:00"}</script></head>
+            <body><article><p>Nur für Abonnenten: Brand in der Perleberger Straße. Lesen Sie weiter
+            mit unserem Digitalabo, jetzt einen Monat kostenlos testen und alle Artikel lesen.
+            Jederzeit kündbar, keine Mindestlaufzeit, alle Inhalte auf allen Geräten.</p></article>
+            </body></html>"#;
+        let http = Http::recorded(std::sync::Arc::new(crate::fetch::Recorded::new().route(
+            "https://paper.test/",
+            200,
+            page,
+        )));
+
+        let fetched = fetch_article(&http, "https://paper.test/a", "Brand").await;
+
+        assert!(matches!(fetched, Page::NotAnArticle(why) if why == "paywalled"));
     }
 }

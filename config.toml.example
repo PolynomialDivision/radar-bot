@@ -68,6 +68,10 @@ candidate_retention_hours = 24
 
 # Your reference address: geocoded once at startup. All distances are measured from here.
 reference_address = "Yourstreet 1, 10000 Yourcity"
+# The reference point itself (both or neither): the bot then starts without the
+# geocoder and looks up city, district and postal code in the background.
+# lat = 52.4736
+# lon = 13.4205
 
 # City string appended to Nominatim queries when geocoding street mentions from articles.
 # Keeps results anchored to the right city.
@@ -149,6 +153,8 @@ aliases = ["Local U-Bahn", "Local S-Bahn", "Station Nickname"]
 #   filter              = false: skip location filter, include everything
 #   required            = ["keyword"]: overrides global filter.required for this source.
 #                         Set to [] to skip the city check for city-specific sources.
+#   stale_after_days = N: the newest entry of an RSS feed older than this (default
+#     45) makes the source "stale", and the admins are told once
 #   base_implied_meters = N: fallback distance when neither area keywords nor geocoding
 #                             produce a result.
 #                             City-wide feeds: ~9000 (score 1 🔵)
@@ -249,8 +255,10 @@ alerts_enabled = true
 # USGS sends significant earthquakes within max_distance_km of your
 # reference_address (default 500 km).
 # GDACS covers major global disasters (earthquakes, floods, cyclones, volcanoes).
+# Both are off unless quakes = true, and then asked every 15th round.
 [emergency]
 enabled = true
+# quakes = false           # USGS and GDACS
 # max_distance_km = 200    # USGS/GDACS radius; default 500, e.g. 20000 = worldwide
 poll_interval_secs = 120
 

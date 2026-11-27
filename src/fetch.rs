@@ -96,6 +96,20 @@ impl Response {
         (200..300).contains(&self.status)
     }
 
+    /// An answer as the live transport would build it.
+    #[cfg(test)]
+    pub(crate) fn for_test(status: u16, content_type: Option<&str>, bytes: Vec<u8>) -> Self {
+        Response {
+            status,
+            body: decode(&bytes, content_type),
+            content_type: content_type.map(str::to_owned),
+            bytes,
+            etag: None,
+            last_modified: None,
+            location: None,
+        }
+    }
+
     /// The content type for a log line.
     pub(crate) fn content_type(&self) -> &str {
         self.content_type.as_deref().unwrap_or("no content type")
@@ -121,6 +135,8 @@ pub(crate) enum FetchError {
     Timeout,
     /// The body was longer than the cap (bytes).
     TooLarge(usize),
+    /// The URL is not one the bot fetches: no http(s), or a host inside the house's networks.
+    Refused(String),
     Failed(String),
 }
 
@@ -129,6 +145,7 @@ impl std::fmt::Display for FetchError {
         match self {
             FetchError::Timeout => write!(f, "timed out"),
             FetchError::TooLarge(cap) => write!(f, "body larger than {cap} bytes"),
+            FetchError::Refused(why) => write!(f, "refused: {why}"),
             FetchError::Failed(why) => write!(f, "{why}"),
         }
     }
@@ -138,6 +155,8 @@ impl std::fmt::Display for FetchError {
 #[derive(Clone)]
 pub(crate) struct Http {
     transport: Transport,
+    /// Which targets the live transport refuses; none for recorded answers.
+    guard: Option<Arc<Guard>>,
     agents: Arc<Agents>,
     limits: Arc<Limits>,
     /// The last answer of each feed that came with validators ([`Http::get_feed`]).
@@ -185,6 +204,7 @@ impl Http {
     pub(crate) fn live(client: reqwest::Client, agents: Agents) -> Self {
         Http {
             transport: Transport::Live(client),
+            guard: Some(Arc::default()),
             agents: Arc::new(agents),
             limits: Arc::new(Limits::new()),
             feeds: Arc::default(),
@@ -195,6 +215,7 @@ impl Http {
     pub(crate) fn recorded(recorded: Arc<Recorded>) -> Self {
         Http {
             transport: Transport::Recorded(recorded),
+            guard: None,
             agents: Arc::default(),
             limits: Arc::new(Limits::new()),
             feeds: Arc::default(),
@@ -368,6 +389,9 @@ impl Http {
         let mut method = method;
         let mut body = body;
         for _ in 0..=MAX_REDIRECTS {
+            if let Some(guard) = &self.guard {
+                guard.check(&url).await?;
+            }
             let response = {
                 let host = self.limits.host(&url);
                 let _host = host.acquire().await.expect("never closed");
@@ -400,6 +424,80 @@ impl Http {
         Err(FetchError::Failed(format!(
             "more than {MAX_REDIRECTS} redirects"
         )))
+    }
+}
+
+/// The targets the live transport refuses: URLs that are not http(s), and hosts that resolve
+/// to a loopback, private, link-local or unique-local address (the bot runs inside the
+/// house's container network and follows whatever links feeds carry). Checked on every
+/// redirect hop.
+#[derive(Default)]
+struct Guard {
+    /// Addresses let through anyway (tests against a local server).
+    allowed: Vec<std::net::IpAddr>,
+}
+
+impl Guard {
+    async fn check(&self, url: &str) -> Result<(), FetchError> {
+        let parsed =
+            reqwest::Url::parse(url).map_err(|e| FetchError::Refused(format!("{url}: {e}")))?;
+        if !matches!(parsed.scheme(), "http" | "https") {
+            return Err(FetchError::Refused(format!(
+                "{} is no web address",
+                parsed.scheme()
+            )));
+        }
+        let port = parsed.port_or_known_default().unwrap_or(80);
+        let host = parsed
+            .host_str()
+            .ok_or_else(|| FetchError::Refused(format!("{url} has no host")))?;
+        // An IPv6 literal comes in brackets.
+        let bare = host.trim_start_matches('[').trim_end_matches(']');
+        let addresses: Vec<std::net::IpAddr> = match bare.parse() {
+            Ok(ip) => vec![ip],
+            Err(_) => tokio::net::lookup_host((bare, port))
+                .await
+                .map_err(|e| FetchError::Failed(format!("{bare}: {e}")))?
+                .map(|address| address.ip())
+                .collect(),
+        };
+        match addresses
+            .iter()
+            .find(|ip| is_internal(**ip) && !self.allowed.contains(ip))
+        {
+            Some(ip) => Err(FetchError::Refused(format!(
+                "{} is an internal address ({ip})",
+                parsed.host_str().unwrap_or_default()
+            ))),
+            None => Ok(()),
+        }
+    }
+}
+
+/// Loopback, private, link-local, unique-local, unspecified or shared address space.
+fn is_internal(ip: std::net::IpAddr) -> bool {
+    use std::net::IpAddr;
+    match ip {
+        IpAddr::V4(v4) => {
+            let [a, b, ..] = v4.octets();
+            v4.is_loopback()
+                || v4.is_private()
+                || v4.is_link_local()
+                || v4.is_unspecified()
+                || v4.is_broadcast()
+                // 100.64.0.0/10, carrier-grade NAT and some container networks
+                || (a == 100 && (64..128).contains(&b))
+        }
+        IpAddr::V6(v6) => {
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return is_internal(IpAddr::V4(v4));
+            }
+            let first = v6.segments()[0];
+            v6.is_loopback()
+                || v6.is_unspecified()
+                || (first & 0xfe00) == 0xfc00 // unique local fc00::/7
+                || (first & 0xffc0) == 0xfe80 // link local fe80::/10
+        }
     }
 }
 
@@ -859,7 +957,17 @@ mod live_tests {
     use wiremock::matchers::{header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
+    /// The live transport, with the local test servers let through the guard.
     fn live() -> Http {
+        let mut http = guarded();
+        http.guard = Some(Arc::new(Guard {
+            allowed: vec!["127.0.0.1".parse().unwrap(), "127.0.0.2".parse().unwrap()],
+        }));
+        http
+    }
+
+    /// The live transport as the bot uses it.
+    fn guarded() -> Http {
         Http::live(
             crate::http_client().unwrap(),
             Agents {
@@ -867,6 +975,48 @@ mod live_tests {
                 page: "Page-Agent/1".to_owned(),
             },
         )
+    }
+
+    #[tokio::test]
+    async fn internal_addresses_and_other_schemes_are_refused() {
+        let http = guarded();
+        for url in [
+            "http://127.0.0.1/",
+            "http://[::1]/",
+            "http://10.0.0.1/feed",
+            "http://192.168.1.10/",
+            "http://169.254.169.254/latest/meta-data/",
+            "http://[fd00::1]/",
+            "file:///etc/passwd",
+            "ftp://example.com/feed",
+        ] {
+            let result = http.get(url, &[], SECOND).await;
+            assert!(
+                matches!(result, Err(FetchError::Refused(_))),
+                "{url}: {result:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_redirect_into_the_house_network_is_refused() {
+        let server = MockServer::start().await;
+        Mock::given(path("/moved"))
+            .respond_with(
+                ResponseTemplate::new(302).insert_header("Location", "http://10.0.0.1/admin"),
+            )
+            .mount(&server)
+            .await;
+
+        let result = live()
+            .get(&format!("{}/moved", server.uri()), &[], SECOND * 5)
+            .await;
+
+        assert!(
+            matches!(result, Err(FetchError::Refused(ref why)) if why.contains("10.0.0.1")),
+            "{result:?}"
+        );
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
     }
 
     const SECOND: Duration = Duration::from_secs(1);

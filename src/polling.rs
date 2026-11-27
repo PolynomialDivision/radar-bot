@@ -80,7 +80,7 @@ pub(crate) async fn process_item(
     // extract_article_body() isolates <article>/<main> to avoid navigation false-positives.
     let needs_article = source.filter || source.base_implied_meters.is_some();
     let mut article_fetch_failed = false;
-    if needs_article && item.article_text.is_none() {
+    if needs_article && item.article_text.is_none() && !item.paywalled {
         if let Some(ref url) = item.link {
             tracing::debug!("fetching article [{}] {:?}", source_name, item.title);
             match fetch_article(&http, url, &item.title).await {
@@ -352,7 +352,7 @@ pub(crate) async fn poll_once(
     // Seen-check stays sequential to avoid races; article fetch + geocoding run concurrently.
     let mut pending: Vec<(SourceConfig, FeedItem)> = Vec::new();
     let mut total_by_source: HashMap<String, usize> = HashMap::new();
-    let mut source_tasks: JoinSet<(SourceConfig, Result<Vec<FeedItem>, SourceError>)> =
+    let mut source_tasks: JoinSet<(SourceConfig, Result<sources::Fetched, SourceError>)> =
         JoinSet::new();
     let bluesky_owned = bluesky.cloned();
 
@@ -392,7 +392,7 @@ pub(crate) async fn poll_once(
         return summary;
     }
     for (source, result) in results {
-        let items = match result {
+        let fetched = match result {
             Ok(items) => items,
             Err(e) => {
                 warn!("Source '{}' failed: {e}", source.name);
@@ -405,6 +405,8 @@ pub(crate) async fn poll_once(
                 continue;
             }
         };
+        let newest_entry_at = fetched.newest_entry_at;
+        let items = fetched.items;
         *total_by_source.entry(source.name.clone()).or_default() += items.len();
         summary.fetched += items.len();
 
@@ -429,6 +431,14 @@ pub(crate) async fn poll_once(
             .await
         {
             warn!("Failed to record the state of '{}': {e:#}", source.name);
+        }
+        if let Some(newest) = newest_entry_at {
+            if let Err(e) = db.record_newest_entry(&source.name, newest).await {
+                warn!(
+                    "Failed to record the newest entry of '{}': {e:#}",
+                    source.name
+                );
+            }
         }
         pending.extend(new.into_iter().map(|item| (source.clone(), item)));
     }
@@ -616,6 +626,204 @@ pub(crate) fn source_verdict(
     (failing, silent)
 }
 
+/// A feed whose newest entry is older than this many days is stale, unless the source says.
+pub(crate) const STALE_AFTER_DAYS: u64 = 45;
+
+/// How a source is doing, as the admins are told.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SourceState {
+    Ok,
+    /// Answers, but nothing new to the bot for a month.
+    Silent,
+    /// The newest entry it lists is older than its `stale_after_days`.
+    Stale,
+    /// Failed [`store::FAILING_AFTER`] polls in a row.
+    Failing,
+}
+
+impl SourceState {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            SourceState::Ok => "ok",
+            SourceState::Silent => "silent",
+            SourceState::Stale => "stale",
+            SourceState::Failing => "failing",
+        }
+    }
+
+    fn parse(stored: Option<&str>) -> Self {
+        match stored {
+            Some("silent") => SourceState::Silent,
+            Some("stale") => SourceState::Stale,
+            Some("failing") => SourceState::Failing,
+            // Never reported: as if it was fine.
+            _ => SourceState::Ok,
+        }
+    }
+}
+
+/// Whether a source is a search, whose answers are old or empty by nature.
+fn is_search(source: &SourceConfig) -> bool {
+    !matches!(source.source_type, sources::SourceType::Rss)
+}
+
+/// The state of `source` from its health and the newest entry it lists.
+pub(crate) fn source_state(
+    source: &SourceConfig,
+    health: &store::SourceHealth,
+    newest_entry_at: Option<i64>,
+    now: i64,
+) -> SourceState {
+    let stale_after = source.stale_after_days.unwrap_or(STALE_AFTER_DAYS) as i64 * 86_400;
+    if health.is_failing() {
+        SourceState::Failing
+    } else if !is_search(source) && newest_entry_at.is_some_and(|t| now - t > stale_after) {
+        SourceState::Stale
+    } else if health.is_silent(now) {
+        SourceState::Silent
+    } else {
+        SourceState::Ok
+    }
+}
+
+/// The admin notice for `source` going from `before` to `now`; `None` when there is nothing
+/// to say (no change, or a search going quiet, which searches do).
+pub(crate) fn source_notice(
+    source: &SourceConfig,
+    before: SourceState,
+    now: SourceState,
+    health: &store::SourceHealth,
+    newest_entry_at: Option<i64>,
+) -> Option<String> {
+    let name = &source.name;
+    match now {
+        _ if now == before => None,
+        SourceState::Failing => Some(format!(
+            "⚠️ Quelle „{name}“ fällt seit {} Abrufen aus: {}",
+            health.consecutive_failures,
+            health.last_error.as_deref().unwrap_or("unbekannter Fehler")
+        )),
+        SourceState::Stale => {
+            let since = newest_entry_at
+                .and_then(|t| chrono::DateTime::from_timestamp(t, 0))
+                .map(|t| {
+                    t.with_timezone(&chrono::Local)
+                        .format("%d.%m.%Y")
+                        .to_string()
+                })
+                .unwrap_or_default();
+            Some(format!(
+                "🕸️ Quelle „{name}“ ist veraltet: der neueste Eintrag ist vom {since}"
+            ))
+        }
+        SourceState::Silent if is_search(source) => None,
+        SourceState::Silent => Some(format!(
+            "🔇 Quelle „{name}“ hat seit 30 Tagen nichts Neues geliefert"
+        )),
+        SourceState::Ok => Some(format!("✅ Quelle „{name}“ läuft wieder")),
+    }
+}
+
+/// A configured source with what is known about it.
+pub(crate) struct SourceReport {
+    pub(crate) source: SourceConfig,
+    pub(crate) state: SourceState,
+    pub(crate) health: store::SourceHealth,
+    pub(crate) newest_entry_at: Option<i64>,
+    /// The state last reported to the admins.
+    pub(crate) reported: SourceState,
+}
+
+/// The current state of every configured source that was polled, in configuration order.
+pub(crate) async fn source_reports(
+    db: &Db,
+    sources: &[SourceConfig],
+    now: i64,
+) -> anyhow::Result<Vec<SourceReport>> {
+    let health = db.source_health().await?;
+    let reports = db.source_reports().await?;
+    Ok(sources
+        .iter()
+        .filter_map(|source| {
+            let health = health
+                .iter()
+                .find(|h| h.source_name == source.name)?
+                .clone();
+            let (newest_entry_at, reported) =
+                reports.get(&source.name).cloned().unwrap_or_default();
+            Some(SourceReport {
+                state: source_state(source, &health, newest_entry_at, now),
+                source: source.clone(),
+                health,
+                newest_entry_at,
+                reported: SourceState::parse(reported.as_deref()),
+            })
+        })
+        .collect())
+}
+
+/// After a round: the notices for the admins about sources whose state changed since it was
+/// last reported, and the new state stored as reported (also when it is not worth a notice).
+pub(crate) async fn source_notices(db: &Db, sources: &[SourceConfig], now: i64) -> Vec<String> {
+    let reports = match source_reports(db, sources, now).await {
+        Ok(reports) => reports,
+        Err(e) => {
+            warn!("Failed to read the source states for the admins: {e:#}");
+            return Vec::new();
+        }
+    };
+    let mut notices = Vec::new();
+    for report in reports.iter().filter(|r| r.state != r.reported) {
+        notices.extend(source_notice(
+            &report.source,
+            report.reported,
+            report.state,
+            &report.health,
+            report.newest_entry_at,
+        ));
+        if let Err(e) = db
+            .set_reported(&report.source.name, report.state.as_str())
+            .await
+        {
+            warn!(
+                "Failed to store the reported state of '{}': {e:#}",
+                report.source.name
+            );
+        }
+    }
+    notices
+}
+
+/// The names of the sources of `reports` in `state`.
+pub(crate) fn names_in(reports: &[SourceReport], state: SourceState) -> Vec<String> {
+    reports
+        .iter()
+        .filter(|r| r.state == state)
+        .map(|r| r.source.name.clone())
+        .collect()
+}
+
+/// The weekly line for the admins: the sources that are not ok, or `None` when all are.
+pub(crate) async fn weekly_source_summary(
+    db: &Db,
+    sources: &[SourceConfig],
+    now: i64,
+) -> anyhow::Result<Option<String>> {
+    let reports = source_reports(db, sources, now).await?;
+    let parts: Vec<String> = [
+        (SourceState::Failing, "fallen aus"),
+        (SourceState::Stale, "veraltet"),
+        (SourceState::Silent, "still"),
+    ]
+    .into_iter()
+    .filter_map(|(state, label)| {
+        let names = names_in(&reports, state);
+        (!names.is_empty()).then(|| format!("{label}: {}", names.join(", ")))
+    })
+    .collect();
+    Ok((!parts.is_empty()).then(|| format!("📡 Quellen diese Woche · {}", parts.join(" · "))))
+}
+
 /// After a round: `radar sources` fails while a source has failed
 /// [`store::FAILING_AFTER`] polls in a row, naming it; the gauge `radar_sources_silent`
 /// counts the sources that answer without new items for a month.
@@ -673,21 +881,50 @@ impl PollSummary {
     }
 }
 
+/// What the poll loop is connected to besides the store.
+#[derive(Default)]
+pub(crate) struct PollLinks {
+    /// The home profile as the profile task publishes it: a later one (its district, a
+    /// refresh) is taken over before the next round.
+    pub(crate) home: Option<tokio::sync::watch::Receiver<Option<crate::profile::HomeProfile>>>,
+    /// Notices for the admins (a source that fails, goes stale or recovers).
+    pub(crate) admins: Option<tokio::sync::mpsc::UnboundedSender<String>>,
+}
+
+/// Poll every `interval_mins`.
 pub(crate) async fn poll_loop(
-    ctx: PollCtx,
+    mut ctx: PollCtx,
     db: Db,
     sources: Vec<SourceConfig>,
     interval_mins: u64,
     bluesky: Option<sources::BlueskyContext>,
+    mut links: PollLinks,
     alive: Alive,
 ) {
     let interval = Duration::from_secs(interval_mins * 60);
     alive.expect_every(interval);
     loop {
         alive.tick();
+        let changed = links
+            .home
+            .as_mut()
+            .filter(|u| u.has_changed().unwrap_or(false));
+        if let Some(updates) = changed {
+            let profile = updates.borrow_and_update().clone();
+            let mut filter = (*ctx.filter).clone();
+            let ref_point = crate::apply_profile(profile.as_ref(), &mut filter);
+            info!("Home profile updated, taken over for this round");
+            ctx = PollCtx::new(ctx.http.clone(), filter, ref_point);
+        }
         poll_once(&ctx, &db, &sources, bluesky.as_ref(), false)
             .await
             .report(&alive);
+        let notices = source_notices(&db, &sources, chrono::Utc::now().timestamp()).await;
+        if let Some(admins) = &links.admins {
+            for notice in notices {
+                admins.send(notice).ok();
+            }
+        }
         info!("Next poll in {interval_mins}m");
         sleep(interval).await;
     }
@@ -753,6 +990,7 @@ mod tests {
             filter: true,
             base_implied_meters: base,
             required: Some(vec![]),
+            stale_after_days: None,
         }
     }
 
@@ -1227,5 +1465,117 @@ mod tests {
             .await
             .unwrap()
             .contains(&item.guid));
+    }
+
+    fn rss_dated(guid: &str, days_ago: i64) -> String {
+        let date = (chrono::Utc::now() - chrono::Duration::days(days_ago)).to_rfc2822();
+        format!(
+            r#"<?xml version="1.0"?><rss version="2.0"><channel><title>Blog</title>
+            <item><title>Eintrag {guid}</title><guid>{guid}</guid><pubDate>{date}</pubDate></item>
+            </channel></rss>"#
+        )
+    }
+
+    #[tokio::test]
+    async fn a_stale_feed_is_reported_once_and_its_recovery_once() {
+        let (db, _dir) = crate::testing::test_db();
+        let sources = [feed("Old Blog", "https://blog.test/rss")];
+        let answer = |body: String| {
+            Http::recorded(Arc::new(crate::fetch::Recorded::new().route(
+                "https://blog.test/",
+                200,
+                &body,
+            )))
+        };
+        let reported =
+            |db: Db| async move { db.source_reports().await.unwrap()["Old Blog"].1.clone() };
+        let now = || chrono::Utc::now().timestamp();
+
+        rounds(&answer(rss_dated("old", 60)), &sources, &db, 1).await;
+        let first = source_notices(&db, &sources, now()).await;
+        rounds(&answer(rss_dated("old", 60)), &sources, &db, 1).await;
+        let second = source_notices(&db, &sources, now()).await;
+
+        assert_eq!(first.len(), 1, "{first:?}");
+        assert!(first[0].contains("„Old Blog“ ist veraltet"), "{first:?}");
+        assert!(second.is_empty(), "{second:?}");
+        assert_eq!(reported(db.clone()).await.as_deref(), Some("stale"));
+
+        rounds(&answer(rss_dated("fresh", 1)), &sources, &db, 1).await;
+        let recovered = source_notices(&db, &sources, now()).await;
+        let after = source_notices(&db, &sources, now()).await;
+
+        assert_eq!(
+            recovered,
+            vec!["✅ Quelle „Old Blog“ läuft wieder".to_owned()]
+        );
+        assert!(after.is_empty());
+        assert_eq!(reported(db).await.as_deref(), Some("ok"));
+    }
+
+    #[test]
+    fn searches_are_never_stale_and_go_quiet_without_a_notice() {
+        let now = 100 * 86_400;
+        let health = store::SourceHealth {
+            source_name: "S".to_owned(),
+            first_polled_at: 0,
+            last_success_at: Some(now),
+            last_item_at: Some(now - 40 * 86_400),
+            last_error: None,
+            consecutive_failures: 0,
+        };
+        let mut search = feed("S", "https://s.test/");
+        search.source_type = sources::SourceType::GoogleNews;
+        let old = Some(now - 90 * 86_400);
+
+        assert_eq!(
+            source_state(&search, &health, old, now),
+            SourceState::Silent
+        );
+        assert_eq!(
+            source_notice(&search, SourceState::Ok, SourceState::Silent, &health, old),
+            None
+        );
+        let blog = feed("S", "https://s.test/");
+        assert_eq!(source_state(&blog, &health, old, now), SourceState::Stale);
+        assert!(source_notice(&blog, SourceState::Ok, SourceState::Silent, &health, old).is_some());
+    }
+
+    #[tokio::test]
+    async fn a_feed_without_entries_is_malformed_but_an_empty_search_is_not() {
+        let empty =
+            r#"<?xml version="1.0"?><rss version="2.0"><channel><title>T</title></channel></rss>"#;
+        let http = Http::recorded(Arc::new(
+            crate::fetch::Recorded::new().route("https://", 200, empty),
+        ));
+        let rss = sources::build_adapter(&feed("Feed", "https://feed.test/rss"), None);
+        let mut search = feed("Search", "https://unused.test/");
+        search.source_type = sources::SourceType::GoogleNews;
+        search.query = Some("Musterstraße".to_owned());
+
+        assert!(matches!(
+            rss.fetch_items(&http).await,
+            Err(SourceError::Malformed(why)) if why == "no entries"
+        ));
+        let found = sources::build_adapter(&search, None)
+            .fetch_items(&http)
+            .await;
+        assert!(found.unwrap().items.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_paywalled_item_is_decided_on_its_feed_text_without_a_page() {
+        let recorded = Arc::new(crate::fetch::Recorded::new().route(
+            "https://page.test/",
+            200,
+            "<html><body><article>Text</article></body></html>",
+        ));
+        let mut item = linked("Polizeieinsatz in Charlottenburg", "https://page.test/1");
+        item.paywalled = true;
+
+        let outcome = run_on(Http::recorded(recorded.clone()), item).await;
+
+        assert!(matches!(outcome, ProcessOutcome::Candidate { .. }));
+        assert!(recorded.calls().is_empty(), "{:?}", recorded.calls());
     }
 }

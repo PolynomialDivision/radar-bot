@@ -59,9 +59,9 @@ pub(crate) async fn run(config: Config, fixtures: Option<&Path>, db: Option<&Pat
 
 /// One poll round on `db` and the digest it leads to, every item decided now.
 async fn round(mut config: Config, http: &Http, db: &Db, header: &str) -> Result<Vec<DigestChunk>> {
-    let home = match config.filter.reference_address.clone() {
-        Some(address) => Some(
-            profile::home_profile(db, http, &address)
+    let home = match profile::HomeConfig::of(&config.filter) {
+        Some(home) => Some(
+            profile::home_profile_once(db, http, &home)
                 .await
                 .map_err(|e| anyhow::anyhow!("Reference address: {e}"))?,
         ),

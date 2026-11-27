@@ -3,13 +3,12 @@
 use std::{collections::HashSet, time::Duration};
 
 use anyhow::{Context, Result};
-use mxbot_common::Bot;
 use tracing::{info, warn};
 
 use super::fetch_api;
 use super::post::{
     append_allclear_to_warning, concise_sentences, edit_alert_message_in_rooms, format_alert,
-    format_rfc3339_validity, post_alert_to_rooms, DwdEditResult,
+    format_rfc3339_validity, post_alert_to_rooms, AlertRooms, DwdEditResult,
 };
 use crate::fetch::Http;
 use crate::store::Db;
@@ -25,7 +24,7 @@ pub(super) async fn fetch_nina_dashboard(http: &Http, ags: &str) -> Result<serde
 
 /// The NINA region key (AGS, Amtlicher Gemeindeschlüssel) of a German `city`: built in for a
 /// city-state, else NINA's completion search. `Ok(None)` when NINA does not know the city;
-/// `Err` when the search failed (it is tried again).
+/// `Err` when the search failed or its answer is not a list of results (it is tried again).
 pub(crate) async fn nina_ags_for_city(
     http: &crate::fetch::Http,
     city: &str,
@@ -43,8 +42,17 @@ pub(crate) async fn nina_ags_for_city(
         .get_api(&url, &[], Duration::from_secs(15))
         .await
         .map_err(|e| format!("NINA region search: {e}"))?;
+    if !response.is_success() {
+        return Err(format!(
+            "NINA region search answered HTTP {}",
+            response.status
+        ));
+    }
     let results: serde_json::Value = serde_json::from_str(&response.body)
         .map_err(|e| format!("NINA region search answer: {e}"))?;
+    if !results.is_array() {
+        return Err("NINA region search answer is not a list".to_owned());
+    }
     match results[0]["id"].as_str() {
         Some(ags) => {
             info!("NINA AGS resolved: {ags} ({city})");
@@ -65,7 +73,12 @@ pub(super) fn known_nina_ags(city: &str) -> Option<&'static str> {
     }
 }
 
-pub(super) async fn check_nina(client: &Bot, http: &Http, db: &Db, ags: &str) -> Result<()> {
+pub(super) async fn check_nina(
+    client: &impl AlertRooms,
+    http: &Http,
+    db: &Db,
+    ags: &str,
+) -> Result<()> {
     let json = fetch_nina_dashboard(http, ags).await?;
     let warnings = json.as_array().context("NINA response is not an array")?;
 
@@ -133,7 +146,21 @@ pub(super) async fn check_nina(client: &Bot, http: &Http, db: &Db, ags: &str) ->
         let link = format!("https://warnung.bund.de/meldung/{id}");
         let (plain, html) = format_alert("NINA/warnung.bund.de", headline, &desc, Some(&link));
 
+        let severity = data["severity"].as_str();
         if let Some(active) = db.get_active_nina_warning(&active_key).await? {
+            // A rise in severity is a new message (an edit does not notify), posted before
+            // the edit; when it does not reach every room, both wait for the next poll.
+            if nina_severity_rose(active.severity.as_deref(), severity) {
+                let (up_plain, up_html) = format_nina_escalation(data, headline, active.seen_at);
+                let reply_to: std::collections::HashMap<String, String> =
+                    serde_json::from_str(&active.event_ids_json).unwrap_or_default();
+                let key = nina_escalation_key(&alert_key, severity.unwrap_or(""));
+                if !client.post(&key, &up_plain, &up_html, &reply_to).await.0 {
+                    warn!("ESCALATION post failed [nina], will retry next poll: {headline}");
+                    continue;
+                }
+                info!("ESCALATION posted [nina]: {headline}");
+            }
             match edit_alert_message_in_rooms(client, &active.event_ids_json, &plain, &html).await {
                 DwdEditResult::Ok => {
                     db.mark_nina_alert_posted(
@@ -145,6 +172,7 @@ pub(super) async fn check_nina(client: &Bot, http: &Http, db: &Db, ags: &str) ->
                         &html,
                     )
                     .await?;
+                    db.set_nina_severity(&active_key, severity).await?;
                     db.mark_alert_seen(&alert_key, "nina").await?;
                     info!("ALERT updated [nina]: {headline}");
                 }
@@ -293,7 +321,7 @@ pub(super) enum NinaPosted {
 /// key is used ([`Db::post_key`]), so rooms that have it get no second copy.
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn post_nina_warning_to_rooms(
-    client: &Bot,
+    client: &impl AlertRooms,
     db: &Db,
     id: &str,
     alert_key: &str,
@@ -310,9 +338,82 @@ pub(super) async fn post_nina_warning_to_rooms(
     let ids_json = serde_json::to_string(&room_event_ids).unwrap_or_else(|_| String::from("{}"));
     db.mark_nina_alert_posted(id, headline, region, &ids_json, plain, html)
         .await?;
+    // `alert_key` ends in the severity of this version.
+    db.set_nina_severity(id, alert_key.rsplit(':').next().filter(|s| !s.is_empty()))
+        .await?;
     Ok(if first.key == alert_key {
         NinaPosted::ThisVersion
     } else {
         NinaPosted::EarlierVersion
     })
+}
+
+/// The rank of a CAP severity; unknown values rank lowest.
+fn nina_severity_rank(severity: &str) -> u8 {
+    match severity.trim().to_ascii_lowercase().as_str() {
+        "minor" => 1,
+        "moderate" => 2,
+        "severe" => 3,
+        "extreme" => 4,
+        _ => 0,
+    }
+}
+
+/// Whether an update raises the severity of the posted version. A posted version of unknown
+/// severity (a row from before it was stored) has not "risen".
+pub(super) fn nina_severity_rose(posted: Option<&str>, update: Option<&str>) -> bool {
+    match (posted, update) {
+        (Some(posted), Some(update)) => nina_severity_rank(update) > nina_severity_rank(posted),
+        _ => false,
+    }
+}
+
+/// The transaction key of the escalation post of the version `alert_key` names.
+pub(super) fn nina_escalation_key(alert_key: &str, severity: &str) -> String {
+    format!("{alert_key}:up:{severity}")
+}
+
+fn nina_severity_label(severity: &str) -> &'static str {
+    match nina_severity_rank(severity) {
+        4 => "Extreme Gefahr",
+        3 => "Schwere Gefahr",
+        2 => "Mittlere Gefahr",
+        _ => "Warnung",
+    }
+}
+
+/// The short message for a NINA warning whose severity rose; `original_at` is when the
+/// original was posted (seconds).
+pub(super) fn format_nina_escalation(
+    data: &serde_json::Value,
+    headline: &str,
+    original_at: i64,
+) -> (String, String) {
+    let severity = data["severity"].as_str().unwrap_or("");
+    let emoji = if nina_severity_rank(severity) >= 4 {
+        "🔴"
+    } else {
+        "🟠"
+    };
+    let validity = format_rfc3339_validity(data["effective"].as_str(), data["expires"].as_str())
+        .unwrap_or_default();
+    let original = chrono::DateTime::from_timestamp(original_at, 0)
+        .map(|t| t.with_timezone(&chrono::Local).format("%H:%M").to_string())
+        .unwrap_or_default();
+    let lines = [
+        format!(
+            "⬆️ {emoji} {}: {}",
+            nina_severity_label(severity),
+            headline.trim()
+        ),
+        format!("🕒 {validity}"),
+        format!("Die Warnung von {original} wurde verschärft."),
+    ];
+    let plain = lines.join("\n");
+    let html = lines
+        .iter()
+        .map(|line| super::post::alert_html_escape(line))
+        .collect::<Vec<_>>()
+        .join("<br>");
+    (plain, html)
 }

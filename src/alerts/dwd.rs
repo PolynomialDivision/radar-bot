@@ -7,12 +7,11 @@ use std::{
 };
 
 use anyhow::{Context, Result};
-use mxbot_common::Bot;
 use tracing::{info, warn};
 
 use super::post::{
     alert_html_escape, append_allclear_to_warning, concise_sentences, edit_alert_message_in_rooms,
-    format_alert, post_alert_to_rooms, DwdEditResult,
+    format_alert, post_alert_to_rooms, AlertRooms, DwdEditResult,
 };
 use super::{ensure_success, fetch_api, FETCH_TIMEOUT};
 use crate::fetch::{FetchError, Http};
@@ -37,7 +36,7 @@ pub(super) async fn fetch_dwd_warnings(http: &Http) -> Result<serde_json::Value>
 
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn check_dwd_weather_warnings(
-    client: &Bot,
+    client: &impl AlertRooms,
     http: &Http,
     db: &Db,
     region_keywords: &[String],
@@ -359,6 +358,38 @@ pub(super) async fn check_dwd_weather_warnings(
 
             match old_warning.event_ids_json.as_deref() {
                 Some(ids_json) => {
+                    // A rise in level is a new message: an edit does not notify. Posted
+                    // first; when it does not reach every room the edit waits too, and the
+                    // next round tries again under the same transaction IDs.
+                    if primary.level > old_level {
+                        let occurrence = dwd_occurrence_key(
+                            db,
+                            &primary_id,
+                            primary.start_ms,
+                            primary.end_ms,
+                            None,
+                        )
+                        .await?;
+                        let key = dwd_escalation_key(&occurrence.key, primary.level);
+                        let (up_plain, up_html) =
+                            format_dwd_escalation(&primary.w, old_warning.seen_at);
+                        let reply_to: HashMap<String, String> =
+                            serde_json::from_str(ids_json).unwrap_or_default();
+                        let (all_ok, _) = client.post(&key, &up_plain, &up_html, &reply_to).await;
+                        if !all_ok {
+                            warn!(
+                                "ESCALATION post failed [dwd], will retry: {} ({region})",
+                                primary.headline
+                            );
+                            // Keep the old row: no all-clear for it this round.
+                            promoted_keys.insert(old_id.clone());
+                            continue;
+                        }
+                        info!(
+                            "ESCALATION posted [dwd]: {} ({region}) L{old_level} → L{}",
+                            primary.headline, primary.level
+                        );
+                    }
                     // Edit the existing message: replace content with new level + append notice.
                     let (edit_plain, edit_html) = if old_level == primary.level {
                         (new_plain.clone(), new_html.clone())
@@ -557,7 +588,7 @@ pub(super) async fn check_dwd_weather_warnings(
             }
             _ => {
                 let (plain, html) = format_dwd_allclear(&prev.headline, &prev.region);
-                if crate::post_to_rooms(client, &plain, &html).await {
+                if client.post_untracked(&plain, &html).await {
                     DwdEditResult::Ok
                 } else {
                     DwdEditResult::Failed
@@ -1033,7 +1064,7 @@ pub(super) async fn dwd_occurrence_key(
 
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn repost_dwd_active_warning(
-    client: &Bot,
+    client: &impl AlertRooms,
     db: &Db,
     id: &str,
     replaces: &str,
@@ -1069,6 +1100,41 @@ pub(super) async fn repost_dwd_active_warning(
 }
 
 /// Append a level-change notice (escalation or de-escalation) to the original warning.
+/// The transaction key of the escalation post of an occurrence to `level`: it names the
+/// occurrence and the level, not the text.
+pub(super) fn dwd_escalation_key(occurrence_key: &str, level: i64) -> String {
+    format!("{occurrence_key}:up:{level}")
+}
+
+/// The short message for a warning that rose to the level of `w`; `original_at` is when the
+/// original was posted (seconds).
+pub(super) fn format_dwd_escalation(w: &serde_json::Value, original_at: i64) -> (String, String) {
+    let level = w["level"].as_i64().unwrap_or(0);
+    let event = w["event"]
+        .as_str()
+        .or_else(|| w["headline"].as_str())
+        .unwrap_or("Wetterwarnung")
+        .trim();
+    let emoji = dwd_level_emoji(level);
+    let label = dwd_level_label_for_warning(w);
+    let validity = format_dwd_validity(w).unwrap_or_default();
+    let original = chrono::DateTime::from_timestamp(original_at, 0)
+        .map(|t| t.with_timezone(&chrono::Local).format("%H:%M").to_string())
+        .unwrap_or_default();
+    let lines = [
+        format!("⬆️ {emoji} {label}: {event}"),
+        format!("🕒 {validity}"),
+        format!("Die Warnung von {original} wurde verschärft."),
+    ];
+    let plain = lines.join("\n");
+    let html = lines
+        .iter()
+        .map(|line| alert_html_escape(line))
+        .collect::<Vec<_>>()
+        .join("<br>");
+    (plain, html)
+}
+
 pub(super) fn append_level_change_to_warning(
     original_plain: &str,
     original_html: &str,

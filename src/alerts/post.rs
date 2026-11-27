@@ -4,7 +4,10 @@ use std::collections::HashMap;
 
 use mxbot_common::{
     matrix_sdk::ruma::{
-        events::room::message::{ReplacementMetadata, RoomMessageEventContent},
+        events::{
+            relation::{InReplyTo, Reply},
+            room::message::{Relation, ReplacementMetadata, RoomMessageEventContent},
+        },
         OwnedEventId, OwnedTransactionId,
     },
     Bot,
@@ -12,7 +15,7 @@ use mxbot_common::{
 use tracing::{error, warn};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum DwdEditResult {
+pub(crate) enum DwdEditResult {
     Ok,
     MissingOriginal,
     Failed,
@@ -82,36 +85,124 @@ pub(super) fn concise_sentences(text: &str, max_sentences: usize) -> Option<Stri
     }
 }
 
+/// Where warnings go: the bot's broadcast rooms, or a recorder in tests.
+pub(crate) trait AlertRooms: Sync {
+    /// Posts to every room with transaction IDs from `alert_key`; in a room that `reply_to`
+    /// names an event of, as a reply to it. Returns `(all_ok, room_id → event_id)`.
+    fn post(
+        &self,
+        alert_key: &str,
+        plain: &str,
+        html: &str,
+        reply_to: &HashMap<String, String>,
+    ) -> impl std::future::Future<Output = (bool, HashMap<String, String>)> + Send;
+
+    /// Edits the messages `event_ids_json` (room_id → event_id) names.
+    fn edit(
+        &self,
+        event_ids_json: &str,
+        plain: &str,
+        html: &str,
+    ) -> impl std::future::Future<Output = DwdEditResult> + Send;
+
+    /// Posts without a transaction key (the all-clear of a warning without stored events).
+    fn post_untracked(
+        &self,
+        plain: &str,
+        html: &str,
+    ) -> impl std::future::Future<Output = bool> + Send;
+}
+
+impl AlertRooms for Bot {
+    async fn post(
+        &self,
+        alert_key: &str,
+        plain: &str,
+        html: &str,
+        reply_to: &HashMap<String, String>,
+    ) -> (bool, HashMap<String, String>) {
+        let mut event_ids: HashMap<String, String> = HashMap::new();
+        let mut all_ok = true;
+        for room in self.broadcast_rooms() {
+            let txn_id = stable_alert_transaction_id(alert_key, room.room_id().as_str());
+            let mut content = RoomMessageEventContent::text_html(plain, html);
+            if let Some(original) = reply_to
+                .get(room.room_id().as_str())
+                .and_then(|id| id.parse::<OwnedEventId>().ok())
+            {
+                content.relates_to = Some(Relation::Reply(Reply::new(InReplyTo::new(original))));
+            }
+            // retried with the same transaction ID: a lost answer posts no second alert
+            match mxbot_common::send::send_with_retry_txn(&room, content, &txn_id).await {
+                Ok(event_id) => {
+                    event_ids.insert(room.room_id().to_string(), event_id.to_string());
+                }
+                Err(e) => {
+                    error!("Failed to post alert message to {}: {e}", room.room_id());
+                    all_ok = false;
+                }
+            }
+        }
+        (all_ok, event_ids)
+    }
+
+    async fn edit(&self, event_ids_json: &str, new_plain: &str, new_html: &str) -> DwdEditResult {
+        let map: HashMap<String, String> = match serde_json::from_str(event_ids_json) {
+            Ok(m) => m,
+            Err(e) => {
+                warn!("Could not parse alert event_ids_json for edit: {e}");
+                return DwdEditResult::Failed;
+            }
+        };
+
+        let mut all_ok = true;
+        let mut missing_original = false;
+        for room in self.broadcast_rooms() {
+            let room_id = room.room_id().to_string();
+            let Some(event_id_str) = map.get(&room_id) else {
+                continue;
+            };
+            let event_id = match event_id_str.parse::<OwnedEventId>() {
+                Ok(id) => id,
+                Err(e) => {
+                    warn!("Invalid event ID {event_id_str} for alert edit: {e}");
+                    all_ok = false;
+                    continue;
+                }
+            };
+            let edited = RoomMessageEventContent::text_html(new_plain, new_html)
+                .make_replacement(ReplacementMetadata::new(event_id, None));
+            if let Err(e) = room.send(edited).await {
+                error!("Failed to edit alert message in {room_id}: {e}");
+                all_ok = false;
+                if looks_like_missing_matrix_event(&e.to_string()) {
+                    missing_original = true;
+                }
+            }
+        }
+        if all_ok {
+            DwdEditResult::Ok
+        } else if missing_original {
+            DwdEditResult::MissingOriginal
+        } else {
+            DwdEditResult::Failed
+        }
+    }
+
+    async fn post_untracked(&self, plain: &str, html: &str) -> bool {
+        crate::post_to_rooms(self, plain, html).await
+    }
+}
+
 /// Returns `(all_ok, room_id_str → event_id_str)`.
 /// Collects event IDs from all rooms so they can be stored for future edits.
 pub(super) async fn post_alert_to_rooms(
-    client: &Bot,
+    client: &impl AlertRooms,
     alert_key: &str,
     plain: &str,
     html: &str,
 ) -> (bool, HashMap<String, String>) {
-    let mut event_ids: HashMap<String, String> = HashMap::new();
-    let mut all_ok = true;
-    for room in client.broadcast_rooms() {
-        let txn_id = stable_alert_transaction_id(alert_key, room.room_id().as_str());
-        // retried with the same transaction ID: a lost answer posts no second alert
-        match mxbot_common::send::send_with_retry_txn(
-            &room,
-            RoomMessageEventContent::text_html(plain, html),
-            &txn_id,
-        )
-        .await
-        {
-            Ok(event_id) => {
-                event_ids.insert(room.room_id().to_string(), event_id.to_string());
-            }
-            Err(e) => {
-                error!("Failed to post alert message to {}: {e}", room.room_id());
-                all_ok = false;
-            }
-        }
-    }
-    (all_ok, event_ids)
+    client.post(alert_key, plain, html, &HashMap::new()).await
 }
 
 pub(super) fn stable_alert_transaction_id(alert_key: &str, room_id: &str) -> OwnedTransactionId {
@@ -133,51 +224,12 @@ pub(super) fn stable_alert_transaction_id(alert_key: &str, room_id: &str) -> Own
 /// Returns whether all edits succeeded, failed transiently, or likely targeted
 /// messages that are gone from the room.
 pub(super) async fn edit_alert_message_in_rooms(
-    client: &Bot,
+    client: &impl AlertRooms,
     event_ids_json: &str,
     new_plain: &str,
     new_html: &str,
 ) -> DwdEditResult {
-    let map: HashMap<String, String> = match serde_json::from_str(event_ids_json) {
-        Ok(m) => m,
-        Err(e) => {
-            warn!("Could not parse alert event_ids_json for edit: {e}");
-            return DwdEditResult::Failed;
-        }
-    };
-
-    let mut all_ok = true;
-    let mut missing_original = false;
-    for room in client.broadcast_rooms() {
-        let room_id = room.room_id().to_string();
-        let Some(event_id_str) = map.get(&room_id) else {
-            continue;
-        };
-        let event_id = match event_id_str.parse::<OwnedEventId>() {
-            Ok(id) => id,
-            Err(e) => {
-                warn!("Invalid event ID {event_id_str} for alert edit: {e}");
-                all_ok = false;
-                continue;
-            }
-        };
-        let edited = RoomMessageEventContent::text_html(new_plain, new_html)
-            .make_replacement(ReplacementMetadata::new(event_id, None));
-        if let Err(e) = room.send(edited).await {
-            error!("Failed to edit alert message in {room_id}: {e}");
-            all_ok = false;
-            if looks_like_missing_matrix_event(&e.to_string()) {
-                missing_original = true;
-            }
-        }
-    }
-    if all_ok {
-        DwdEditResult::Ok
-    } else if missing_original {
-        DwdEditResult::MissingOriginal
-    } else {
-        DwdEditResult::Failed
-    }
+    client.edit(event_ids_json, new_plain, new_html).await
 }
 
 pub(super) fn looks_like_missing_matrix_event(error: &str) -> bool {

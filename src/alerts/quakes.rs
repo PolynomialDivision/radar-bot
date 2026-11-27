@@ -1,11 +1,10 @@
 //! USGS significant earthquakes and GDACS disasters near the reference point.
 
 use anyhow::{Context, Result};
-use mxbot_common::Bot;
 use tracing::{info, warn};
 
 use super::fetch_api;
-use super::post::{concise_sentences, format_alert, post_alert_to_rooms};
+use super::post::{concise_sentences, format_alert, post_alert_to_rooms, AlertRooms};
 use crate::fetch::Http;
 use crate::store::Db;
 
@@ -76,7 +75,7 @@ pub(super) async fn fetch_gdacs(http: &Http) -> Result<Vec<crate::FeedItem>> {
 }
 
 pub(super) async fn check_usgs(
-    client: &Bot,
+    client: &impl AlertRooms,
     http: &Http,
     db: &Db,
     ref_point: Option<(f64, f64)>,
@@ -138,7 +137,7 @@ pub(super) async fn check_usgs(
 }
 
 pub(super) async fn check_gdacs(
-    client: &Bot,
+    client: &impl AlertRooms,
     http: &Http,
     db: &Db,
     ref_point: Option<(f64, f64)>,

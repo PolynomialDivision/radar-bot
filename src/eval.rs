@@ -95,6 +95,7 @@ fn source(entry: &Entry) -> SourceConfig {
         filter: true,
         base_implied_meters: base,
         required,
+        stale_after_days: None,
     }
 }
 

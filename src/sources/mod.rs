@@ -94,11 +94,28 @@ pub enum SourceAdapter {
     // Mastodon(mastodon::MastodonAdapter),
 }
 
+/// What a source answered: its items (after the source's own age filter), and the publish date
+/// of the newest entry it lists (before that filter), which tells a feed that went stale.
+#[derive(Debug, Default)]
+pub(crate) struct Fetched {
+    pub(crate) items: Vec<FeedItem>,
+    pub(crate) newest_entry_at: Option<i64>,
+}
+
+impl From<Vec<FeedItem>> for Fetched {
+    fn from(items: Vec<FeedItem>) -> Self {
+        Fetched {
+            items,
+            newest_entry_at: None,
+        }
+    }
+}
+
 impl SourceAdapter {
-    pub(crate) async fn fetch_items(&self, http: &Http) -> Result<Vec<FeedItem>, SourceError> {
+    pub(crate) async fn fetch_items(&self, http: &Http) -> Result<Fetched, SourceError> {
         match self {
             Self::Rss(a) => a.fetch_items(http).await,
-            Self::Bluesky(a) => a.fetch_items(http).await,
+            Self::Bluesky(a) => a.fetch_items(http).await.map(Fetched::from),
         }
     }
 }
@@ -111,11 +128,13 @@ pub fn build_adapter(source: &SourceConfig, bluesky: Option<&BlueskyContext>) ->
             name: source.name.clone(),
             url: source.url.clone().unwrap_or_default(),
             max_age_hours: source.max_age_hours,
+            search: false,
         }),
         SourceType::GoogleNews => SourceAdapter::Rss(rss::RssAdapter {
             name: source.name.clone(),
             url: google_news_rss_url(&source.name, source.query.as_deref().unwrap_or_default()),
             max_age_hours: source.max_age_hours,
+            search: true,
         }),
         SourceType::Bluesky => {
             let (identifier, password, session) = bluesky

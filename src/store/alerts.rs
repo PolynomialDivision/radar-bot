@@ -21,6 +21,8 @@ pub struct DwdActiveWarning {
     /// DWD start/end timestamps (ms) as last seen. Used to detect time updates.
     pub start_ms: i64,
     pub end_ms: i64,
+    /// When the message was posted (or last replaced), seconds.
+    pub seen_at: i64,
 }
 
 /// The transaction key of an alert occurrence's post, fixed at its first
@@ -38,6 +40,10 @@ pub struct NinaActiveWarning {
     pub event_ids_json: String,
     pub original_plain: String,
     pub original_html: String,
+    /// The severity of the posted version; unknown for rows from before migration 4.
+    pub severity: Option<String>,
+    /// When it was posted or last updated, seconds.
+    pub seen_at: i64,
 }
 
 impl Db {
@@ -147,7 +153,8 @@ impl Db {
         self.0
             .run(move |conn| {
                 let mut stmt = conn.prepare(
-                    "SELECT headline, event_ids_json, original_plain, original_html
+                    "SELECT headline, event_ids_json, original_plain, original_html, severity,
+                        seen_at
                  FROM nina_active_warnings
                  WHERE id = ?1",
                 )?;
@@ -160,7 +167,24 @@ impl Db {
                     event_ids_json: row.get(1)?,
                     original_plain: row.get(2)?,
                     original_html: row.get(3)?,
+                    severity: row.get(4)?,
+                    seen_at: row.get(5)?,
                 }))
+            })
+            .await
+    }
+
+    /// The severity of the version of NINA warning `id` that the rooms show.
+    pub async fn set_nina_severity(&self, id: &str, severity: Option<&str>) -> Result<()> {
+        let id = id.to_owned();
+        let severity = severity.map(str::to_owned);
+        self.0
+            .run(move |conn| {
+                conn.execute(
+                    "UPDATE nina_active_warnings SET severity = ?2 WHERE id = ?1",
+                    params![id, severity],
+                )?;
+                Ok(())
             })
             .await
     }
@@ -231,7 +255,7 @@ impl Db {
             .run(move |conn| {
                 let mut stmt = conn.prepare(
                     "SELECT id, headline, region, event_ids_json, original_plain, original_html,
-                        start_ms, end_ms
+                        start_ms, end_ms, seen_at
                  FROM dwd_active_warnings",
                 )?;
                 let rows = stmt
@@ -245,6 +269,7 @@ impl Db {
                             original_html: row.get(5)?,
                             start_ms: row.get(6)?,
                             end_ms: row.get(7)?,
+                            seen_at: row.get(8)?,
                         })
                     })?
                     .collect::<rusqlite::Result<Vec<_>>>()?;

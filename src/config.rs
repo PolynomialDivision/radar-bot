@@ -79,6 +79,10 @@ pub(crate) struct EmergencyConfig {
     /// Poll interval in seconds (default 120).
     #[serde(default = "default_alert_poll_secs")]
     pub(crate) poll_interval_secs: u64,
+    /// Earthquakes (USGS) and global disasters (GDACS), every 15th round. Off by default:
+    /// within the usual radius they have nothing to report.
+    #[serde(default)]
+    pub(crate) quakes: bool,
 }
 
 impl Default for EmergencyConfig {
@@ -87,6 +91,7 @@ impl Default for EmergencyConfig {
             enabled: true,
             max_distance_km: default_alert_max_distance_km(),
             poll_interval_secs: default_alert_poll_secs(),
+            quakes: false,
         }
     }
 }
@@ -191,6 +196,9 @@ pub(crate) struct SourceConfig {
     /// Set to [] to skip the required check for city-specific sources.
     #[serde(default)]
     pub(crate) required: Option<Vec<String>>,
+    /// A feed whose newest entry is older than this is stale (default 45; not for searches).
+    #[serde(default)]
+    pub(crate) stale_after_days: Option<u64>,
 }
 
 impl SourceConfig {
@@ -284,6 +292,12 @@ pub(crate) struct FilterConfig {
     /// Full address used as the reference point for distance scoring.
     /// Geocoded once at startup via Nominatim.
     pub(crate) reference_address: Option<String>,
+    /// The reference point itself (both or neither): with it, a start needs no geocoder; the
+    /// city, district and postal code are still looked up in the background.
+    #[serde(default)]
+    pub(crate) lat: Option<f64>,
+    #[serde(default)]
+    pub(crate) lon: Option<f64>,
     /// City string appended to Nominatim queries when geocoding street mentions
     /// from articles (e.g. "Berlin, Germany"). Anchors results to the right city.
     #[serde(default)]
@@ -389,6 +403,14 @@ impl Config {
                 "[[filter.area]] #{}: an empty term matches everything",
                 i + 1
             );
+        }
+        match (filter.lat, filter.lon) {
+            (Some(lat), Some(lon)) => ensure!(
+                (-90.0..=90.0).contains(&lat) && (-180.0..=180.0).contains(&lon),
+                "[filter] lat {lat} / lon {lon} is no coordinate"
+            ),
+            (None, None) => {}
+            _ => bail!("[filter] lat and lon go together"),
         }
         for place in &filter.places {
             ensure!(
@@ -593,5 +615,16 @@ mod tests {
         assert_eq!(slug("Polizei Berlin"), "polizei-berlin");
         assert_eq!(slug("  Bluesky #YourCity "), "bluesky-yourcity");
         assert_eq!(slug("Straßen & Plätze!"), "straßen-plätze");
+    }
+
+    #[test]
+    fn a_reference_point_needs_both_coordinates() {
+        let mut config = example();
+        config.filter.lat = Some(52.47);
+        assert!(format!("{:#}", config.validate().unwrap_err()).contains("go together"));
+        config.filter.lon = Some(13.42);
+        config.validate().unwrap();
+        config.filter.lon = Some(213.42);
+        assert!(format!("{:#}", config.validate().unwrap_err()).contains("no coordinate"));
     }
 }

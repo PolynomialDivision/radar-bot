@@ -107,7 +107,12 @@ pub(crate) fn format_digest(items: &[DigestItem], header: &str) -> (String, Stri
             .as_deref()
             .map(|note| format!(" <em>({})</em>", html_escape(note)))
             .unwrap_or_default();
-        if let Some(link) = item.link.as_deref() {
+        // Only web links: anything else a feed carries (`javascript:`, `data:`) is dropped.
+        let link = item
+            .link
+            .as_deref()
+            .filter(|link| link.starts_with("https://") || link.starts_with("http://"));
+        if let Some(link) = link {
             plain.push(format!("🔗 {link}{note_p}"));
             html.push(format!(
                 "🔗 <a href=\"{}\">Open</a>{note_h}",
@@ -1242,5 +1247,18 @@ mod tests {
         assert_eq!(promoted, 2);
         assert_eq!(items.len(), 2);
         assert!(items.iter().all(|item| item.score >= 3));
+    }
+
+    #[test]
+    fn only_web_links_are_rendered() {
+        let item = |link: &str| DigestItem::from_db(db_item("g", "Feed", "Titel", link));
+
+        let (plain, html) = format_digest(&[item("javascript:alert(1)")], "Digest");
+        assert!(
+            !html.contains("href") && !plain.contains("javascript"),
+            "{html}"
+        );
+        let (_, html) = format_digest(&[item("https://example.com/a")], "Digest");
+        assert!(html.contains("href=\"https://example.com/a\""), "{html}");
     }
 }

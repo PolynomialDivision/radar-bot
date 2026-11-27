@@ -15,7 +15,7 @@ use std::{
 };
 
 use anyhow::{bail, Result};
-use mxbot_common::{supervise::Alive, Bot};
+use mxbot_common::supervise::Alive;
 use tokio::time::sleep;
 use tracing::warn;
 
@@ -23,14 +23,15 @@ use crate::fetch::{FetchError, Http, Response};
 use crate::store::Db;
 use dwd::check_dwd_weather_warnings;
 use nina::check_nina;
+pub(crate) use post::AlertRooms;
 use quakes::{check_gdacs, check_usgs};
 
 const DWD_ACTIVE_RECONCILE_INTERVAL: Duration = Duration::from_secs(60 * 60);
 
 pub struct AlertConfig {
-    /// AGS resolved at startup from ref_point. None = outside Germany, skip NINA.
-    pub nina_ags: Option<String>,
-    pub ref_point: Option<(f64, f64)>,
+    /// The home profile, once known: its point for the DWD cell test, its region for NINA.
+    /// Until then DWD runs without the cell test (it fails open) and NINA waits.
+    pub home: tokio::sync::watch::Receiver<Option<crate::profile::HomeProfile>>,
     /// DWD warning region keywords, e.g. ["Berlin"]. Empty = skip direct DWD warnings.
     pub dwd_region_keywords: Vec<String>,
     /// How long before its start a DWD warning is posted.
@@ -38,18 +39,39 @@ pub struct AlertConfig {
     /// Drop USGS events farther than this from ref_point. None = send all.
     pub max_distance_km: Option<f64>,
     pub poll_interval_secs: u64,
+    /// USGS and GDACS, every [`QUAKE_EVERY`] rounds.
+    pub quakes: bool,
 }
 
-pub async fn alert_loop(client: Bot, http: Http, db: Db, config: AlertConfig, alive: Alive) {
+/// USGS and GDACS are asked every this many rounds (30 minutes at the default 120 s).
+pub(crate) const QUAKE_EVERY: u64 = 15;
+
+/// Whether round `n` (from 0) asks USGS and GDACS.
+pub(crate) fn quake_round(quakes: bool, n: u64) -> bool {
+    quakes && n.is_multiple_of(QUAKE_EVERY)
+}
+
+pub async fn alert_loop(
+    client: impl AlertRooms + Send + 'static,
+    http: Http,
+    db: Db,
+    config: AlertConfig,
+    alive: Alive,
+) {
     let mut dwd_area_cache: HashMap<String, bool> = HashMap::new();
     let mut last_dwd_reconcile: Option<Instant> = None;
 
     alive.expect_every(Duration::from_secs(config.poll_interval_secs));
+    let mut n: u64 = 0;
     loop {
         alive.tick();
         // The checks that failed this round, for the status file.
         let mut failed: Vec<(&str, String)> = Vec::new();
-        if let Some(ref ags) = config.nina_ags {
+        let (ref_point, nina_ags) = match config.home.borrow().as_ref() {
+            Some(home) => (Some(home.point()), home.nina_ags.clone()),
+            None => (None, None),
+        };
+        if let Some(ref ags) = nina_ags {
             if let Err(e) = check_nina(&client, &http, &db, ags).await {
                 warn!("NINA check failed: {e:#}");
                 failed.push(("NINA", format!("{e:#}")));
@@ -64,7 +86,7 @@ pub async fn alert_loop(client: Bot, http: Http, db: Db, config: AlertConfig, al
                 &db,
                 &config.dwd_region_keywords,
                 config.dwd_lead,
-                config.ref_point,
+                ref_point,
                 &mut dwd_area_cache,
                 reconcile_active_messages,
             )
@@ -76,32 +98,22 @@ pub async fn alert_loop(client: Bot, http: Http, db: Db, config: AlertConfig, al
                 last_dwd_reconcile = Some(Instant::now());
             }
         }
-        if let Err(e) = check_usgs(
-            &client,
-            &http,
-            &db,
-            config.ref_point,
-            config.max_distance_km,
-        )
-        .await
-        {
-            warn!("USGS check failed: {e:#}");
-            failed.push(("USGS", format!("{e:#}")));
-        }
-        if let Err(e) = check_gdacs(
-            &client,
-            &http,
-            &db,
-            config.ref_point,
-            config.max_distance_km,
-        )
-        .await
-        {
-            warn!("GDACS check failed: {e:#}");
-            failed.push(("GDACS", format!("{e:#}")));
+        if quake_round(config.quakes, n) {
+            if let Err(e) = check_usgs(&client, &http, &db, ref_point, config.max_distance_km).await
+            {
+                warn!("USGS check failed: {e:#}");
+                failed.push(("USGS", format!("{e:#}")));
+            }
+            if let Err(e) =
+                check_gdacs(&client, &http, &db, ref_point, config.max_distance_km).await
+            {
+                warn!("GDACS check failed: {e:#}");
+                failed.push(("GDACS", format!("{e:#}")));
+            }
         }
         report_round(&alive, &failed);
         sleep(Duration::from_secs(config.poll_interval_secs)).await;
+        n = n.wrapping_add(1);
     }
 }
 

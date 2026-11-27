@@ -40,6 +40,9 @@ pub(crate) struct FeedItem {
     /// Event geo on the page), as (lat, lon).
     #[serde(default)]
     pub(crate) coords: Option<(f64, f64)>,
+    /// The feed marks the item as paid content (`<dcterms:accessRights>paid`): its page is
+    /// not fetched, the item is decided on title and teaser.
+    pub(crate) paywalled: bool,
     /// Street address of an event venue declared on the page (schema.org Event).
     #[serde(default)]
     pub(crate) venue: Option<String>,
@@ -208,11 +211,14 @@ pub(crate) fn parse_feed_entries(
     };
     let feed = feed.map_err(|e| e.to_string())?;
     let coords = feed_item_coords(&xml);
+    let paid = paid_feed_items(&xml);
     Ok(feed
         .entries
         .into_iter()
         .filter_map(|entry| normalize_feed_entry(entry, source_name))
         .map(|mut item| {
+            item.paywalled = paid.contains(&item.guid)
+                || item.link.as_ref().is_some_and(|link| paid.contains(link));
             item.coords = coords.get(&item.guid).copied().or_else(|| {
                 item.link
                     .as_ref()
@@ -222,6 +228,25 @@ pub(crate) fn parse_feed_entries(
             item
         })
         .collect())
+}
+
+/// Feed content that is a long teaser rather than the article: it ends in an ellipsis or in a
+/// "weiterlesen" link.
+pub(crate) fn looks_like_teaser(text: &str) -> bool {
+    let end = text.trim_end().to_lowercase();
+    let tail: String = end
+        .chars()
+        .rev()
+        .take(40)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    end.ends_with('…')
+        || end.ends_with("[…]")
+        || end.ends_with("...")
+        || end.ends_with("[...]")
+        || tail.contains("weiterlesen")
 }
 
 /// The encoding an XML declaration at the start of `bytes` names (`<?xml … encoding="…"?>`).
@@ -294,7 +319,7 @@ pub(crate) fn normalize_feed_entry(
         .as_ref()
         .and_then(|c| c.body.as_deref())
         .map(text_to_plain)
-        .filter(|text| text.chars().count() >= FULL_TEXT_CHARS);
+        .filter(|text| text.chars().count() >= FULL_TEXT_CHARS && !looks_like_teaser(text));
 
     let guid = if entry.id.trim().is_empty() {
         link.clone()
@@ -327,15 +352,8 @@ pub(crate) fn normalize_feed_entry(
 /// link. feed-rs does not expose these extensions.
 pub(crate) fn feed_item_coords(xml: &str) -> HashMap<String, (f64, f64)> {
     let mut map = HashMap::new();
-    for tag in ["item", "entry"] {
-        let open = format!("<{tag}");
-        let close = format!("</{tag}>");
-        for block in xml.split(&open).skip(1) {
-            // Skip e.g. "<itemizedlist": the tag name must end here.
-            if !block.starts_with(['>', ' ', '\n', '\r', '\t']) {
-                continue;
-            }
-            let item = &block[..block.find(&close).unwrap_or(block.len())];
+    for item in feed_item_blocks(xml) {
+        {
             let point = xml_text(item, "georss:point").and_then(|p| {
                 let mut parts = p.split_whitespace().map(str::parse::<f64>);
                 Some((parts.next()?.ok()?, parts.next()?.ok()?))
@@ -346,18 +364,50 @@ pub(crate) fn feed_item_coords(xml: &str) -> HashMap<String, (f64, f64)> {
                 Some((lat, lon))
             });
             let Some(point) = point else { continue };
-            let keys = [
-                xml_text(item, "guid"),
-                xml_text(item, "id"),
-                xml_text(item, "link"),
-                xml_attr_of(item, "link", "href"),
-            ];
-            for key in keys.into_iter().flatten() {
+            for key in feed_item_keys(item) {
                 map.insert(key, point);
             }
         }
     }
     map
+}
+
+/// The raw XML of each `<item>` and `<entry>` of a feed.
+fn feed_item_blocks(xml: &str) -> impl Iterator<Item = &str> {
+    ["item", "entry"].into_iter().flat_map(move |tag| {
+        let open = format!("<{tag}");
+        let close = format!("</{tag}>");
+        xml.split(open.as_str())
+            .skip(1)
+            // Skip e.g. "<itemizedlist": the tag name must end here.
+            .filter(|block| block.starts_with(['>', ' ', '\n', '\r', '\t']))
+            .map(move |block| &block[..block.find(close.as_str()).unwrap_or(block.len())])
+            .collect::<Vec<_>>()
+    })
+}
+
+/// The keys an item is found by: guid or id, link.
+fn feed_item_keys(item: &str) -> Vec<String> {
+    [
+        xml_text(item, "guid"),
+        xml_text(item, "id"),
+        xml_text(item, "link"),
+        xml_attr_of(item, "link", "href"),
+    ]
+    .into_iter()
+    .flatten()
+    .collect()
+}
+
+/// The keys of the items a feed marks as paid content (`<dcterms:accessRights>paid`).
+fn paid_feed_items(xml: &str) -> std::collections::HashSet<String> {
+    feed_item_blocks(xml)
+        .filter(|item| {
+            xml_text(item, "dcterms:accessRights")
+                .is_some_and(|rights| rights.trim().eq_ignore_ascii_case("paid"))
+        })
+        .flat_map(feed_item_keys)
+        .collect()
 }
 
 /// Trimmed text content of the first `<tag …>…</tag>` in `xml`, CDATA unwrapped.
@@ -600,5 +650,44 @@ mod feed_tests {
             let items = parse_feed_entries(&bytes, content_type, "Latin").unwrap();
             assert_eq!(items[0].title, "Sperrung in der Straße", "{case}");
         }
+    }
+
+    #[test]
+    fn a_long_teaser_in_the_feed_is_not_taken_for_the_article() {
+        let long = "Die Polizei sucht Zeugen eines Unfalls in der Britzer Allee. ".repeat(12);
+        let item = |content: &str| {
+            let xml = format!(
+                r#"<rss version="2.0" xmlns:content="http://purl.org/rss/1.0/modules/content/">
+                <channel><title>T</title><item><title>Unfall</title><guid>u1</guid>
+                <content:encoded><![CDATA[{content}]]></content:encoded></item></channel></rss>"#
+            );
+            parse_feed(&xml, "Teaser").remove(0)
+        };
+
+        assert!(item(&long).article_text.is_some());
+        for teaser in [
+            format!("{long}Mehr dazu …"),
+            format!("{long}[…]"),
+            format!("{long}<a href=\"https://example.com/a\">Weiterlesen »</a>"),
+        ] {
+            assert_eq!(item(&teaser).article_text, None, "{teaser:.40}");
+        }
+    }
+
+    #[test]
+    fn items_the_feed_marks_as_paid_are_paywalled() {
+        let xml = r#"<rss version="2.0" xmlns:dcterms="http://purl.org/dc/terms/"><channel>
+            <title>Paper</title>
+            <item><title>Frei</title><guid>a</guid><dcterms:accessRights>free</dcterms:accessRights></item>
+            <item><title>Bezahlt</title><guid>b</guid><dcterms:accessRights>paid</dcterms:accessRights></item>
+            <item><title>Ohne</title><guid>c</guid></item>
+            </channel></rss>"#;
+
+        let paywalled: Vec<bool> = parse_feed(xml, "Paper")
+            .iter()
+            .map(|i| i.paywalled)
+            .collect();
+
+        assert_eq!(paywalled, vec![false, true, false]);
     }
 }

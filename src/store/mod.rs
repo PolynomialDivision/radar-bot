@@ -30,7 +30,12 @@ pub use sources::{SourceHealth, SourcePollStat, FAILING_AFTER};
 pub struct Db(sqlite::Db);
 
 /// Never edit a migration that has shipped: add the next.
-pub(crate) const MIGRATIONS: &Migrations = &[(1, SCHEMA_V1), (2, LEDGER_V2), (3, SOURCE_STATE_V3)];
+pub(crate) const MIGRATIONS: &Migrations = &[
+    (1, SCHEMA_V1),
+    (2, LEDGER_V2),
+    (3, SOURCE_STATE_V3),
+    (4, ROUND_2_V4),
+];
 
 /// How long rows that only record "seen" or "done" are kept: past every feed's memory
 /// (Google News lists results up to nine months old).
@@ -87,7 +92,8 @@ impl Db {
                 )?;
                 n += tx.execute("DELETE FROM alerts WHERE sent_at < ?1", params![seen])?;
                 n += tx.execute(
-                    "DELETE FROM items WHERE state IN ('posted', 'dropped') AND discovered_at < ?1",
+                    "DELETE FROM items WHERE state IN ('posted', 'dropped')
+                         AND COALESCE(last_seen_at, discovered_at) < ?1",
                     params![seen],
                 )?;
                 tx.commit()?;
@@ -376,6 +382,17 @@ const SOURCE_STATE_V3: &str = "
         GROUP BY source_name;
 ";
 
+/// Migration 4: the severity of a posted NINA warning (to see it rise), the newest entry a
+/// source lists and the state last reported to the admins, and when a seen item was last
+/// listed by its feed (retention prunes on that).
+const ROUND_2_V4: &str = "
+    ALTER TABLE nina_active_warnings ADD COLUMN severity TEXT;
+    ALTER TABLE source_state ADD COLUMN newest_entry_at INTEGER;
+    ALTER TABLE source_state ADD COLUMN reported TEXT;
+    ALTER TABLE items ADD COLUMN last_seen_at INTEGER;
+    UPDATE items SET last_seen_at = discovered_at;
+";
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -570,7 +587,8 @@ mod tests {
         drop(Db::open(&fresh).unwrap());
 
         let (old, fresh) = (raw(&old), raw(&fresh));
-        assert_eq!(versions(&old), vec![1, 2, 3]);
+        let all: Vec<i64> = MIGRATIONS.iter().map(|(version, _)| *version).collect();
+        assert_eq!(versions(&old), all);
         assert_eq!(tables(&old), tables(&fresh));
         for table in tables(&fresh).iter().filter(|t| !t.starts_with("idx_")) {
             assert_eq!(columns(&old, table), columns(&fresh, table), "{table}");
@@ -611,6 +629,30 @@ mod tests {
             .unwrap();
         assert!(db.is_done("weather", &slot).await.unwrap());
         assert!(db.has_ledger_rows("weather").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn an_item_its_feed_still_lists_stays_in_the_seen_set() {
+        let (db, _dir) = test_db();
+        let now = chrono::Utc::now().timestamp();
+        let long_ago = now - 500 * 86_400;
+        db.0.with(|conn| {
+            conn.execute_batch(&format!(
+                "INSERT INTO items (guid, source_name, title, discovered_at, state) VALUES
+                     ('listed', 's', 't', {long_ago}, 'dropped'),
+                     ('gone', 's', 't', {long_ago}, 'dropped');"
+            ))?;
+            Ok(())
+        })
+        .unwrap();
+
+        let seen = db.seen_guids(vec!["listed".to_owned()]).await.unwrap();
+        let deleted = db.apply_retention(now).await.unwrap();
+
+        assert!(seen.contains("listed"));
+        assert_eq!(deleted, 1);
+        assert!(!db.is_new("listed").await.unwrap());
+        assert!(db.is_new("gone").await.unwrap());
     }
 
     #[tokio::test]

@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use serde_json::json;
 
@@ -782,4 +782,160 @@ fn the_warning_fixtures_parse_as_today() {
         "{description}"
     );
     assert!(description.contains("💡 Halten Sie Fenster und Türen geschlossen."));
+}
+
+/// The rooms of a test: posts and edits are recorded and succeed.
+#[derive(Default)]
+struct Recorder {
+    posts: std::sync::Mutex<Vec<(String, String, bool)>>,
+    edits: std::sync::Mutex<Vec<String>>,
+}
+
+impl AlertRooms for Recorder {
+    async fn post(
+        &self,
+        alert_key: &str,
+        plain: &str,
+        _html: &str,
+        reply_to: &HashMap<String, String>,
+    ) -> (bool, HashMap<String, String>) {
+        let mut posts = self.posts.lock().unwrap();
+        posts.push((alert_key.to_owned(), plain.to_owned(), !reply_to.is_empty()));
+        let event = format!("$event{}", posts.len());
+        (true, HashMap::from([("!room:test".to_owned(), event)]))
+    }
+
+    async fn edit(&self, _event_ids_json: &str, plain: &str, _html: &str) -> DwdEditResult {
+        self.edits.lock().unwrap().push(plain.to_owned());
+        DwdEditResult::Ok
+    }
+
+    async fn post_untracked(&self, _plain: &str, _html: &str) -> bool {
+        true
+    }
+}
+
+/// A DWD file with one active warning of `level` and `event` for the test city.
+fn dwd_file(level: i64, event: &str, start_ms: i64, end_ms: i64) -> String {
+    let file = json!({
+        "time": start_ms,
+        "warnings": {"100000001": [{
+            "state": "Yourstate", "type": 2, "level": level,
+            "start": start_ms, "end": end_ms,
+            "regionName": "Yourcity", "event": event,
+            "headline": format!("Amtliche WARNUNG vor {event}"),
+            "description": "Es treten Sturmböen auf.", "instruction": "",
+        }]},
+        "vorabInformation": {},
+    });
+    format!("warnWetter.loadWarnings({file});")
+}
+
+#[tokio::test]
+async fn a_warning_that_rises_in_level_is_posted_again_and_a_lower_one_only_edited() {
+    let (db, _dir) = crate::testing::test_db();
+    let rooms = Recorder::default();
+    let now = chrono::Utc::now().timestamp_millis();
+    let (start, end) = (now - 3_600_000, now + 5 * 3_600_000);
+    let mut cache = HashMap::new();
+    let round = |file: String| {
+        let (http, _) = recorded(&[(DWD_WARNINGS_URL, 200, &file)]);
+        (http, file)
+    };
+    let regions = vec!["Yourcity".to_owned()];
+    let lead = std::time::Duration::from_secs(3 * 3600);
+
+    for (level, event) in [
+        (2, "STURMBÖEN"),
+        (3, "SCHWERE STURMBÖEN"),
+        (3, "SCHWERE STURMBÖEN"),
+        (2, "STURMBÖEN"),
+    ] {
+        let (http, _) = round(dwd_file(level, event, start, end));
+        check_dwd_weather_warnings(&rooms, &http, &db, &regions, lead, None, &mut cache, false)
+            .await
+            .unwrap();
+        let posts = rooms.posts.lock().unwrap().len();
+        let edits = rooms.edits.lock().unwrap().len();
+        match (level, posts, edits) {
+            // 2: posted; 3: escalation post and edit; 3 again: nothing; 2: edit only.
+            (2, 1, 0) | (3, 2, 1) | (2, 2, 2) => {}
+            other => panic!("after level {level}: (level, posts, edits) = {other:?}"),
+        }
+    }
+
+    let posts = rooms.posts.lock().unwrap();
+    let (key, plain, is_reply) = &posts[1];
+    assert!(key.ends_with(":up:3"), "{key}");
+    assert!(*is_reply, "the escalation replies to the original");
+    assert!(
+        plain.starts_with("⬆️ 🟠 Starke Warnung: SCHWERE STURMBÖEN"),
+        "{plain}"
+    );
+    assert!(plain.contains("wurde verschärft."), "{plain}");
+    assert_eq!(plain.lines().count(), 3);
+}
+
+#[test]
+fn a_nina_update_escalates_only_when_the_severity_rose() {
+    assert!(nina_severity_rose(Some("Moderate"), Some("Severe")));
+    assert!(nina_severity_rose(Some("Severe"), Some("Extreme")));
+    assert!(!nina_severity_rose(Some("Severe"), Some("Moderate")));
+    assert!(!nina_severity_rose(Some("Severe"), Some("Severe")));
+    // A row from before the severity was stored: the first update has not risen.
+    assert!(!nina_severity_rose(None, Some("Extreme")));
+    assert_eq!(
+        nina_escalation_key("nina:abc:1", "Severe"),
+        "nina:abc:1:up:Severe"
+    );
+    let (plain, _) = format_nina_escalation(
+        &json!({"severity": "Extreme", "effective": "2026-11-27T14:00:00+01:00"}),
+        "Großbrand",
+        0,
+    );
+    assert!(
+        plain.starts_with("⬆️ 🔴 Extreme Gefahr: Großbrand"),
+        "{plain}"
+    );
+}
+
+#[test]
+fn quakes_are_off_by_default_and_asked_every_fifteenth_round() {
+    assert!(!crate::config::EmergencyConfig::default().quakes);
+    let asked: Vec<u64> = (0..31).filter(|n| quake_round(true, *n)).collect();
+    assert_eq!(asked, vec![0, 15, 30]);
+    assert!((0..31).all(|n| !quake_round(false, n)));
+}
+
+#[tokio::test]
+async fn without_a_home_profile_the_dwd_file_is_still_asked_for() {
+    let (db, _dir) = crate::testing::test_db();
+    let recorded = std::sync::Arc::new(Recorded::new());
+    let (_publish, home) = tokio::sync::watch::channel(None);
+    let config = AlertConfig {
+        home,
+        dwd_region_keywords: vec!["Yourcity".to_owned()],
+        dwd_lead: std::time::Duration::from_secs(3 * 3600),
+        max_distance_km: None,
+        poll_interval_secs: 3600,
+        quakes: false,
+    };
+    let alive = mxbot_common::supervise::report("radar alerts, no profile under test");
+
+    let task = tokio::spawn(alert_loop(
+        Recorder::default(),
+        Http::recorded(recorded.clone()),
+        db,
+        config,
+        alive,
+    ));
+    for _ in 0..500 {
+        if !recorded.calls().is_empty() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    task.abort();
+
+    assert_eq!(recorded.calls(), vec![format!("GET {DWD_WARNINGS_URL}")]);
 }

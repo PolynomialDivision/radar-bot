@@ -1,8 +1,7 @@
 use tokio::time::Duration;
 use tracing::{debug, warn};
 
-use super::SourceError;
-use crate::feed::FeedItem;
+use super::{Fetched, SourceError};
 use crate::fetch::Http;
 
 pub struct RssAdapter {
@@ -10,10 +9,12 @@ pub struct RssAdapter {
     pub url: String,
     /// Drop items older than this many hours. None = no limit.
     pub max_age_hours: Option<u64>,
+    /// A search (Google News): an empty answer is a quiet round, not a broken feed.
+    pub search: bool,
 }
 
 impl RssAdapter {
-    pub(crate) async fn fetch_items(&self, http: &Http) -> Result<Vec<FeedItem>, SourceError> {
+    pub(crate) async fn fetch_items(&self, http: &Http) -> Result<Fetched, SourceError> {
         if self.url.trim().is_empty() {
             return Err(SourceError::Malformed("no URL configured".to_owned()));
         }
@@ -27,7 +28,7 @@ impl RssAdapter {
             })?;
         if unchanged && response.status == 304 {
             // Not modified, and nothing kept from before (a restart): no new items.
-            return Ok(Vec::new());
+            return Ok(Fetched::default());
         }
         if !response.is_success() {
             warn!(
@@ -45,6 +46,7 @@ impl RssAdapter {
             &self.name,
         ) {
             Ok(items) if !items.is_empty() => items,
+            Ok(_) if self.search => return Ok(Fetched::default()),
             Ok(_) => {
                 warn!(
                     "RSS '{}' has no entries (HTTP {}, {}, {} bytes)",
@@ -53,7 +55,7 @@ impl RssAdapter {
                     response.content_type(),
                     response.body.len()
                 );
-                return Ok(Vec::new());
+                return Err(SourceError::Malformed("no entries".to_owned()));
             }
             Err(e) => {
                 warn!(
@@ -66,6 +68,7 @@ impl RssAdapter {
             }
         };
 
+        let newest_entry_at = items.iter().filter_map(|item| item.published_at).max();
         if let Some(max_age) = self.max_age_hours {
             let cutoff = chrono::Utc::now().timestamp() - (max_age as i64 * 3600);
             let before = items.len();
@@ -80,6 +83,9 @@ impl RssAdapter {
             }
         }
 
-        Ok(items)
+        Ok(Fetched {
+            items,
+            newest_entry_at,
+        })
     }
 }

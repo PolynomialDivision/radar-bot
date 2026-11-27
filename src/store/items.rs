@@ -28,23 +28,38 @@ pub struct PendingItem {
 }
 
 impl Db {
-    /// The guids of `guids` that were seen before (any state): one query per feed.
+    /// The guids of `guids` that were seen before (any state): one query per feed. Each of them
+    /// is marked as listed now (`last_seen_at`), which keeps it in the seen-set while its feed
+    /// still lists it ([`Db::apply_retention`]).
     pub async fn seen_guids(
         &self,
         guids: Vec<String>,
     ) -> Result<std::collections::HashSet<String>> {
+        let now = chrono::Utc::now().timestamp();
         self.0
             .run(move |conn| {
+                let tx = conn.transaction()?;
                 let mut seen = std::collections::HashSet::new();
                 for chunk in guids.chunks(500) {
                     let marks = vec!["?"; chunk.len()].join(", ");
-                    let mut stmt =
-                        conn.prepare(&format!("SELECT guid FROM items WHERE guid IN ({marks})"))?;
-                    let rows = stmt.query_map(rusqlite::params_from_iter(chunk), |r| r.get(0))?;
-                    for guid in rows {
-                        seen.insert(guid?);
+                    {
+                        let mut stmt =
+                            tx.prepare(&format!("SELECT guid FROM items WHERE guid IN ({marks})"))?;
+                        let rows =
+                            stmt.query_map(rusqlite::params_from_iter(chunk), |r| r.get(0))?;
+                        for guid in rows {
+                            seen.insert(guid?);
+                        }
                     }
+                    let mut params: Vec<&dyn rusqlite::ToSql> = vec![&now];
+                    params.extend(chunk.iter().map(|g| g as &dyn rusqlite::ToSql));
+                    // `?1` is the time; the `?` after it are numbered from 2.
+                    tx.execute(
+                        &format!("UPDATE items SET last_seen_at = ?1 WHERE guid IN ({marks})"),
+                        rusqlite::params_from_iter(params),
+                    )?;
                 }
+                tx.commit()?;
                 Ok(seen)
             })
             .await

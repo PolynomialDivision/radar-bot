@@ -136,6 +136,52 @@ impl Db {
             .await
     }
 
+    /// The publish date of the newest entry the source's last answer listed (when it had a
+    /// dated one).
+    pub async fn record_newest_entry(&self, source_name: &str, newest: i64) -> Result<()> {
+        let name = source_name.to_owned();
+        self.0
+            .run(move |conn| {
+                conn.execute(
+                    "UPDATE source_state SET newest_entry_at = ?2 WHERE source_name = ?1",
+                    params![name, newest],
+                )?;
+                Ok(())
+            })
+            .await
+    }
+
+    /// Per source: the newest entry it lists and the state last reported to the admins.
+    pub async fn source_reports(
+        &self,
+    ) -> Result<std::collections::HashMap<String, (Option<i64>, Option<String>)>> {
+        self.0
+            .run(|conn| {
+                let mut stmt = conn
+                    .prepare("SELECT source_name, newest_entry_at, reported FROM source_state")?;
+                let rows = stmt
+                    .query_map([], |r| Ok((r.get(0)?, (r.get(1)?, r.get(2)?))))?
+                    .collect::<rusqlite::Result<_>>()?;
+                Ok(rows)
+            })
+            .await
+    }
+
+    /// The state of the source as last reported to the admins.
+    pub async fn set_reported(&self, source_name: &str, state: &str) -> Result<()> {
+        let name = source_name.to_owned();
+        let state = state.to_owned();
+        self.0
+            .run(move |conn| {
+                conn.execute(
+                    "UPDATE source_state SET reported = ?2 WHERE source_name = ?1",
+                    params![name, state],
+                )?;
+                Ok(())
+            })
+            .await
+    }
+
     /// How every source that was ever polled is doing.
     pub async fn source_health(&self) -> Result<Vec<SourceHealth>> {
         self.0
