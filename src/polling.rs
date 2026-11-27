@@ -369,15 +369,29 @@ pub(crate) async fn poll_once(
     }
 
     let now = chrono::Utc::now().timestamp();
+    let mut results = Vec::with_capacity(sources.len());
     while let Some(res) = source_tasks.join_next().await {
-        let (source, result) = match res {
-            Ok(v) => v,
+        match res {
+            Ok(v) => results.push(v),
             Err(e) => {
                 warn!("Source fetch task panicked: {e}");
                 summary.panicked += 1;
-                continue;
             }
-        };
+        }
+    }
+    // Every source unreachable: the network is down, not the sources. The round does not
+    // count against them.
+    let unreachable = !results.is_empty()
+        && summary.panicked == 0
+        && results
+            .iter()
+            .all(|(_, result)| matches!(result, Err(SourceError::Unavailable(_))));
+    if unreachable {
+        warn!("No source reachable this round");
+        mxbot_common::supervise::report("radar sources").failed("no source reachable");
+        return summary;
+    }
+    for (source, result) in results {
         let items = match result {
             Ok(items) => items,
             Err(e) => {
@@ -395,7 +409,17 @@ pub(crate) async fn poll_once(
         summary.fetched += items.len();
 
         let guids = items.iter().map(|item| item.guid.clone()).collect();
-        let seen = db.seen_guids(guids).await.unwrap_or_default();
+        let seen = match db.seen_guids(guids).await {
+            Ok(seen) => seen,
+            Err(e) => {
+                // Without the seen-set every item would look new: skip the source this round.
+                warn!(
+                    "Skipping '{}' this round, the seen-check failed: {e:#}",
+                    source.name
+                );
+                continue;
+            }
+        };
         let new: Vec<FeedItem> = items
             .into_iter()
             .filter(|item| !seen.contains(&item.guid))
@@ -413,16 +437,20 @@ pub(crate) async fn poll_once(
     // Spawn one task per item: article fetches and geocoding run in parallel.
     // Geocoding tasks share the NominatimLimiter so total Nominatim traffic stays ≤ 1 req/s.
     let mut tasks: JoinSet<ProcessOutcome> = JoinSet::new();
+    // What a task is about, for when it panics and returns nothing.
+    let mut in_task: HashMap<tokio::task::Id, (FeedItem, u32)> = HashMap::new();
     let n_pending = pending.len();
     summary.new_items = n_pending;
     for (source, item) in pending {
         let attempts = db.retry_attempts(&item.guid).await.unwrap_or(0);
-        tasks.spawn(process_item(
+        let about = item.clone();
+        let handle = tasks.spawn(process_item(
             ctx.clone(),
             source,
             item,
             decide_now || attempts >= MAX_RETRY_ATTEMPTS,
         ));
+        in_task.insert(handle.id(), (about, attempts));
     }
     if n_pending > 0 {
         info!("Processing {} new item(s) in parallel...", n_pending);
@@ -456,9 +484,9 @@ pub(crate) async fn poll_once(
     let mut drop_reasons: HashMap<String, usize> = HashMap::new();
     let mut retry_reasons: HashMap<String, usize> = HashMap::new();
 
-    while let Some(res) = tasks.join_next().await {
+    while let Some(res) = tasks.join_next_with_id().await {
         n_done_shared.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        match res {
+        match res.map(|(_, outcome)| outcome) {
             Ok(ProcessOutcome::Queued(item)) => {
                 *passed_by_source
                     .entry(item.source_name.clone())
@@ -494,7 +522,12 @@ pub(crate) async fn poll_once(
                 *retry_reasons.entry(reason).or_default() += 1;
                 db.record_retry(&item.guid).await.ok();
             }
-            Err(e) => warn!("Item task panicked: {e}"),
+            Err(e) => {
+                warn!("Item task panicked: {e}");
+                if let Some((item, attempts)) = in_task.remove(&e.id()) {
+                    item_panicked(db, &item, attempts, decide_now).await;
+                }
+            }
         }
     }
     ticker.abort();
@@ -533,6 +566,25 @@ pub(crate) async fn poll_once(
         info!("Retry reason: {count} item(s): {reason}");
     }
     summary
+}
+
+/// An item whose task panicked: counted like a retry, and after [`MAX_RETRY_ATTEMPTS`] (or in
+/// a round that decides everything) recorded as dropped, so that it is not processed again.
+async fn item_panicked(db: &Db, item: &FeedItem, attempts: u32, decide_now: bool) {
+    if let Err(e) = db.record_retry(&item.guid).await {
+        warn!("Failed to count the panic of {:?}: {e:#}", item.title);
+    }
+    if decide_now || attempts + 1 >= MAX_RETRY_ATTEMPTS {
+        db.insert_dropped(
+            &item.guid,
+            &item.source_name,
+            &item.title,
+            item.link.as_deref(),
+            "panicked while processing",
+        )
+        .await
+        .ok();
+    }
 }
 
 /// The configured sources that are failing (with their last error), and those that are silent.
@@ -1104,5 +1156,76 @@ mod tests {
             .await
             .unwrap()
             .contains("big-1"));
+    }
+
+    fn police_feed() -> String {
+        crate::testing::fixture("feeds/police_title_only.xml")
+    }
+
+    #[tokio::test]
+    async fn a_failing_seen_check_skips_the_source_for_the_round() {
+        let (db, dir) = crate::testing::test_db();
+        mxbot_common::sqlite::rusqlite::Connection::open(dir.path().join("items.db"))
+            .unwrap()
+            .execute_batch("DROP TABLE items")
+            .unwrap();
+        let recorded =
+            Arc::new(crate::fetch::Recorded::new().route("https://ok.test/", 200, &police_feed()));
+        let sources = [feed("Fine Feed", "https://ok.test/rss")];
+        let ctx = PollCtx::new(Http::recorded(recorded.clone()), filter(), None);
+
+        let summary = poll_once(&ctx, &db, &sources, None, true).await;
+
+        assert_eq!(summary.new_items, 0);
+        assert_eq!(recorded.calls(), vec!["GET https://ok.test/rss"]);
+        assert!(db.source_health().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_round_without_any_reachable_source_does_not_count_against_them() {
+        let (db, _dir) = crate::testing::test_db();
+        let sources = [
+            feed("Feed A", "https://a.test/rss"),
+            feed("Feed B", "https://b.test/rss"),
+        ];
+
+        rounds(&Http::offline(), &sources, &db, 6).await;
+
+        // (`radar sources` then says "no source reachable"; other tests report the same task
+        // concurrently, so it is not asserted here.)
+        assert!(db.source_health().await.unwrap().is_empty());
+
+        // One reachable source: the other one's failure counts.
+        let http = Http::recorded(Arc::new(crate::fetch::Recorded::new().route(
+            "https://a.test/",
+            200,
+            &police_feed(),
+        )));
+        rounds(&http, &sources, &db, 1).await;
+        let health = db.source_health().await.unwrap();
+        let b = health.iter().find(|h| h.source_name == "Feed B").unwrap();
+        assert_eq!(b.consecutive_failures, 1);
+    }
+
+    #[tokio::test]
+    async fn an_item_that_keeps_panicking_is_dropped_after_the_last_attempt() {
+        let (db, _dir) = crate::testing::test_db();
+        let item = report("Kaputt", "");
+
+        for attempts in 0..MAX_RETRY_ATTEMPTS - 1 {
+            item_panicked(&db, &item, attempts, false).await;
+            assert!(db
+                .seen_guids(vec![item.guid.clone()])
+                .await
+                .unwrap()
+                .is_empty());
+        }
+        item_panicked(&db, &item, MAX_RETRY_ATTEMPTS - 1, false).await;
+
+        assert!(db
+            .seen_guids(vec![item.guid.clone()])
+            .await
+            .unwrap()
+            .contains(&item.guid));
     }
 }

@@ -1,12 +1,12 @@
 //! USGS significant earthquakes and GDACS disasters near the reference point.
 
-use std::time::Duration;
-
 use anyhow::{Context, Result};
 use mxbot_common::Bot;
 use tracing::{info, warn};
 
+use super::fetch_api;
 use super::post::{concise_sentences, format_alert, post_alert_to_rooms};
+use crate::fetch::Http;
 use crate::store::Db;
 
 pub(super) fn format_usgs_description(f: &serde_json::Value) -> String {
@@ -60,28 +60,29 @@ pub(super) fn format_gdacs_description(
     lines.join("\n")
 }
 
+/// The significant earthquakes of the last day (USGS GeoJSON).
+pub(super) async fn fetch_usgs(http: &Http) -> Result<serde_json::Value> {
+    let url = "https://earthquake.usgs.gov/earthquakes/feed/v1.0/summary/significant_day.geojson";
+    let body = fetch_api(http, url, "USGS").await?.body;
+    serde_json::from_str(&body).context("USGS JSON parse failed")
+}
+
+/// The items of the GDACS feed (a feed the parser cannot read yields none, as before).
+pub(super) async fn fetch_gdacs(http: &Http) -> Result<Vec<crate::FeedItem>> {
+    let xml = fetch_api(http, "https://www.gdacs.org/xml/rss.xml", "GDACS")
+        .await?
+        .body;
+    Ok(crate::parse_feed(&xml, "GDACS"))
+}
+
 pub(super) async fn check_usgs(
     client: &Bot,
-    http: &reqwest::Client,
+    http: &Http,
     db: &Db,
     ref_point: Option<(f64, f64)>,
     max_distance_km: Option<f64>,
 ) -> Result<()> {
-    let body = tokio::time::timeout(
-        Duration::from_secs(15),
-        http.get(
-            "https://earthquake.usgs.gov/earthquakes/feed/v1.0/summary/significant_day.geojson",
-        )
-        .send(),
-    )
-    .await
-    .context("USGS fetch timed out")?
-    .context("USGS request failed")?
-    .text()
-    .await
-    .context("USGS response read failed")?;
-
-    let json: serde_json::Value = serde_json::from_str(&body).context("USGS JSON parse failed")?;
+    let json = fetch_usgs(http).await?;
     let empty = vec![];
     let features = json["features"].as_array().unwrap_or(&empty);
     let cutoff_ms = (chrono::Utc::now().timestamp() - 48 * 3600) * 1000;
@@ -138,25 +139,15 @@ pub(super) async fn check_usgs(
 
 pub(super) async fn check_gdacs(
     client: &Bot,
-    http: &reqwest::Client,
+    http: &Http,
     db: &Db,
     ref_point: Option<(f64, f64)>,
     max_distance_km: Option<f64>,
 ) -> Result<()> {
-    let xml = tokio::time::timeout(
-        Duration::from_secs(15),
-        http.get("https://www.gdacs.org/xml/rss.xml").send(),
-    )
-    .await
-    .context("GDACS fetch timed out")?
-    .context("GDACS request failed")?
-    .text()
-    .await
-    .context("GDACS response read failed")?;
-
+    let items = fetch_gdacs(http).await?;
     let cutoff = chrono::Utc::now().timestamp() - 48 * 3600;
 
-    for item in crate::parse_feed(&xml, "GDACS") {
+    for item in items {
         // Green = routine monitoring, not actionable. Only send Orange and Red.
         if item.title.to_lowercase().starts_with("green") {
             continue;

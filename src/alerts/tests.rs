@@ -5,8 +5,105 @@ use serde_json::json;
 use super::dwd::*;
 use super::nina::*;
 use super::post::*;
+use super::quakes::{fetch_gdacs, fetch_usgs};
 use super::*;
+use crate::fetch::Recorded;
 use crate::store::PostKey;
+
+fn recorded(routes: &[(&str, u16, &str)]) -> (Http, std::sync::Arc<Recorded>) {
+    let recorded = routes
+        .iter()
+        .fold(Recorded::new(), |r, (prefix, status, body)| {
+            r.route(prefix, *status, body)
+        });
+    let recorded = std::sync::Arc::new(recorded);
+    (Http::recorded(recorded.clone()), recorded)
+}
+
+#[tokio::test]
+async fn a_failing_dwd_file_is_an_error_of_the_dwd_check() {
+    use mxbot_common::supervise::{report, snapshot};
+    let (http, _) = recorded(&[(DWD_WARNINGS_URL, 500, "<html>Internal Server Error</html>")]);
+
+    let error = fetch_dwd_warnings(&http).await.unwrap_err();
+    let alive = report("radar alerts, DWD under test");
+    report_round(&alive, &[("DWD", format!("{error:#}"))]);
+
+    assert!(format!("{error:#}").contains("HTTP 500"), "{error:#}");
+    let task = snapshot()
+        .into_iter()
+        .find(|t| t.name == "radar alerts, DWD under test")
+        .unwrap();
+    assert!(task
+        .last_err_reason
+        .as_deref()
+        .is_some_and(|r| r.starts_with("DWD check failed")));
+}
+
+#[tokio::test]
+async fn an_unchanged_dwd_file_is_the_last_one_again() {
+    let file = crate::testing::fixture("warnings/dwd_warnings.json");
+    let recorded = std::sync::Arc::new(
+        Recorded::new()
+            .route(DWD_WARNINGS_URL, 200, &file)
+            .with_etag("\"w1\""),
+    );
+    let http = Http::recorded(recorded.clone());
+    let (db, _dir) = crate::testing::test_db();
+    let active_before = db.list_active_dwd_warnings().await.unwrap().len();
+
+    let first = fetch_dwd_warnings(&http).await.unwrap();
+    let second = fetch_dwd_warnings(&http).await.unwrap();
+
+    assert_eq!(first, second);
+    assert_eq!(
+        recorded.calls().len(),
+        2,
+        "the second request was answered 304"
+    );
+    assert_eq!(
+        db.list_active_dwd_warnings().await.unwrap().len(),
+        active_before
+    );
+}
+
+#[tokio::test]
+async fn warning_and_forecast_fetches_refuse_bad_answers() {
+    let nina = crate::testing::fixture("warnings/nina_dashboard.json");
+    let dashboard = "https://warnung.bund.de/api31/dashboard/";
+    let (http, _) = recorded(&[(dashboard, 200, &nina)]);
+    assert!(fetch_nina_dashboard(&http, "110000000000")
+        .await
+        .unwrap()
+        .is_array());
+    for (status, body) in [
+        (503, "busy"),
+        (200, "{\"not\": \"a list\"}"),
+        (200, "<html>"),
+    ] {
+        let (http, _) = recorded(&[(dashboard, status, body)]);
+        assert!(
+            fetch_nina_dashboard(&http, "110000000000").await.is_err(),
+            "NINA {status} {body}"
+        );
+    }
+
+    let usgs = "https://earthquake.usgs.gov/";
+    let (http, _) = recorded(&[(usgs, 200, "{\"features\": []}")]);
+    assert!(fetch_usgs(&http).await.is_ok());
+    let (http, _) = recorded(&[(usgs, 502, "{\"features\": []}")]);
+    assert!(fetch_usgs(&http).await.is_err());
+
+    let gdacs = "https://www.gdacs.org/";
+    let rss = "<rss version=\"2.0\"><channel><title>G</title><item><title>Flood</title>\
+               <guid>g1</guid></item></channel></rss>";
+    let (http, _) = recorded(&[(gdacs, 200, rss)]);
+    assert_eq!(fetch_gdacs(&http).await.unwrap().len(), 1);
+    let (http, _) = recorded(&[(gdacs, 404, rss)]);
+    assert!(fetch_gdacs(&http).await.is_err());
+    let (http, _) = recorded(&[]);
+    assert!(fetch_gdacs(&http).await.is_err());
+}
 
 #[test]
 fn alert_rounds_are_reported_for_the_status_file() {

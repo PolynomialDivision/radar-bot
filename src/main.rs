@@ -9,6 +9,8 @@ mod feed;
 mod fetch;
 mod filter;
 mod geo;
+#[cfg(test)]
+mod hostile_input;
 mod polling;
 mod profile;
 mod sources;
@@ -38,12 +40,10 @@ use std::sync::Arc;
 use store::Db;
 
 use anyhow::Result;
-use chrono::{NaiveTime, Timelike};
 use mxbot_common::command::{Commands, Parsed, Spec};
 use mxbot_common::{
     admin::Dispatch,
     clock::Zone,
-    config::TimeOfDay,
     matrix_sdk::{
         deserialized_responses::EncryptionInfo,
         ruma::events::room::message::{
@@ -174,10 +174,12 @@ async fn source_counts_reply(db: &Db, args: &str) -> String {
     }
 }
 
-/// The command line: `radar-bot [--dry-run [--fixtures DIR] [--db FILE]] [CONFIG.toml]`.
+/// The command line: `radar-bot [--dry-run [--fixtures DIR] [--db FILE]] [CONFIG.toml]`, or
+/// `radar-bot --check-config CONFIG.toml`.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct Args {
     pub(crate) config: PathBuf,
+    pub(crate) check_config: bool,
     pub(crate) dry_run: bool,
     pub(crate) fixtures: Option<PathBuf>,
     pub(crate) db: Option<PathBuf>,
@@ -187,6 +189,7 @@ impl Args {
     pub(crate) fn parse(args: impl IntoIterator<Item = String>) -> Result<Self> {
         let mut parsed = Args {
             config: PathBuf::from("config.toml"),
+            check_config: false,
             dry_run: false,
             fixtures: None,
             db: None,
@@ -196,6 +199,7 @@ impl Args {
         while let Some(arg) = args.next() {
             match arg.as_str() {
                 "--dry-run" => parsed.dry_run = true,
+                "--check-config" => parsed.check_config = true,
                 "--fixtures" | "--db" => {
                     let value = args
                         .next()
@@ -210,12 +214,15 @@ impl Args {
                     config = Some(PathBuf::from(arg));
                 }
                 _ => anyhow::bail!(
-                    "unknown argument {arg:?}; usage: radar-bot [--dry-run [--fixtures DIR] [--db FILE]] [CONFIG.toml]"
+                    "unknown argument {arg:?}; usage: radar-bot [--dry-run [--fixtures DIR] [--db FILE]] [CONFIG.toml] | --check-config CONFIG.toml"
                 ),
             }
         }
         if !parsed.dry_run && (parsed.fixtures.is_some() || parsed.db.is_some()) {
             anyhow::bail!("--fixtures and --db only go with --dry-run");
+        }
+        if parsed.check_config && (parsed.dry_run || config.is_none()) {
+            anyhow::bail!("--check-config takes a configuration file and nothing else");
         }
         if let Some(config) = config {
             parsed.config = config;
@@ -224,13 +231,40 @@ impl Args {
     }
 }
 
-/// The HTTP client for sources, article pages and the public APIs.
+/// The HTTP client under [`Http`]: no redirects of its own ([`Http`] follows them, one hop at
+/// a time), the User-Agent set per request.
 pub(crate) fn http_client() -> Result<reqwest::Client> {
     Ok(reqwest::Client::builder()
-        .user_agent("Mozilla/5.0 (compatible; radar-bot/0.1)")
+        .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(std::time::Duration::from_secs(10))
         .timeout(std::time::Duration::from_secs(60))
         .build()?)
+}
+
+/// `--check-config`: the configuration loads and validates; one line per source. No network,
+/// no store.
+fn check_config(path: &std::path::Path) -> Result<()> {
+    let config: Config = mxbot_common::config::load_toml(path)?;
+    config.validate()?;
+    for source in &config.sources {
+        println!("{}", source_line(source));
+    }
+    println!(
+        "{}: {} source(s), valid",
+        path.display(),
+        config.sources.len()
+    );
+    Ok(())
+}
+
+/// A source for `--check-config`: its type, id and name.
+fn source_line(source: &SourceConfig) -> String {
+    let kind = match source.source_type {
+        sources::SourceType::Rss => "rss",
+        sources::SourceType::GoogleNews => "google_news",
+        sources::SourceType::Bluesky => "bluesky",
+    };
+    format!("{kind:<12} {:<32} {}", source.id(), source.name)
 }
 
 /// The reference point of `profile` (none: distance scoring off), with its district (Bezirk)
@@ -273,6 +307,13 @@ pub(crate) fn bluesky_context(config: &Config) -> Option<sources::BlueskyContext
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse(std::env::args().skip(1))?;
+    if args.check_config {
+        if let Err(e) = check_config(&args.config) {
+            eprintln!("{}: {e:#}", args.config.display());
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
     if args.dry_run {
         dry_run::init_logging();
         let config: Config = mxbot_common::config::load_toml(&args.config)?;
@@ -353,8 +394,7 @@ async fn main() -> Result<()> {
         );
     }
 
-    let client = http_client()?;
-    let http = Http::live(client.clone());
+    let http = Http::live(http_client()?, config.http.agents());
     let bluesky = bluesky_context(&config);
     let dwd_region_keywords = if config.weather.alerts_enabled {
         derive_warning_region_keywords(&config.filter, &config.weather)
@@ -389,7 +429,6 @@ async fn main() -> Result<()> {
     let address = config.filter.reference_address.clone();
     let loops = Loops {
         bot: bot.clone(),
-        client,
         http: http.clone(),
         db: db.clone(),
         zone,
@@ -447,7 +486,6 @@ async fn retention_loop(db: Db, alive: Alive) {
 /// The loops that need the reference point (poll, weather, warnings) and what they run with.
 struct Loops {
     bot: Bot,
-    client: reqwest::Client,
     http: Http,
     db: Db,
     zone: Zone,
@@ -464,7 +502,6 @@ impl Loops {
     fn start(self, profile: Option<profile::HomeProfile>) {
         let Loops {
             bot,
-            client,
             http,
             db,
             zone,
@@ -494,25 +531,16 @@ impl Loops {
                 poll_interval_secs: emergency.poll_interval_secs,
             };
             supervise_ticking("radar alerts", within, |alive| {
-                alerts::alert_loop(bot.clone(), client.clone(), db.clone(), config, alive)
+                alerts::alert_loop(bot.clone(), http.clone(), db.clone(), config, alive)
             });
         }
 
         if weather.enabled {
             if let Some(pt) = ref_point {
-                let post_time_str = weather
-                    .post_time
-                    .clone()
-                    .or_else(|| schedule.digest_times.first().cloned())
-                    .unwrap_or_else(|| "08:00".to_owned());
-                let post_time = {
-                    let mut p = post_time_str.splitn(2, ':');
-                    let h: u32 = p.next().and_then(|s| s.parse().ok()).unwrap_or(8);
-                    let m: u32 = p.next().and_then(|s| s.parse().ok()).unwrap_or(0);
-                    NaiveTime::from_hms_opt(h, m, 0)
-                        .unwrap_or_else(|| NaiveTime::from_hms_opt(8, 0, 0).unwrap())
-                };
-                let post_time = TimeOfDay::new(post_time.hour(), post_time.minute());
+                // Validated at start.
+                let post_time = weather
+                    .forecast_time(&schedule)
+                    .expect("a valid forecast time");
                 let job = weather::weather_job(zone, post_time);
                 // A forecast's run: its fetch (15 s), then the post retried for SEND_FOR.
                 let within = job.stall_after(SEND_FOR + Duration::from_secs(5 * 60));
@@ -520,7 +548,7 @@ impl Loops {
                 supervise_ticking("radar weather", within, |alive| {
                     weather::weather_loop(
                         bot.clone(),
-                        client.clone(),
+                        http.clone(),
                         db.clone(),
                         pt,
                         job,
@@ -590,5 +618,36 @@ mod tests {
             Parsed::Refused(_)
         ));
         assert_eq!(COMMANDS.parse("!weather"), Parsed::NotOurs);
+    }
+
+    #[test]
+    fn check_config_validates_without_network_or_store() {
+        let example = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("config.toml.example");
+        assert!(args(&["--check-config", "c.toml"]).unwrap().check_config);
+        assert!(args(&["--check-config"]).is_err());
+        assert!(args(&["--check-config", "--dry-run", "c.toml"]).is_err());
+
+        check_config(&example).unwrap();
+
+        let typo = std::fs::read_to_string(&example)
+            .unwrap()
+            .replace("digest_threshold = 2", "digest_treshold = 2");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, typo).unwrap();
+        let error = format!("{:#}", check_config(&path).unwrap_err());
+        assert!(error.contains("digest_treshold"), "{error}");
+    }
+
+    #[test]
+    fn check_config_lists_type_id_and_name() {
+        let source: SourceConfig = toml::from_str(
+            "name = \"Local Police\"\ntype = \"rss\"\nurl = \"https://example.com/rss\"",
+        )
+        .unwrap();
+        let line = source_line(&source);
+        assert!(line.starts_with("rss"), "{line}");
+        assert!(line.contains("local-police"), "{line}");
+        assert!(line.ends_with("Local Police"), "{line}");
     }
 }

@@ -789,7 +789,11 @@ pub(crate) async fn fetch_article(http: &Http, url: &str, title: &str) -> Page {
 }
 
 /// Everything the bot reads from a page, parsed once. `None` when it has no text.
-fn read_page(feed_url: &str, html: &str, title: &str) -> Result<Option<ArticleFetch>, TooComplex> {
+pub(crate) fn read_page(
+    feed_url: &str,
+    html: &str,
+    title: &str,
+) -> Result<Option<ArticleFetch>, TooComplex> {
     let doc = parse_page(html)?;
     let text = article_body_in(&doc)?;
     if text.is_empty() {

@@ -14,12 +14,31 @@ use super::post::{
     alert_html_escape, append_allclear_to_warning, concise_sentences, edit_alert_message_in_rooms,
     format_alert, post_alert_to_rooms, DwdEditResult,
 };
+use super::{ensure_success, fetch_api, FETCH_TIMEOUT};
+use crate::fetch::{FetchError, Http};
 use crate::store::{Db, PostKey};
+
+/// The nationwide warnings file.
+pub(super) const DWD_WARNINGS_URL: &str =
+    "https://www.dwd.de/DWD/warnungen/warnapp/json/warnings.json";
+
+/// The DWD warnings file, parsed. It is asked for conditionally: an unchanged file
+/// (`304 Not Modified`) is the last one again, so that the check still sees warnings start and
+/// end on the clock.
+pub(super) async fn fetch_dwd_warnings(http: &Http) -> Result<serde_json::Value> {
+    let (response, _unchanged) = match http.get_api_feed(DWD_WARNINGS_URL, FETCH_TIMEOUT).await {
+        Ok(answer) => answer,
+        Err(FetchError::Timeout) => anyhow::bail!("DWD warnings fetch timed out"),
+        Err(e) => anyhow::bail!("DWD warnings request failed: {e}"),
+    };
+    let response = ensure_success(response, "DWD warnings")?;
+    parse_dwd_jsonp(&response.body).context("DWD warnings JSON parse failed")
+}
 
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn check_dwd_weather_warnings(
     client: &Bot,
-    http: &reqwest::Client,
+    http: &Http,
     db: &Db,
     region_keywords: &[String],
     lead: Duration,
@@ -27,19 +46,7 @@ pub(super) async fn check_dwd_weather_warnings(
     area_cache: &mut HashMap<String, bool>,
     reconcile_active_messages: bool,
 ) -> Result<()> {
-    let body = tokio::time::timeout(
-        Duration::from_secs(15),
-        http.get("https://www.dwd.de/DWD/warnungen/warnapp/json/warnings.json")
-            .send(),
-    )
-    .await
-    .context("DWD warnings fetch timed out")?
-    .context("DWD warnings request failed")?
-    .text()
-    .await
-    .context("DWD warnings response read failed")?;
-
-    let json = parse_dwd_jsonp(&body).context("DWD warnings JSON parse failed")?;
+    let json = fetch_dwd_warnings(http).await?;
     let now_ms = chrono::Utc::now().timestamp_millis();
 
     // Load the previously-posted warnings before scanning the feed.
@@ -678,7 +685,7 @@ pub(super) fn contains_any(haystack: &str, needles: &[&str]) -> bool {
 }
 
 pub(super) async fn dwd_warning_area_contains_point(
-    http: &reqwest::Client,
+    http: &Http,
     warncell_id: &str,
     point: (f64, f64),
     cache: &mut HashMap<String, bool>,
@@ -712,7 +719,7 @@ pub(super) async fn dwd_warning_area_contains_point(
 }
 
 pub(super) async fn fetch_dwd_warning_area(
-    http: &reqwest::Client,
+    http: &Http,
     warncell_id: &str,
 ) -> Result<Option<serde_json::Value>> {
     const DWD_GEOMETRY_LAYERS: &[&str] = &[
@@ -728,13 +735,7 @@ pub(super) async fn fetch_dwd_warning_area(
             "https://maps.dwd.de/geoserver/dwd/ows?service=WFS&version=1.1.0&request=GetFeature&typeName=dwd:{layer}&outputFormat=application/json&CQL_FILTER=WARNCELLID%3D{}",
             crate::url_encode(warncell_id)
         );
-        let body = tokio::time::timeout(Duration::from_secs(15), http.get(&url).send())
-            .await
-            .context("DWD warning-area fetch timed out")?
-            .context("DWD warning-area request failed")?
-            .text()
-            .await
-            .context("DWD warning-area response read failed")?;
+        let body = fetch_api(http, &url, "DWD warning-area").await?.body;
         let json: serde_json::Value =
             serde_json::from_str(&body).context("DWD warning-area JSON parse failed")?;
         if let Some(geometry) = json["features"]

@@ -33,3 +33,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 # No panic = "abort" (unlike the other bots): panics are caught on purpose in
 # each feed and each item (data from outside), one bad entry costs only itself.
 # Its background loops still end the bot on a panic (mxbot_common::supervise).
+
+[dev-dependencies]
+# Tests of the live transport against a local server (fetch.rs only).
+wiremock = "0.6"

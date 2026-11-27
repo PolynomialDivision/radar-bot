@@ -83,7 +83,7 @@ pub struct BlueskyContext {
 // ── Adapter enum ──────────────────────────────────────────────────────────────
 //
 // Each variant wraps a source-specific struct. All structs expose one method:
-//   async fn fetch_items(&self, http: &reqwest::Client) -> Vec<FeedItem>
+//   async fn fetch_items(&self, http: &Http) -> Result<Vec<FeedItem>, SourceError>
 //
 // The enum's own fetch_items dispatches to the right impl. poll_once() only
 // ever calls this method and never needs to know which source type it's talking to.

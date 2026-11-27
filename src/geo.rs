@@ -585,7 +585,7 @@ pub(crate) async fn geocode_location(
          &polygon_geojson=1&polygon_threshold=0.0001"
     );
     let body = http
-        .get(&url, &[("Accept-Language", "de")], NOMINATIM_TIMEOUT)
+        .get_api(&url, &[("Accept-Language", "de")], NOMINATIM_TIMEOUT)
         .await
         .map_err(|_| ())?
         .body;

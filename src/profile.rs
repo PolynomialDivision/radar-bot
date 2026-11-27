@@ -69,7 +69,7 @@ pub(crate) async fn resolve(http: &Http, address: &str) -> Result<HomeProfile, S
         url_encode(address)
     );
     let response = http
-        .get(&url, &[("Accept-Language", "de")], NOMINATIM_TIMEOUT)
+        .get_api(&url, &[("Accept-Language", "de")], NOMINATIM_TIMEOUT)
         .await
         .map_err(|e| format!("geocoder: {e}"))?;
     if !response.is_success() {

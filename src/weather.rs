@@ -1,5 +1,6 @@
 use std::time::Duration;
 
+use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Local, Timelike};
 use mxbot_common::{
     clock::Zone,
@@ -10,6 +11,7 @@ use mxbot_common::{
 };
 use tracing::warn;
 
+use crate::fetch::{FetchError, Http};
 use crate::store::Db;
 
 #[derive(serde::Deserialize, Default, Clone)]
@@ -38,7 +40,7 @@ pub fn weather_job(zone: Zone, post_time: TimeOfDay) -> Job {
 
 pub async fn weather_loop(
     client: Bot,
-    http: reqwest::Client,
+    http: Http,
     db: Db,
     ref_point: (f64, f64),
     job: Job,
@@ -59,12 +61,16 @@ pub async fn weather_loop(
 /// losing the day's forecast.
 async fn post_forecast(
     client: &Bot,
-    http: &reqwest::Client,
+    http: &Http,
     ref_point: (f64, f64),
     provider: &WeatherProvider,
     slot: &Slot,
 ) -> Outcome {
     let now = Local::now();
+    if periods_ahead(now).next().is_none() {
+        // Late in the evening: nothing of the day is left to forecast.
+        return Outcome::Skipped;
+    }
     let rows = match provider {
         WeatherProvider::Brightsky => fetch_brightsky(http, ref_point)
             .await
@@ -73,8 +79,15 @@ async fn post_forecast(
             .await
             .map(|json| openmeteo_rows(&json, now)),
     };
-    let Some((plain, html)) = rows.and_then(|rows| format_message(&rows, now)) else {
-        warn!("Weather forecast fetch failed, trying again later");
+    let rows = match rows {
+        Ok(rows) => rows,
+        Err(e) => {
+            warn!("Weather forecast fetch failed, trying again later: {e:#}");
+            return Outcome::RetryIn(crate::RETRY_AFTER);
+        }
+    };
+    let Some((plain, html)) = format_message(&rows, now) else {
+        warn!("Weather forecast has no period ahead, trying again later");
         return Outcome::RetryIn(crate::RETRY_AFTER);
     };
     let key = format!("radar-bot:weather:{}", slot.key());
@@ -123,10 +136,7 @@ fn periods_ahead(now: DateTime<Local>) -> impl Iterator<Item = u32> {
 
 // ── BrightSky (DWD) ───────────────────────────────────────────────────────────
 
-async fn fetch_brightsky(
-    http: &reqwest::Client,
-    (lat, lon): (f64, f64),
-) -> Option<serde_json::Value> {
+async fn fetch_brightsky(http: &Http, (lat, lon): (f64, f64)) -> Result<serde_json::Value> {
     let date = Local::now().format("%Y-%m-%d").to_string();
     let url = format!("https://api.brightsky.dev/weather?lat={lat}&lon={lon}&date={date}");
     fetch_json(http, &url).await
@@ -179,10 +189,7 @@ fn brightsky_icon(icon: &str) -> (&'static str, &'static str) {
 
 // ── Open-Meteo (fallback) ─────────────────────────────────────────────────────
 
-async fn fetch_openmeteo(
-    http: &reqwest::Client,
-    (lat, lon): (f64, f64),
-) -> Option<serde_json::Value> {
+async fn fetch_openmeteo(http: &Http, (lat, lon): (f64, f64)) -> Result<serde_json::Value> {
     let url = format!(
         "https://api.open-meteo.com/v1/forecast\
          ?latitude={lat}&longitude={lon}\
@@ -234,15 +241,21 @@ fn wmo_icon(code: i64) -> (&'static str, &'static str) {
 
 // ── Shared helpers ────────────────────────────────────────────────────────────
 
-async fn fetch_json(http: &reqwest::Client, url: &str) -> Option<serde_json::Value> {
-    let body = tokio::time::timeout(Duration::from_secs(15), http.get(url).send())
-        .await
-        .ok()?
-        .ok()?
-        .text()
-        .await
-        .ok()?;
-    serde_json::from_str(&body).ok()
+/// `GET url` of a forecast provider as JSON; a failed request or a non-2xx answer is an error.
+async fn fetch_json(http: &Http, url: &str) -> Result<serde_json::Value> {
+    let response = match http.get_api(url, &[], Duration::from_secs(15)).await {
+        Ok(response) => response,
+        Err(FetchError::Timeout) => bail!("forecast fetch timed out"),
+        Err(e) => bail!("forecast request failed: {e}"),
+    };
+    if !response.is_success() {
+        bail!(
+            "forecast answered HTTP {} ({})",
+            response.status,
+            response.content_type()
+        );
+    }
+    serde_json::from_str(&response.body).context("forecast JSON parse failed")
 }
 
 fn period_label(local_hour: u32) -> &'static str {
@@ -420,5 +433,26 @@ mod tests {
             vec![13, 22]
         );
         assert!(rows.iter().all(|r| r.precip_percent.is_none()));
+    }
+
+    #[tokio::test]
+    async fn a_forecast_answer_that_is_no_success_is_an_error() {
+        let point = (52.47, 13.42);
+        let http = |status, body: &str| {
+            Http::recorded(std::sync::Arc::new(crate::fetch::Recorded::new().route(
+                "https://api.brightsky.dev/",
+                status,
+                body,
+            )))
+        };
+
+        assert!(fetch_brightsky(&http(200, "{\"weather\": []}"), point)
+            .await
+            .is_ok());
+        assert!(fetch_brightsky(&http(503, "{\"weather\": []}"), point)
+            .await
+            .is_err());
+        assert!(fetch_brightsky(&http(200, "<html>"), point).await.is_err());
+        assert!(fetch_openmeteo(&Http::offline(), point).await.is_err());
     }
 }

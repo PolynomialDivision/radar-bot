@@ -39,7 +39,11 @@ impl RssAdapter {
             return Err(SourceError::from_status(response.status));
         }
 
-        let mut items = match crate::parse_feed_entries(&response.body, &self.name) {
+        let mut items = match crate::parse_feed_entries(
+            &response.bytes,
+            response.content_type.as_deref(),
+            &self.name,
+        ) {
             Ok(items) if !items.is_empty() => items,
             Ok(_) => {
                 warn!(

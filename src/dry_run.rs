@@ -35,7 +35,7 @@ pub(crate) fn init_logging() {
 pub(crate) async fn run(config: Config, fixtures: Option<&Path>, db: Option<&Path>) -> Result<()> {
     let http = match fixtures {
         Some(dir) => Http::recorded(Arc::new(Recorded::from_dir(dir)?)),
-        None => Http::live(http_client()?),
+        None => Http::live(http_client()?, config.http.agents()),
     };
     let scratch = tempfile::tempdir().context("Creating a temporary directory")?;
     let path = scratch.path().join("items.db");

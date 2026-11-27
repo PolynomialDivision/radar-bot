@@ -4,8 +4,12 @@
 //!
 //! Every request, live or recorded, goes through the same limits: at most
 //! [`MAX_IN_FLIGHT`] at a time and [`MAX_PER_HOST`] per host, so that a poll round with many
-//! new items does not hit one publisher with a burst. Bodies are read up to a cap
-//! ([`MAX_BODY_BYTES`] unless the caller asks for less) and dropped beyond it.
+//! new items does not hit one publisher with a burst. Redirects are followed here, one hop at a
+//! time, so that the limits of the host a redirect leads to apply as well. Bodies are read up
+//! to a cap ([`MAX_BODY_BYTES`] unless the caller asks for less) and dropped beyond it.
+//!
+//! Two User-Agents: services with an API (geocoder, warnings, forecast, structured sources) get
+//! the bot's own name ([`Agents::api`]), feeds and article pages the page agent.
 
 use std::{
     collections::HashMap,
@@ -29,6 +33,41 @@ pub(crate) const MAX_PER_HOST: usize = 2;
 pub(crate) const MAX_BODY_BYTES: usize = 5 * 1024 * 1024;
 /// Body cap for article pages.
 pub(crate) const MAX_PAGE_BYTES: usize = 2 * 1024 * 1024;
+/// Redirects followed for one request.
+const MAX_REDIRECTS: usize = 10;
+
+/// The User-Agents of the two kinds of request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Agents {
+    /// For APIs: identifies the bot (`radar-bot/<version>`), as Nominatim and Overpass ask.
+    pub(crate) api: String,
+    /// For feeds and article pages, which some publishers refuse to unknown bots.
+    pub(crate) page: String,
+}
+
+impl Default for Agents {
+    fn default() -> Self {
+        Agents {
+            api: default_api_agent(),
+            page: default_page_agent(),
+        }
+    }
+}
+
+pub(crate) fn default_api_agent() -> String {
+    format!("radar-bot/{}", env!("CARGO_PKG_VERSION"))
+}
+
+pub(crate) fn default_page_agent() -> String {
+    "Mozilla/5.0 (compatible; radar-bot/0.1)".to_owned()
+}
+
+/// Which agent a request carries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Agent {
+    Api,
+    Page,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "UPPERCASE")]
@@ -37,15 +76,19 @@ pub(crate) enum Method {
     Post,
 }
 
-/// What came back: the status, the content type and the body as text.
+/// What came back: the status, the content type and the body, as text and as it came.
 #[derive(Debug, Clone)]
 pub(crate) struct Response {
     pub(crate) status: u16,
     pub(crate) content_type: Option<String>,
     pub(crate) body: String,
+    /// The body undecoded: feeds name their encoding inside.
+    pub(crate) bytes: Vec<u8>,
     /// The validators of the answer, for a conditional request next time.
     pub(crate) etag: Option<String>,
     pub(crate) last_modified: Option<String>,
+    /// Where a redirect points.
+    location: Option<String>,
 }
 
 impl Response {
@@ -56,6 +99,19 @@ impl Response {
     /// The content type for a log line.
     pub(crate) fn content_type(&self) -> &str {
         self.content_type.as_deref().unwrap_or("no content type")
+    }
+
+    /// The target of a redirect, resolved against `url`.
+    fn redirect_target(&self, url: &str) -> Option<String> {
+        if !matches!(self.status, 301 | 302 | 303 | 307 | 308) {
+            return None;
+        }
+        let location = self.location.as_deref()?;
+        reqwest::Url::parse(url)
+            .ok()?
+            .join(location)
+            .ok()
+            .map(String::from)
     }
 }
 
@@ -82,6 +138,7 @@ impl std::fmt::Display for FetchError {
 #[derive(Clone)]
 pub(crate) struct Http {
     transport: Transport,
+    agents: Arc<Agents>,
     limits: Arc<Limits>,
     /// The last answer of each feed that came with validators ([`Http::get_feed`]).
     feeds: Arc<Mutex<HashMap<String, Response>>>,
@@ -124,10 +181,11 @@ fn host_of(url: &str) -> String {
 }
 
 impl Http {
-    /// The live client.
-    pub(crate) fn live(client: reqwest::Client) -> Self {
+    /// The live client (built without redirects: [`Http`] follows them itself).
+    pub(crate) fn live(client: reqwest::Client, agents: Agents) -> Self {
         Http {
             transport: Transport::Live(client),
+            agents: Arc::new(agents),
             limits: Arc::new(Limits::new()),
             feeds: Arc::default(),
         }
@@ -137,6 +195,7 @@ impl Http {
     pub(crate) fn recorded(recorded: Arc<Recorded>) -> Self {
         Http {
             transport: Transport::Recorded(recorded),
+            agents: Arc::default(),
             limits: Arc::new(Limits::new()),
             feeds: Arc::default(),
         }
@@ -160,8 +219,33 @@ impl Http {
         headers: &[(&str, &str)],
         timeout: Duration,
     ) -> Result<Response, FetchError> {
-        self.send(Method::Get, url, headers, None, timeout, MAX_BODY_BYTES)
-            .await
+        self.send(
+            Agent::Page,
+            Method::Get,
+            url,
+            headers,
+            None,
+            Bounds::new(timeout, MAX_BODY_BYTES),
+        )
+        .await
+    }
+
+    /// [`Http::get`] for an API: with the bot's own User-Agent.
+    pub(crate) async fn get_api(
+        &self,
+        url: &str,
+        headers: &[(&str, &str)],
+        timeout: Duration,
+    ) -> Result<Response, FetchError> {
+        self.send(
+            Agent::Api,
+            Method::Get,
+            url,
+            headers,
+            None,
+            Bounds::new(timeout, MAX_BODY_BYTES),
+        )
+        .await
     }
 
     /// [`Http::get`] with its own body cap.
@@ -172,8 +256,15 @@ impl Http {
         timeout: Duration,
         max_bytes: usize,
     ) -> Result<Response, FetchError> {
-        self.send(Method::Get, url, headers, None, timeout, max_bytes)
-            .await
+        self.send(
+            Agent::Page,
+            Method::Get,
+            url,
+            headers,
+            None,
+            Bounds::new(timeout, max_bytes),
+        )
+        .await
     }
 
     /// [`Http::get`] for a feed that is polled again and again: the request carries the
@@ -183,6 +274,24 @@ impl Http {
     /// first request is unconditional. The flag says whether the answer was not modified.
     pub(crate) async fn get_feed(
         &self,
+        url: &str,
+        timeout: Duration,
+    ) -> Result<(Response, bool), FetchError> {
+        self.conditional(Agent::Page, url, timeout).await
+    }
+
+    /// [`Http::get_feed`] for an API file (the DWD warnings): with the bot's own User-Agent.
+    pub(crate) async fn get_api_feed(
+        &self,
+        url: &str,
+        timeout: Duration,
+    ) -> Result<(Response, bool), FetchError> {
+        self.conditional(Agent::Api, url, timeout).await
+    }
+
+    async fn conditional(
+        &self,
+        agent: Agent,
         url: &str,
         timeout: Duration,
     ) -> Result<(Response, bool), FetchError> {
@@ -201,7 +310,16 @@ impl Http {
                 headers.push(("If-Modified-Since", modified));
             }
         }
-        let response = self.get(url, &headers, timeout).await?;
+        let response = self
+            .send(
+                agent,
+                Method::Get,
+                url,
+                &headers,
+                None,
+                Bounds::new(timeout, MAX_BODY_BYTES),
+            )
+            .await?;
         if response.status == 304 {
             return Ok((cached.unwrap_or(response), true));
         }
@@ -223,46 +341,85 @@ impl Http {
         timeout: Duration,
     ) -> Result<Response, FetchError> {
         self.send(
+            Agent::Page,
             Method::Post,
             url,
             headers,
             Some(body),
-            timeout,
-            MAX_BODY_BYTES,
+            Bounds::new(timeout, MAX_BODY_BYTES),
         )
         .await
     }
 
     async fn send(
         &self,
+        agent: Agent,
         method: Method,
         url: &str,
         headers: &[(&str, &str)],
         body: Option<String>,
-        timeout: Duration,
-        max_bytes: usize,
+        Bounds { timeout, max_bytes }: Bounds,
     ) -> Result<Response, FetchError> {
-        let host = self.limits.host(url);
-        let _host = host.acquire().await.expect("never closed");
-        let _total = self.limits.total.acquire().await.expect("never closed");
-        let request = Request {
-            method,
-            url,
-            headers,
-            body,
-            timeout,
-            max_bytes,
+        let agent = match agent {
+            Agent::Api => self.agents.api.as_str(),
+            Agent::Page => self.agents.page.as_str(),
         };
-        match &self.transport {
-            Transport::Live(client) => live(client, request).await,
-            Transport::Recorded(recorded) => recorded.answer(method, url, headers, max_bytes).await,
+        let mut url = url.to_owned();
+        let mut method = method;
+        let mut body = body;
+        for _ in 0..=MAX_REDIRECTS {
+            let response = {
+                let host = self.limits.host(&url);
+                let _host = host.acquire().await.expect("never closed");
+                let _total = self.limits.total.acquire().await.expect("never closed");
+                let request = Request {
+                    method,
+                    url: &url,
+                    agent,
+                    headers,
+                    body: body.clone(),
+                    timeout,
+                    max_bytes,
+                };
+                match &self.transport {
+                    Transport::Live(client) => live(client, request).await?,
+                    Transport::Recorded(recorded) => {
+                        recorded.answer(method, &url, headers, max_bytes).await?
+                    }
+                }
+            };
+            let Some(target) = response.redirect_target(&url) else {
+                return Ok(response);
+            };
+            if response.status == 303 {
+                method = Method::Get;
+                body = None;
+            }
+            url = target;
         }
+        Err(FetchError::Failed(format!(
+            "more than {MAX_REDIRECTS} redirects"
+        )))
+    }
+}
+
+/// How long a request may take (sending and, separately, reading) and how large its body.
+#[derive(Clone, Copy)]
+struct Bounds {
+    timeout: Duration,
+    max_bytes: usize,
+}
+
+impl Bounds {
+    fn new(timeout: Duration, max_bytes: usize) -> Self {
+        Bounds { timeout, max_bytes }
     }
 }
 
 struct Request<'a> {
     method: Method,
     url: &'a str,
+    agent: &'a str,
     headers: &'a [(&'a str, &'a str)],
     body: Option<String>,
     timeout: Duration,
@@ -274,6 +431,7 @@ async fn live(client: &reqwest::Client, req: Request<'_>) -> Result<Response, Fe
         Method::Get => client.get(req.url),
         Method::Post => client.post(req.url),
     };
+    request = request.header(reqwest::header::USER_AGENT, req.agent);
     for (name, value) in req.headers {
         request = request.header(*name, *value);
     }
@@ -295,6 +453,7 @@ async fn live(client: &reqwest::Client, req: Request<'_>) -> Result<Response, Fe
     let content_type = header(reqwest::header::CONTENT_TYPE);
     let etag = header(reqwest::header::ETAG);
     let last_modified = header(reqwest::header::LAST_MODIFIED);
+    let location = header(reqwest::header::LOCATION);
     let max_bytes = req.max_bytes;
     if response
         .content_length()
@@ -320,28 +479,33 @@ async fn live(client: &reqwest::Client, req: Request<'_>) -> Result<Response, Fe
     .map_err(|_| FetchError::Timeout)??;
     Ok(Response {
         body: decode(&bytes, content_type.as_deref()),
+        bytes,
         status,
         content_type,
         etag,
         last_modified,
+        location,
     })
 }
 
 /// The body as text: the `charset` of the content type, else UTF-8, with a BOM taking
 /// precedence and malformed sequences replaced (as reqwest's `text_with_charset("utf-8")`).
-fn decode(bytes: &[u8], content_type: Option<&str>) -> String {
-    let charset = content_type
-        .and_then(|ct| {
-            ct.split(';')
-                .skip(1)
-                .filter_map(|p| p.split_once('='))
-                .find(|(k, _)| k.trim().eq_ignore_ascii_case("charset"))
-                .map(|(_, v)| v.trim().trim_matches('"').to_owned())
-        })
-        .unwrap_or_else(|| "utf-8".to_owned());
-    let encoding =
-        encoding_rs::Encoding::for_label(charset.as_bytes()).unwrap_or(encoding_rs::UTF_8);
+pub(crate) fn decode(bytes: &[u8], content_type: Option<&str>) -> String {
+    let encoding = content_type
+        .and_then(charset_of)
+        .and_then(|charset| encoding_rs::Encoding::for_label(charset.as_bytes()))
+        .unwrap_or(encoding_rs::UTF_8);
     encoding.decode(bytes).0.into_owned()
+}
+
+/// The `charset` parameter of a content type.
+pub(crate) fn charset_of(content_type: &str) -> Option<String> {
+    content_type
+        .split(';')
+        .skip(1)
+        .filter_map(|p| p.split_once('='))
+        .find(|(k, _)| k.trim().eq_ignore_ascii_case("charset"))
+        .map(|(_, v)| v.trim().trim_matches('"').to_owned())
 }
 
 /// Recorded answers by URL prefix, the first matching route wins. A URL without a route fails
@@ -540,8 +704,10 @@ impl Recorded {
                 status: 304,
                 content_type: None,
                 body: String::new(),
+                bytes: Vec::new(),
                 etag: route.etag.clone(),
                 last_modified: None,
+                location: None,
             });
         }
         if route.body.len() > max_bytes {
@@ -551,8 +717,10 @@ impl Recorded {
             status: route.status,
             content_type: route.content_type.clone(),
             body: route.body.clone(),
+            bytes: route.body.clone().into_bytes(),
             etag: route.etag.clone(),
             last_modified: None,
+            location: None,
         })
     }
 }
@@ -680,5 +848,218 @@ mod tests {
         );
         assert_eq!(second.body, first.body);
         assert_eq!(recorded.calls().len(), 2);
+    }
+}
+
+/// `Http::live` against local servers: the one place where tests open a socket.
+#[cfg(test)]
+mod live_tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use wiremock::matchers::{header, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    fn live() -> Http {
+        Http::live(
+            crate::http_client().unwrap(),
+            Agents {
+                api: "radar-bot/test".to_owned(),
+                page: "Page-Agent/1".to_owned(),
+            },
+        )
+    }
+
+    const SECOND: Duration = Duration::from_secs(1);
+
+    /// A server that answers one request with `chunks` of `chunk` bytes each, chunked and
+    /// without `Content-Length`.
+    async fn chunked_server(chunks: usize, chunk: usize) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = vec![0; 4096];
+            let _ = socket.read(&mut request).await;
+            let head =
+                "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nTransfer-Encoding: chunked\r\n\r\n";
+            if socket.write_all(head.as_bytes()).await.is_err() {
+                return;
+            }
+            let body = vec![b'x'; chunk];
+            for _ in 0..chunks {
+                let size = format!("{chunk:x}\r\n");
+                if socket.write_all(size.as_bytes()).await.is_err()
+                    || socket.write_all(&body).await.is_err()
+                    || socket.write_all(b"\r\n").await.is_err()
+                {
+                    return;
+                }
+            }
+            let _ = socket.write_all(b"0\r\n\r\n").await;
+        });
+        format!("http://{address}/page")
+    }
+
+    #[tokio::test]
+    async fn a_chunked_body_over_the_cap_is_refused_while_reading() {
+        let url = chunked_server(40, 64 * 1024).await;
+
+        let result = live().get_capped(&url, &[], SECOND * 5, 1024 * 1024).await;
+
+        assert_eq!(result.unwrap_err(), FetchError::TooLarge(1024 * 1024));
+    }
+
+    #[tokio::test]
+    async fn a_declared_length_over_the_cap_is_refused_before_reading() {
+        let server = MockServer::start().await;
+        Mock::given(path("/big"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![b'x'; 2 * 1024 * 1024]))
+            .mount(&server)
+            .await;
+
+        let result = live()
+            .get_capped(
+                &format!("{}/big", server.uri()),
+                &[],
+                SECOND * 5,
+                1024 * 1024,
+            )
+            .await;
+
+        assert_eq!(result.unwrap_err(), FetchError::TooLarge(1024 * 1024));
+    }
+
+    #[tokio::test]
+    async fn a_latin_1_body_is_decoded_by_its_charset_and_kept_as_it_came() {
+        let server = MockServer::start().await;
+        Mock::given(path("/feed"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("Content-Type", "text/xml; charset=ISO-8859-1")
+                    .set_body_bytes(b"<t>Stra\xdfe</t>".to_vec()),
+            )
+            .mount(&server)
+            .await;
+
+        let response = live()
+            .get(&format!("{}/feed", server.uri()), &[], SECOND * 5)
+            .await
+            .unwrap();
+
+        assert_eq!(response.body, "<t>Straße</t>");
+        assert_eq!(response.bytes, b"<t>Stra\xdfe</t>");
+    }
+
+    #[tokio::test]
+    async fn an_unchanged_feed_is_asked_for_with_its_etag_and_answered_304() {
+        let server = MockServer::start().await;
+        Mock::given(path("/rss"))
+            .and(header("If-None-Match", "\"v1\""))
+            .respond_with(ResponseTemplate::new(304))
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        Mock::given(path("/rss"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("ETag", "\"v1\"")
+                    .set_body_string("<rss>items</rss>"),
+            )
+            .with_priority(2)
+            .mount(&server)
+            .await;
+        let http = live();
+        let url = format!("{}/rss", server.uri());
+
+        let (first, first_unchanged) = http.get_feed(&url, SECOND * 5).await.unwrap();
+        let (second, second_unchanged) = http.get_feed(&url, SECOND * 5).await.unwrap();
+
+        assert!(!first_unchanged);
+        assert!(second_unchanged, "the second answer was a 304");
+        assert_eq!(second.body, "<rss>items</rss>");
+        assert_eq!(first.body, second.body);
+        assert_eq!(server.received_requests().await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn apis_and_pages_get_their_own_user_agent() {
+        let server = MockServer::start().await;
+        Mock::given(path("/api"))
+            .and(header("User-Agent", "radar-bot/test"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+        Mock::given(path("/page"))
+            .and(header("User-Agent", "Page-Agent/1"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+        let http = live();
+
+        let api = http
+            .get_api(&format!("{}/api", server.uri()), &[], SECOND * 5)
+            .await
+            .unwrap();
+        let page = http
+            .get(&format!("{}/page", server.uri()), &[], SECOND * 5)
+            .await
+            .unwrap();
+
+        assert_eq!((api.status, page.status), (200, 200));
+    }
+
+    #[tokio::test]
+    async fn a_redirect_is_followed_under_the_limit_of_the_host_it_leads_to() {
+        // Two loopback addresses are two hosts.
+        let target = MockServer::builder()
+            .listener(std::net::TcpListener::bind("127.0.0.2:0").unwrap())
+            .start()
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/slow"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string("arrived")
+                    .set_delay(Duration::from_millis(400)),
+            )
+            .mount(&target)
+            .await;
+        let origin = MockServer::start().await;
+        Mock::given(path("/moved"))
+            .respond_with(
+                ResponseTemplate::new(302)
+                    .insert_header("Location", format!("{}/slow", target.uri())),
+            )
+            .mount(&origin)
+            .await;
+        let http = live();
+        let slow = format!("{}/slow", target.uri());
+
+        // Both permits of the target host are taken by direct requests.
+        let direct: Vec<_> = (0..MAX_PER_HOST)
+            .map(|_| {
+                let (http, slow) = (http.clone(), slow.clone());
+                tokio::spawn(async move { http.get(&slow, &[], SECOND * 5).await })
+            })
+            .collect();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let started = std::time::Instant::now();
+        let redirected = http
+            .get(&format!("{}/moved", origin.uri()), &[], SECOND * 5)
+            .await
+            .unwrap();
+        let waited = started.elapsed();
+
+        assert_eq!(
+            (redirected.status, redirected.body.as_str()),
+            (200, "arrived")
+        );
+        assert!(
+            waited >= Duration::from_millis(550),
+            "the redirected request waited for a permit of the target host: {waited:?}"
+        );
+        for request in direct {
+            assert_eq!(request.await.unwrap().unwrap().status, 200);
+        }
     }
 }

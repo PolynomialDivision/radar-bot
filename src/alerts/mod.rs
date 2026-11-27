@@ -14,10 +14,12 @@ use std::{
     time::{Duration, Instant},
 };
 
+use anyhow::{bail, Result};
 use mxbot_common::{supervise::Alive, Bot};
 use tokio::time::sleep;
 use tracing::warn;
 
+use crate::fetch::{FetchError, Http, Response};
 use crate::store::Db;
 use dwd::check_dwd_weather_warnings;
 use nina::check_nina;
@@ -38,13 +40,7 @@ pub struct AlertConfig {
     pub poll_interval_secs: u64,
 }
 
-pub async fn alert_loop(
-    client: Bot,
-    http: reqwest::Client,
-    db: Db,
-    config: AlertConfig,
-    alive: Alive,
-) {
+pub async fn alert_loop(client: Bot, http: Http, db: Db, config: AlertConfig, alive: Alive) {
     let mut dwd_area_cache: HashMap<String, bool> = HashMap::new();
     let mut last_dwd_reconcile: Option<Instant> = None;
 
@@ -107,6 +103,32 @@ pub async fn alert_loop(
         report_round(&alive, &failed);
         sleep(Duration::from_secs(config.poll_interval_secs)).await;
     }
+}
+
+/// How long one request of a warning service may take.
+const FETCH_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// `GET url` of a warning service (`what` names it in errors), with the bot's own User-Agent:
+/// the answer when it is a success or `304 Not Modified`, else an error.
+pub(super) async fn fetch_api(http: &Http, url: &str, what: &str) -> Result<Response> {
+    let response = match http.get_api(url, &[], FETCH_TIMEOUT).await {
+        Ok(response) => response,
+        Err(FetchError::Timeout) => bail!("{what} fetch timed out"),
+        Err(e) => bail!("{what} request failed: {e}"),
+    };
+    ensure_success(response, what)
+}
+
+/// `response` when it is a success, else an error naming `what` and the status.
+pub(super) fn ensure_success(response: Response, what: &str) -> Result<Response> {
+    if !response.is_success() {
+        bail!(
+            "{what} answered HTTP {} ({})",
+            response.status,
+            response.content_type()
+        );
+    }
+    Ok(response)
 }
 
 /// A round of checks for the status file: ok when every check worked, failed (naming the

@@ -166,7 +166,7 @@ pub(crate) fn decode_entities(s: &str) -> String {
 
 /// The items of a feed; a feed the parser cannot read is logged and yields none.
 pub(crate) fn parse_feed(xml: &str, source_name: &str) -> Vec<FeedItem> {
-    match parse_feed_entries(xml, source_name) {
+    match parse_feed_entries(xml.as_bytes(), None, source_name) {
         Ok(items) if !items.is_empty() => items,
         Ok(_) => {
             warn!("Feed parser returned no entries for '{source_name}'");
@@ -179,10 +179,35 @@ pub(crate) fn parse_feed(xml: &str, source_name: &str) -> Vec<FeedItem> {
     }
 }
 
-/// The items of a feed, or why it is not one.
-pub(crate) fn parse_feed_entries(xml: &str, source_name: &str) -> Result<Vec<FeedItem>, String> {
-    let feed = feed_rs::parser::parse(xml.as_bytes()).map_err(|e| e.to_string())?;
-    let coords = feed_item_coords(xml);
+/// The items of a feed as it came (`bytes`, with the `Content-Type` it came with), or why it is
+/// not one. The encoding the XML declaration names wins; the header's charset counts only for
+/// a body that declares none.
+pub(crate) fn parse_feed_entries(
+    bytes: &[u8],
+    content_type: Option<&str>,
+    source_name: &str,
+) -> Result<Vec<FeedItem>, String> {
+    let declared = declared_encoding(bytes);
+    let header = content_type
+        .and_then(crate::fetch::charset_of)
+        .and_then(|label| encoding_rs::Encoding::for_label(label.as_bytes()));
+    let (feed, xml) = match (declared, header) {
+        // The parser reads the declaration itself.
+        (Some(encoding), _) => (
+            feed_rs::parser::parse(bytes),
+            encoding.decode(bytes).0.into_owned(),
+        ),
+        (None, Some(encoding)) => {
+            let xml = encoding.decode(bytes).0.into_owned();
+            (feed_rs::parser::parse(xml.as_bytes()), xml)
+        }
+        (None, None) => (
+            feed_rs::parser::parse(bytes),
+            String::from_utf8_lossy(bytes).into_owned(),
+        ),
+    };
+    let feed = feed.map_err(|e| e.to_string())?;
+    let coords = feed_item_coords(&xml);
     Ok(feed
         .entries
         .into_iter()
@@ -197,6 +222,23 @@ pub(crate) fn parse_feed_entries(xml: &str, source_name: &str) -> Result<Vec<Fee
             item
         })
         .collect())
+}
+
+/// The encoding an XML declaration at the start of `bytes` names (`<?xml … encoding="…"?>`).
+fn declared_encoding(bytes: &[u8]) -> Option<&'static encoding_rs::Encoding> {
+    let start = bytes.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(bytes);
+    let start = &start[..start.len().min(200)];
+    let start = start.trim_ascii_start();
+    if !start.starts_with(b"<?xml") {
+        return None;
+    }
+    let declaration = &start[..start.iter().position(|b| *b == b'>')?];
+    let declaration = String::from_utf8_lossy(declaration);
+    let value = declaration.split("encoding").nth(1)?.trim_start();
+    let value = value.strip_prefix('=')?.trim_start();
+    let quote = value.chars().next().filter(|c| *c == '"' || *c == '\'')?;
+    let label = value[1..].split(quote).next()?;
+    encoding_rs::Encoding::for_label(label.trim().as_bytes())
 }
 
 /// Feed text at least this long (characters) is the article itself: its page is not fetched.
@@ -529,5 +571,34 @@ mod feed_tests {
             .link
             .as_deref()
             .is_some_and(|l| l.starts_with("https://news.google.com/rss/articles/")));
+    }
+
+    #[test]
+    fn a_latin_1_feed_is_read_by_its_declaration_or_its_header() {
+        let body = |declaration: &str| {
+            let mut xml = format!(
+                "{declaration}<rss version=\"2.0\"><channel><title>T</title><item>\
+                 <title>Sperrung in der Stra"
+            )
+            .into_bytes();
+            xml.push(0xDF);
+            xml.extend_from_slice(b"e</title><guid>1</guid></item></channel></rss>");
+            xml
+        };
+        let latin_1 = "<?xml version=\"1.0\" encoding=\"ISO-8859-1\"?>";
+        let header = Some("application/rss+xml; charset=ISO-8859-1");
+
+        for (case, bytes, content_type) in [
+            ("header and declaration", body(latin_1), header),
+            ("header only", body(""), header),
+            (
+                "declaration only",
+                body(latin_1),
+                Some("application/rss+xml"),
+            ),
+        ] {
+            let items = parse_feed_entries(&bytes, content_type, "Latin").unwrap();
+            assert_eq!(items[0].title, "Sperrung in der Straße", "{case}");
+        }
     }
 }

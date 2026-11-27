@@ -254,6 +254,17 @@ enabled = true
 # max_distance_km = 200    # USGS/GDACS radius; default 500, e.g. 20000 = worldwide
 poll_interval_secs = 120
 
+# ── Outbound HTTP ─────────────────────────────────────────────────────────────
+# APIs (geocoder, warnings, forecast) get the bot's own name, as their usage
+# policies ask; feeds and article pages a browser-like agent, which some
+# publishers need. Both have defaults.
+# [http]
+# user_agent = "radar-bot/0.1.0"                            # default: radar-bot/<version>
+# page_user_agent = "Mozilla/5.0 (compatible; radar-bot/0.1)"
+#
+# `radar-bot --check-config config.toml` loads and validates a configuration and
+# lists its sources (type, id, name) without network or store; exit 1 on errors.
+
 [security.verification]
 # Users allowed to complete first-time verification. If omitted or empty,
 # an explicit allowed_inviters list is used as the fallback.

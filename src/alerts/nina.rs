@@ -6,11 +6,22 @@ use anyhow::{Context, Result};
 use mxbot_common::Bot;
 use tracing::{info, warn};
 
+use super::fetch_api;
 use super::post::{
     append_allclear_to_warning, concise_sentences, edit_alert_message_in_rooms, format_alert,
     format_rfc3339_validity, post_alert_to_rooms, DwdEditResult,
 };
+use crate::fetch::Http;
 use crate::store::Db;
+
+/// The NINA dashboard of the region `ags`: the warnings now in force, as a JSON array.
+pub(super) async fn fetch_nina_dashboard(http: &Http, ags: &str) -> Result<serde_json::Value> {
+    let url = format!("https://warnung.bund.de/api31/dashboard/{ags}.json");
+    let body = fetch_api(http, &url, "NINA").await?.body;
+    let json: serde_json::Value = serde_json::from_str(&body).context("NINA JSON parse failed")?;
+    anyhow::ensure!(json.is_array(), "NINA response is not an array");
+    Ok(json)
+}
 
 /// The NINA region key (AGS, Amtlicher Gemeindeschlüssel) of a German `city`: built in for a
 /// city-state, else NINA's completion search. `Ok(None)` when NINA does not know the city;
@@ -29,7 +40,7 @@ pub(crate) async fn nina_ags_for_city(
         crate::url_encode(city)
     );
     let response = http
-        .get(&url, &[], Duration::from_secs(15))
+        .get_api(&url, &[], Duration::from_secs(15))
         .await
         .map_err(|e| format!("NINA region search: {e}"))?;
     let results: serde_json::Value = serde_json::from_str(&response.body)
@@ -54,23 +65,8 @@ pub(super) fn known_nina_ags(city: &str) -> Option<&'static str> {
     }
 }
 
-pub(super) async fn check_nina(
-    client: &Bot,
-    http: &reqwest::Client,
-    db: &Db,
-    ags: &str,
-) -> Result<()> {
-    let url = format!("https://warnung.bund.de/api31/dashboard/{ags}.json");
-
-    let body = tokio::time::timeout(Duration::from_secs(15), http.get(&url).send())
-        .await
-        .context("NINA fetch timed out")?
-        .context("NINA request failed")?
-        .text()
-        .await
-        .context("NINA response read failed")?;
-
-    let json: serde_json::Value = serde_json::from_str(&body).context("NINA JSON parse failed")?;
+pub(super) async fn check_nina(client: &Bot, http: &Http, db: &Db, ags: &str) -> Result<()> {
+    let json = fetch_nina_dashboard(http, ags).await?;
     let warnings = json.as_array().context("NINA response is not an array")?;
 
     // The warnings in the feed (without their version), for the post keys.

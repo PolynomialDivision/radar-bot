@@ -23,10 +23,21 @@ pub(crate) struct BlueskySession {
     expires_at: Instant,
 }
 
-pub type SharedSession = Arc<Mutex<Option<BlueskySession>>>;
+/// The session all Bluesky sources share, and when a login last failed.
+#[derive(Default)]
+pub(crate) struct SessionState {
+    current: Option<BlueskySession>,
+    login_failed_at: Option<Instant>,
+}
+
+pub type SharedSession = Arc<Mutex<SessionState>>;
+
+/// After a failed login no source tries again for this long: with wrong credentials every
+/// source of every round would log in otherwise, beyond the service's daily limit.
+const LOGIN_BACKOFF: Duration = Duration::from_secs(15 * 60);
 
 pub fn new_shared_session() -> SharedSession {
-    Arc::new(Mutex::new(None))
+    Arc::default()
 }
 
 // ── Adapter ───────────────────────────────────────────────────────────────────
@@ -46,26 +57,39 @@ impl BlueskyAdapter {
     async fn ensure_token(&self, http: &Http) -> Option<String> {
         let mut lock = self.session.lock().await;
 
-        if let Some(ref sess) = *lock {
+        if let Some(ref sess) = lock.current {
             if sess.expires_at > Instant::now() + Duration::from_secs(300) {
                 return Some(sess.access_jwt.clone());
             }
             if let Some(new_sess) = refresh_session(http, &sess.refresh_jwt).await {
                 let token = new_sess.access_jwt.clone();
-                *lock = Some(new_sess);
+                lock.current = Some(new_sess);
                 return Some(token);
             }
             warn!("Bluesky token refresh failed, re-authenticating");
+        }
+        if lock
+            .login_failed_at
+            .is_some_and(|failed| failed.elapsed() < LOGIN_BACKOFF)
+        {
+            return None;
         }
 
         match create_session(http, &self.identifier, &self.password).await {
             Some(sess) => {
                 let token = sess.access_jwt.clone();
-                *lock = Some(sess);
+                lock.current = Some(sess);
+                lock.login_failed_at = None;
                 Some(token)
             }
             None => {
-                warn!("Bluesky authentication failed for {}", self.identifier);
+                warn!(
+                    "Bluesky authentication failed for {}, next try in {} minutes",
+                    self.identifier,
+                    LOGIN_BACKOFF.as_secs() / 60
+                );
+                lock.current = None;
+                lock.login_failed_at = Some(Instant::now());
                 None
             }
         }
@@ -290,5 +314,31 @@ mod tests {
         assert!(items[0].title.starts_with("Großes Kiezfest am Samstag"));
         assert_eq!(items[0].article_text, items[0].description);
         assert_eq!(items[0].published_at, Some(1_795_169_700));
+    }
+
+    #[tokio::test]
+    async fn a_failed_login_is_not_tried_again_by_the_other_searches() {
+        let recorded = std::sync::Arc::new(crate::fetch::Recorded::new().route(
+            "https://bsky.social/xrpc/com.atproto.server.createSession",
+            401,
+            "{\"error\":\"AuthenticationRequired\"}",
+        ));
+        let http = Http::recorded(recorded.clone());
+        let session = new_shared_session();
+        let search = |name: &str| BlueskyAdapter {
+            name: name.to_owned(),
+            query: name.to_owned(),
+            limit: 25,
+            max_age_hours: 24,
+            identifier: "someone.example".to_owned(),
+            password: "wrong".to_owned(),
+            session: session.clone(),
+        };
+
+        for name in ["#a", "#b", "#c"] {
+            assert!(search(name).fetch_items(&http).await.is_err());
+        }
+
+        assert_eq!(recorded.calls().len(), 1, "{:?}", recorded.calls());
     }
 }

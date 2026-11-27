@@ -25,6 +25,38 @@ pub(crate) struct Config {
     pub(crate) emergency: EmergencyConfig,
     #[serde(default)]
     pub(crate) weather: WeatherConfig,
+    #[serde(default)]
+    pub(crate) http: HttpConfig,
+}
+
+/// `[http]`: the User-Agents of outbound requests.
+#[derive(Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct HttpConfig {
+    /// Sent to APIs (geocoder, warnings, forecast). Default `radar-bot/<version>`.
+    #[serde(default = "crate::fetch::default_api_agent")]
+    pub(crate) user_agent: String,
+    /// Sent to feeds and article pages.
+    #[serde(default = "crate::fetch::default_page_agent")]
+    pub(crate) page_user_agent: String,
+}
+
+impl Default for HttpConfig {
+    fn default() -> Self {
+        Self {
+            user_agent: crate::fetch::default_api_agent(),
+            page_user_agent: crate::fetch::default_page_agent(),
+        }
+    }
+}
+
+impl HttpConfig {
+    pub(crate) fn agents(&self) -> crate::fetch::Agents {
+        crate::fetch::Agents {
+            api: self.user_agent.clone(),
+            page: self.page_user_agent.clone(),
+        }
+    }
 }
 
 #[derive(Deserialize, Default)]
@@ -77,7 +109,7 @@ pub(crate) struct WeatherConfig {
     pub(crate) provider: weather::WeatherProvider,
     /// Time of day to post the forecast (HH:MM, 24h). Defaults to first digest time.
     #[serde(default)]
-    pub(crate) post_time: Option<String>,
+    pub(crate) post_time: Option<TimeOfDay>,
     /// Poll DWD weather warnings and send them immediately through the alert loop.
     #[serde(default = "default_true")]
     pub(crate) alerts_enabled: bool,
@@ -94,6 +126,22 @@ pub(crate) struct WeatherConfig {
 
 pub(crate) fn default_warning_lead_hours() -> u64 {
     3
+}
+
+/// The forecast's time when `[weather] post_time` is not set and there is no digest time.
+const DEFAULT_FORECAST_TIME: TimeOfDay = TimeOfDay { hour: 8, minute: 0 };
+
+impl WeatherConfig {
+    /// When the forecast is posted: `post_time`, else the first digest time, else 08:00.
+    pub(crate) fn forecast_time(&self, schedule: &ScheduleConfig) -> anyhow::Result<TimeOfDay> {
+        match (self.post_time, schedule.digest_times.first()) {
+            (Some(time), _) => Ok(time),
+            (None, Some(digest)) => digest
+                .parse::<TimeOfDay>()
+                .map_err(|e| anyhow::anyhow!("Time {digest:?}: {e:#}")),
+            (None, None) => Ok(DEFAULT_FORECAST_TIME),
+        }
+    }
 }
 
 impl Default for WeatherConfig {
@@ -143,6 +191,27 @@ pub(crate) struct SourceConfig {
     /// Set to [] to skip the required check for city-specific sources.
     #[serde(default)]
     pub(crate) required: Option<Vec<String>>,
+}
+
+impl SourceConfig {
+    /// The source's identity: its name lower-cased, each run of other characters than letters
+    /// and digits one `-` ("Polizei Berlin" → "polizei-berlin").
+    pub(crate) fn id(&self) -> String {
+        slug(&self.name)
+    }
+}
+
+/// `name` lower-cased, each run of characters that are not letters or digits one `-`.
+pub(crate) fn slug(name: &str) -> String {
+    let mut slug = String::new();
+    for c in name.trim().to_lowercase().chars() {
+        if c.is_alphanumeric() {
+            slug.push(c);
+        } else if !slug.is_empty() && !slug.ends_with('-') {
+            slug.push('-');
+        }
+    }
+    slug.trim_end_matches('-').to_owned()
 }
 
 /// Keyword group with an implied distance. When no street can be geocoded,
@@ -340,14 +409,26 @@ impl Config {
             );
         }
 
-        for time in self
-            .schedule
-            .digest_times
-            .iter()
-            .chain(&self.weather.post_time)
-        {
+        for time in &self.schedule.digest_times {
             time.parse::<TimeOfDay>()
                 .map_err(|e| anyhow::anyhow!("Time {time:?}: {e:#}"))?;
+        }
+        if self.weather.enabled {
+            let forecast = self.weather.forecast_time(&self.schedule)?;
+            ensure!(
+                forecast.hour < 23,
+                "The forecast time {forecast} leaves no period of the day to show: \
+                 set [weather] post_time before 23:00"
+            );
+        }
+        for (key, agent) in [
+            ("user_agent", &self.http.user_agent),
+            ("page_user_agent", &self.http.page_user_agent),
+        ] {
+            ensure!(
+                !agent.trim().is_empty() && reqwest::header::HeaderValue::from_str(agent).is_ok(),
+                "[http] {key} {agent:?} is no usable User-Agent"
+            );
         }
         ensure!(
             self.schedule.poll_interval_minutes > 0,
@@ -469,5 +550,48 @@ mod tests {
         assert!(invalid(&|c| c.filter.area[0].terms.push(" ".to_owned())).contains("empty term"));
         assert!(invalid(&|c| c.bluesky.password = None).contains("[bluesky]"));
         assert!(invalid(&|c| c.sources[0].url = None).contains("needs a url"));
+    }
+
+    #[test]
+    fn the_forecast_time_is_parsed_once_and_must_leave_a_period() {
+        let mut config = example();
+        config.weather.post_time = Some(TimeOfDay::new(9, 30));
+        assert_eq!(
+            config.weather.forecast_time(&config.schedule).unwrap(),
+            TimeOfDay::new(9, 30)
+        );
+        config.weather.post_time = None;
+        config.schedule.digest_times = vec!["07:15".to_owned()];
+        assert_eq!(
+            config.weather.forecast_time(&config.schedule).unwrap(),
+            TimeOfDay::new(7, 15)
+        );
+
+        config.weather.post_time = Some(TimeOfDay::new(23, 0));
+        let error = format!("{:#}", config.validate().unwrap_err());
+        assert!(error.contains("23:00"), "{error}");
+        config.weather.enabled = false;
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn user_agents_default_to_the_bot_and_the_page_agent() {
+        let config = example();
+        assert_eq!(
+            config.http.user_agent,
+            format!("radar-bot/{}", env!("CARGO_PKG_VERSION"))
+        );
+        assert!(config.http.page_user_agent.starts_with("Mozilla/5.0"));
+
+        let mut broken = example();
+        broken.http.user_agent = "radar\nbot".to_owned();
+        assert!(format!("{:#}", broken.validate().unwrap_err()).contains("[http] user_agent"));
+    }
+
+    #[test]
+    fn a_source_id_is_its_name_as_a_slug() {
+        assert_eq!(slug("Polizei Berlin"), "polizei-berlin");
+        assert_eq!(slug("  Bluesky #YourCity "), "bluesky-yourcity");
+        assert_eq!(slug("Straßen & Plätze!"), "straßen-plätze");
     }
 }
