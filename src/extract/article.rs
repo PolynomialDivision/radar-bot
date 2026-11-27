@@ -666,9 +666,46 @@ fn canonical_in(doc: &Html) -> Option<String> {
         .map(str::to_owned)
 }
 
+/// Whether a URL is on one of Google's own hosts: `news.google.com`, `www.google.de`, but
+/// also `support.google.com` and `consent.google.com`, whose links are never the article.
 pub(crate) fn looks_like_google_url(url: &str) -> bool {
-    let u = url.to_lowercase();
-    u.contains("://news.google.") || u.contains("://www.google.") || u.contains("://google.")
+    host_and_path(url).is_some_and(|(host, _)| {
+        let labels: Vec<&str> = host.split('.').collect();
+        labels[..labels.len() - 1].contains(&"google")
+    })
+}
+
+/// What Google answers instead of an article when it blocks the bot (the "unusual traffic"
+/// page under `/sorry/`) or asks for cookie consent first.
+pub(crate) fn is_google_interstitial(url: &str) -> bool {
+    looks_like_google_url(url)
+        && host_and_path(url).is_some_and(|(host, path)| {
+            host.starts_with("consent.google.") || path.starts_with("/sorry")
+        })
+}
+
+/// The lowercased host (without user info and port) and the path of an http(s) URL.
+fn host_and_path(url: &str) -> Option<(String, &str)> {
+    let (scheme, rest) = url.trim().split_once("://")?;
+    if !(scheme.eq_ignore_ascii_case("https") || scheme.eq_ignore_ascii_case("http")) {
+        return None;
+    }
+    let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let authority = &rest[..end];
+    let host = authority.rsplit('@').next()?.split(':').next()?;
+    let path = rest[end..].split(['?', '#']).next().unwrap_or("");
+    (!host.is_empty()).then(|| (host.to_ascii_lowercase(), path))
+}
+
+/// Google's captcha page, when it is served at the article's own address: its form, its
+/// reCAPTCHA, or its link explaining the block.
+fn google_block_in(doc: &Html) -> bool {
+    static BLOCK: std::sync::LazyLock<Selector> = std::sync::LazyLock::new(|| {
+        selector(
+            "form#captcha-form, .g-recaptcha, a[href*=\"support.google.com/websearch/answer/86640\"]",
+        )
+    });
+    doc.select(&BLOCK).next().is_some()
 }
 
 pub(crate) fn decode_url_parameter(url: &str, keys: &[&str]) -> Option<String> {
@@ -874,6 +911,14 @@ pub(crate) async fn fetch_article(http: &Http, url: &str, title: &str) -> Page {
             return Page::Failed;
         }
     };
+    if let Some(answered) = response
+        .final_url
+        .as_deref()
+        .filter(|u| is_google_interstitial(u))
+    {
+        tracing::debug!("article fetch blocked {url}: Google answered from {answered}");
+        return Page::Failed;
+    }
     match response.status {
         200..=299 => {}
         429 | 500..=599 => {
@@ -910,6 +955,9 @@ pub(crate) fn read_page(
     title: &str,
 ) -> Result<Option<ArticleFetch>, TooComplex> {
     let doc = parse_page(html)?;
+    if looks_like_google_url(feed_url) && google_block_in(&doc) {
+        return Ok(None);
+    }
     if paywalled_in(&doc) {
         return Ok(Some(ArticleFetch::paywalled()));
     }
@@ -1234,6 +1282,109 @@ mod tests {
 
         assert!(page_text(&named).contains("Straße"));
         assert!(page_text(&header).contains("Straße"));
+    }
+
+    /// Google's "unusual traffic" page, as it is built (the text shortened).
+    const GOOGLE_BLOCK_PAGE: &str = r#"<html><head><title>https://news.google.com/rss/articles/abc</title></head>
+        <body><div style="max-width:400px;"><hr noshade size="1">
+        <form id="captcha-form" action="index" method="post">
+        <script src="https://www.google.com/recaptcha/api.js" async defer></script>
+        <div id="recaptcha" class="g-recaptcha" data-sitekey="test"></div>
+        <input type="hidden" name="continue" value="https://news.google.com/rss/articles/abc"></form>
+        <div id="infoDiv">Our systems have detected unusual traffic from your computer network.
+        This page checks to see if it's really you sending the requests, and not a robot.
+        <a href="https://support.google.com/websearch/answer/86640">Why did this happen?</a></div>
+        </div></body></html>"#;
+
+    #[test]
+    fn google_is_recognised_by_its_host() {
+        for google in [
+            "https://news.google.com/rss/articles/abc",
+            "https://www.google.de/url?q=x",
+            "https://support.google.com/websearch/answer/86640",
+            "https://consent.google.com/ml?continue=x",
+            "https://policies.google.com/privacy",
+            "HTTPS://Google.co.uk/",
+        ] {
+            assert!(looks_like_google_url(google), "{google}");
+        }
+        for other in [
+            "https://publisher.test/article/1",
+            "https://googlewatch.test/a",
+            "https://notgoogle.com/a",
+            "https://publisher.test/?ref=https://www.google.com/",
+            "mailto:someone@google.com",
+        ] {
+            assert!(!looks_like_google_url(other), "{other}");
+        }
+        assert!(is_google_interstitial(
+            "https://www.google.com/sorry/index?continue=https://news.google.com/rss/articles/abc"
+        ));
+        assert!(is_google_interstitial(
+            "https://consent.google.com/ml?continue=x"
+        ));
+        assert!(!is_google_interstitial(
+            "https://news.google.com/rss/articles/abc"
+        ));
+        assert!(!is_google_interstitial(
+            "https://publisher.test/sorry/we-apologise"
+        ));
+    }
+
+    #[test]
+    fn a_google_help_link_is_never_the_article() {
+        let html = r#"
+            <html><head><link rel="canonical" href="https://news.google.com/rss/articles/abc" /></head>
+            <body><a href="https://support.google.com/websearch/answer/86640">Hilfe</a>
+            <a href="https://policies.google.com/privacy">Datenschutz</a>
+            <a href="https://publisher.test/article/1">Publisher</a></body></html>
+        "#;
+        let (link, _) = resolve_article_link(
+            "https://news.google.com/rss/articles/abc",
+            html,
+            "Brand in der Perleberger Straße mit Feuerwehreinsatz",
+            "Brand in der Perleberger Straße",
+        );
+
+        assert_eq!(link.as_deref(), Some("https://publisher.test/article/1"));
+    }
+
+    #[test]
+    fn googles_block_page_at_the_article_address_is_no_text() {
+        let read = read_page(
+            "https://news.google.com/rss/articles/abc",
+            GOOGLE_BLOCK_PAGE,
+            "Brand in der Perleberger Straße",
+        );
+
+        assert!(matches!(read, Ok(None)));
+    }
+
+    #[tokio::test]
+    async fn a_redirect_to_a_google_block_or_consent_page_is_tried_again() {
+        let consent = r#"<html><body><main><p>Bevor Sie zu Google weitergehen: Wir verwenden
+            Cookies und Daten, um Dienste bereitzustellen und zu verwalten, Ausfälle zu
+            erfassen und vor Spam, Betrug und Missbrauch zu schützen.</p>
+            <a href="https://policies.google.com/technologies/cookies">Mehr</a></main></body></html>"#;
+        let http = Http::recorded(std::sync::Arc::new(
+            crate::fetch::Recorded::new()
+                .route("https://news.google.com/rss/articles/blocked", 302, "")
+                .with_location(
+                    "https://www.google.com/sorry/index?continue=https://news.google.com/rss/articles/blocked",
+                )
+                .route("https://www.google.com/sorry/", 429, GOOGLE_BLOCK_PAGE)
+                .route("https://news.google.com/rss/articles/consent", 302, "")
+                .with_location("https://consent.google.com/ml?continue=x")
+                .route("https://consent.google.com/", 200, consent),
+        ));
+
+        for url in [
+            "https://news.google.com/rss/articles/blocked",
+            "https://news.google.com/rss/articles/consent",
+        ] {
+            let fetched = fetch_article(&http, url, "Brand").await;
+            assert!(matches!(fetched, Page::Failed), "{url}");
+        }
     }
 
     #[tokio::test]

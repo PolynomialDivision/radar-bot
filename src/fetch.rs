@@ -89,6 +89,8 @@ pub(crate) struct Response {
     pub(crate) last_modified: Option<String>,
     /// Where a redirect points.
     location: Option<String>,
+    /// The URL that gave this answer, after redirects (set by [`Http`]).
+    pub(crate) final_url: Option<String>,
 }
 
 impl Response {
@@ -107,6 +109,7 @@ impl Response {
             etag: None,
             last_modified: None,
             location: None,
+            final_url: None,
         }
     }
 
@@ -413,7 +416,10 @@ impl Http {
                 }
             };
             let Some(target) = response.redirect_target(&url) else {
-                return Ok(response);
+                return Ok(Response {
+                    final_url: Some(url),
+                    ..response
+                });
             };
             if response.status == 303 {
                 method = Method::Get;
@@ -583,6 +589,7 @@ async fn live(client: &reqwest::Client, req: Request<'_>) -> Result<Response, Fe
         etag,
         last_modified,
         location,
+        final_url: None,
     })
 }
 
@@ -628,6 +635,8 @@ struct Route {
     fail_first: Mutex<usize>,
     /// Sent as the answer's `ETag`; a request with `If-None-Match` of it gets a 304.
     etag: Option<String>,
+    /// Sent as the answer's `Location`.
+    location: Option<String>,
 }
 
 impl Recorded {
@@ -658,7 +667,17 @@ impl Recorded {
             body: body.to_owned(),
             fail_first: Mutex::new(failures),
             etag: None,
+            location: None,
         });
+        self
+    }
+
+    /// The last route redirects to `location` (give it a 3xx status).
+    #[cfg(test)]
+    pub(crate) fn with_location(mut self, location: &str) -> Self {
+        if let Some(route) = self.routes.last_mut() {
+            route.location = Some(location.to_owned());
+        }
         self
     }
 
@@ -729,6 +748,7 @@ impl Recorded {
                 body,
                 fail_first: Mutex::new(0),
                 etag: None,
+                location: None,
             });
         }
         Ok(recorded)
@@ -806,6 +826,7 @@ impl Recorded {
                 etag: route.etag.clone(),
                 last_modified: None,
                 location: None,
+                final_url: None,
             });
         }
         if route.body.len() > max_bytes {
@@ -818,7 +839,8 @@ impl Recorded {
             bytes: route.body.clone().into_bytes(),
             etag: route.etag.clone(),
             last_modified: None,
-            location: None,
+            location: route.location.clone(),
+            final_url: None,
         })
     }
 }
