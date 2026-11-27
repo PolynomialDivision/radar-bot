@@ -1,14 +1,20 @@
 //! Fetching article pages, reading their text and metadata, resolving aggregator links.
 //!
 //! A page is parsed once (`scraper`, an HTML5 parser) and every reading works on that document.
+//!
+//! A page's nesting depth and size are chosen by its author, so nothing here recurses over the
+//! document and every pass has a budget: the parser is fed in chunks against a deadline (its
+//! own cost grows with the square of the nesting depth of some elements), the text walk stops
+//! at [`MAX_NODES`] nodes or [`MAX_DEPTH`] levels. A page beyond a budget is not an article.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use scraper::{node::Node, ElementRef, Html, Selector};
+use html5ever::tendril::{StrTendril, TendrilSink};
+use scraper::{node::Node, ElementRef, Html, HtmlTreeSink, Selector};
 
 use crate::feed::parse_feed_date;
-use crate::fetch::{Http, MAX_PAGE_BYTES};
-use crate::filter::normalize;
+use crate::fetch::{FetchError, Http, MAX_PAGE_BYTES};
+use crate::filter::{is_invisible, normalize};
 
 // ── Article text ──────────────────────────────────────────────────────────────
 
@@ -20,30 +26,256 @@ const NOT_TEXT: &[&str] = &[
 /// Candidate containers of the article, in the order they are considered.
 const CONTAINERS: &[&str] = &["article", "main", "section", "div"];
 
+/// Elements after which the text continues as a new word: `<h1>Brand</h1><p>Die` is
+/// "Brand Die", not "BrandDie".
+const BLOCKS: &[&str] = &[
+    "p",
+    "div",
+    "h1",
+    "h2",
+    "h3",
+    "h4",
+    "h5",
+    "h6",
+    "li",
+    "br",
+    "tr",
+    "td",
+    "th",
+    "ul",
+    "ol",
+    "dt",
+    "dd",
+    "table",
+    "section",
+    "article",
+    "main",
+    "header",
+    "footer",
+    "nav",
+    "aside",
+    "blockquote",
+    "figure",
+    "figcaption",
+    "hr",
+    "pre",
+];
+
+/// Class or id tokens of page parts around an article: teaser lists, related stories,
+/// comments, breadcrumbs, newsletter boxes. Their text is never part of the body.
+const NOT_BODY_TOKENS: &[&str] = &[
+    "teaser",
+    "related",
+    "comment",
+    "comments",
+    "breadcrumb",
+    "newsletter",
+    "recommendation",
+    "recommendations",
+    "more",
+];
+
+/// A container loses to a descendant container that holds at least this share of its text
+/// (percent): the innermost one that still has the article wins over the page wrapper.
+const INNER_SHARE_PERCENT: usize = 60;
+
+/// Nodes the text walk visits at most.
+pub(crate) const MAX_NODES: usize = 200_000;
+/// Nesting depth the text walk follows at most.
+pub(crate) const MAX_DEPTH: usize = 512;
+/// Time the parser may take for one page. A 2 MB page of ordinary shape takes about 40 ms.
+const PARSE_BUDGET: Duration = Duration::from_secs(1);
+/// Bytes handed to the parser between two looks at the clock.
+const PARSE_CHUNK: usize = 1024;
+/// Time reading one page may take in all, on its blocking thread.
+const READ_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The page is beyond a work budget.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TooComplex;
+
 fn selector(css: &str) -> Selector {
     Selector::parse(css).expect("a valid selector")
 }
 
-/// The text of `element` without the text of [`NOT_TEXT`] elements inside it, whitespace
-/// collapsed.
-fn visible_text(element: ElementRef<'_>) -> String {
-    fn walk(element: ElementRef<'_>, out: &mut String) {
-        for child in element.children() {
-            if let Some(child_element) = ElementRef::wrap(child) {
-                if !NOT_TEXT.contains(&child_element.value().name()) {
-                    walk(child_element, out);
+/// `html` as a document, or [`TooComplex`] when the parser runs past [`PARSE_BUDGET`].
+fn parse_page(html: &str) -> Result<Html, TooComplex> {
+    let started = Instant::now();
+    let mut parser = html5ever::driver::parse_document(
+        HtmlTreeSink::new(Html::new_document()),
+        Default::default(),
+    );
+    let mut rest = html;
+    while !rest.is_empty() {
+        let mut cut = PARSE_CHUNK.min(rest.len());
+        while !rest.is_char_boundary(cut) {
+            cut += 1;
+        }
+        let (chunk, tail) = rest.split_at(cut);
+        parser.process(StrTendril::from_slice(chunk));
+        if started.elapsed() > PARSE_BUDGET {
+            return Err(TooComplex);
+        }
+        rest = tail;
+    }
+    Ok(parser.finish())
+}
+
+/// Whether the class or id of `element` names a page part that is not the article body.
+fn is_not_body(element: &scraper::node::Element) -> bool {
+    if matches!(element.name(), "html" | "body") {
+        return false;
+    }
+    ["class", "id"]
+        .iter()
+        .filter_map(|attr| element.attr(attr))
+        .flat_map(|value| value.split(|c: char| !c.is_alphanumeric()))
+        .any(|token| {
+            NOT_BODY_TOKENS
+                .iter()
+                .any(|not_body| token.eq_ignore_ascii_case(not_body))
+        })
+}
+
+/// A candidate container: where its text lies in [`PageText::text`].
+struct Container<'a> {
+    element: ElementRef<'a>,
+    /// Byte range of its text.
+    start: usize,
+    end: usize,
+    /// Words of the page before it and up to its end.
+    words_before: usize,
+    words_end: usize,
+    /// Candidates after this one up to here are its descendants.
+    descendants_until: usize,
+}
+
+/// The visible text of a whole document in one pass: whitespace collapsed, page furniture
+/// ([`NOT_TEXT`], [`NOT_BODY_TOKENS`]) and invisible characters left out, and for every
+/// candidate container the range of the text that is its own.
+struct PageText<'a> {
+    text: String,
+    words: usize,
+    at_space: bool,
+    containers: Vec<Container<'a>>,
+}
+
+impl<'a> PageText<'a> {
+    fn push_text(&mut self, text: &str) {
+        for c in text.chars().filter(|c| !is_invisible(*c)) {
+            if c.is_whitespace() {
+                self.push_space();
+            } else {
+                if self.at_space {
+                    self.words += 1;
                 }
-            } else if let Node::Text(text) = child.value() {
-                out.push_str(text);
+                self.text.push(c);
+                self.at_space = false;
             }
         }
     }
-    let mut out = String::new();
-    walk(element, &mut out);
-    out.split_whitespace().collect::<Vec<_>>().join(" ")
+
+    fn push_space(&mut self) {
+        if !self.at_space {
+            self.text.push(' ');
+            self.at_space = true;
+        }
+    }
+
+    fn of(doc: &'a Html) -> Result<Self, TooComplex> {
+        let mut page = PageText {
+            text: String::new(),
+            words: 0,
+            at_space: true,
+            containers: Vec::new(),
+        };
+        // Containers that are open at the current node, innermost last.
+        let mut open: Vec<usize> = Vec::new();
+        let root = doc.tree.root();
+        let mut node = root;
+        let mut depth = 0;
+        let mut visited = 0;
+        loop {
+            visited += 1;
+            if visited > MAX_NODES || depth > MAX_DEPTH {
+                return Err(TooComplex);
+            }
+            let mut descend = true;
+            match node.value() {
+                Node::Text(text) => page.push_text(text),
+                Node::Element(element) => {
+                    let name = element.name();
+                    if NOT_TEXT.contains(&name) || is_not_body(element) {
+                        descend = false;
+                    } else if CONTAINERS.contains(&name) {
+                        open.push(page.containers.len());
+                        page.containers.push(Container {
+                            element: ElementRef::wrap(node).expect("an element"),
+                            start: page.text.len(),
+                            end: page.text.len(),
+                            words_before: page.words,
+                            words_end: page.words,
+                            descendants_until: 0,
+                        });
+                    }
+                }
+                _ => {}
+            }
+            if descend {
+                if let Some(child) = node.first_child() {
+                    node = child;
+                    depth += 1;
+                    continue;
+                }
+            }
+            // Leave `node`, and each ancestor whose last child it was.
+            loop {
+                if let Node::Element(element) = node.value() {
+                    if let Some(&index) = open.last() {
+                        if page.containers[index].element.id() == node.id() {
+                            open.pop();
+                            let until = page.containers.len();
+                            let container = &mut page.containers[index];
+                            container.end = page.text.len();
+                            container.words_end = page.words;
+                            container.descendants_until = until;
+                        }
+                    }
+                    if BLOCKS.contains(&element.name()) {
+                        page.push_space();
+                    }
+                }
+                if node == root {
+                    return Ok(page);
+                }
+                if let Some(next) = node.next_sibling() {
+                    node = next;
+                    break;
+                }
+                node = node.parent().expect("below the root");
+                depth -= 1;
+            }
+        }
+    }
+
+    fn text_of(&self, container: &Container<'_>) -> &str {
+        self.text[container.start..container.end].trim()
+    }
+
+    fn words_of(&self, container: &Container<'_>) -> usize {
+        // A container whose text continues a word of the text before it ("a<b>bc</b>") has
+        // that word counted before it.
+        let continues = container.start > 0
+            && !self.text[..container.start].ends_with(' ')
+            && self.text[container.start..container.end]
+                .chars()
+                .next()
+                .is_some_and(|c| c != ' ');
+        container.words_end - container.words_before + usize::from(continues)
+    }
 }
 
-/// The opening tag as text (`<div class="article-body">`), for [`article_container_score`].
+/// The opening tag as text (`<div class="article-body">`), for [`container_score`].
 fn opening_tag(element: ElementRef<'_>) -> String {
     let attrs: Vec<String> = element
         .value()
@@ -53,7 +285,8 @@ fn opening_tag(element: ElementRef<'_>) -> String {
     format!("<{} {}>", element.value().name(), attrs.join(" "))
 }
 
-pub(crate) fn article_container_score(tag: &str, text: &str) -> i32 {
+/// Score of a container from its opening tag and its number of words.
+fn container_score(tag: &str, words: usize) -> i32 {
     let tag = tag.to_lowercase();
     let mut score = 0;
     for needle in [
@@ -80,38 +313,66 @@ pub(crate) fn article_container_score(tag: &str, text: &str) -> i32 {
             score -= 5;
         }
     }
-    let words = text.split_whitespace().count() as i32;
-    score + (words / 80).min(8)
+    score + (words / 80).min(8) as i32
 }
 
 /// Extract only the article body from a full HTML page.
 #[cfg(test)]
 pub(crate) fn extract_article_body(html: &str) -> String {
-    article_body_in(&Html::parse_document(html))
+    article_body_in(&parse_page(html).expect("within budget")).expect("within budget")
 }
 
-/// The best-scoring container's text (semantic containers first, page furniture left out), or
-/// the whole page's text when no container qualifies.
-fn article_body_in(doc: &Html) -> String {
-    let mut best: Option<(i32, String)> = None;
-    for name in CONTAINERS {
-        for element in doc.select(&selector(name)) {
-            let text = visible_text(element);
-            if text.len() < 200 {
-                continue;
+/// The article's text: the best-scoring container (semantic containers first, page furniture
+/// left out), then the innermost container inside it that still holds most of its text; the
+/// whole page's text when no container qualifies.
+fn article_body_in(doc: &Html) -> Result<String, TooComplex> {
+    let page = PageText::of(doc)?;
+    // Qualifying containers in document order, with their score and text length.
+    let qualified: Vec<(usize, i32, usize)> = page
+        .containers
+        .iter()
+        .enumerate()
+        .filter_map(|(index, container)| {
+            let len = page.text_of(container).len();
+            if len < 200 {
+                return None;
             }
-            let score = article_container_score(&opening_tag(element), &text);
-            if score > 0
-                && best.as_ref().is_none_or(|(best_score, best_text)| {
-                    score > *best_score || (score == *best_score && text.len() > best_text.len())
-                })
-            {
-                best = Some((score, text));
-            }
+            let score = container_score(&opening_tag(container.element), page.words_of(container));
+            (score > 0).then_some((index, score, len))
+        })
+        .collect();
+    // The order of the scan before: by tag name in `CONTAINERS` order, then document order; a
+    // later one wins only with a higher score, or the same score and longer text.
+    let kind = |index: usize| {
+        let name = page.containers[index].element.value().name();
+        CONTAINERS.iter().position(|c| *c == name).unwrap_or(0)
+    };
+    let best_of = |candidates: &[(usize, i32, usize)]| {
+        candidates.iter().copied().max_by(|a, b| {
+            (a.1, a.2)
+                .cmp(&(b.1, b.2))
+                .then_with(|| (kind(b.0), b.0).cmp(&(kind(a.0), a.0)))
+        })
+    };
+    let Some(mut chosen) = best_of(&qualified) else {
+        return Ok(page.text.trim().to_owned());
+    };
+    loop {
+        let (index, _, len) = chosen;
+        let until = page.containers[index].descendants_until;
+        let from = qualified.partition_point(|q| q.0 <= index);
+        let to = qualified.partition_point(|q| q.0 < until);
+        let inner: Vec<_> = qualified[from..to]
+            .iter()
+            .copied()
+            .filter(|q| q.2 * 100 >= len * INNER_SHARE_PERCENT)
+            .collect();
+        match best_of(&inner) {
+            Some(next) => chosen = next,
+            None => break,
         }
     }
-    best.map(|(_, text)| text)
-        .unwrap_or_else(|| visible_text(doc.root_element()))
+    Ok(page.text_of(&page.containers[chosen.0]).to_owned())
 }
 
 #[derive(Debug, Clone)]
@@ -476,9 +737,10 @@ fn resolve_link_in(
 /// What fetching an item's link gave.
 pub(crate) enum Page {
     Article(ArticleFetch),
-    /// The link is no web page (a PDF, a video): the item is decided on its feed text.
+    /// The link is no article page (a PDF, a video, an error page, a page too large or too
+    /// complex to read): the item is decided on its feed text.
     NotAnArticle(String),
-    /// Unreachable, too large, or no text: tried again next poll.
+    /// Unreachable, rate-limited, a server error, or no text: tried again next poll.
     Failed,
 }
 
@@ -494,11 +756,20 @@ pub(crate) async fn fetch_article(http: &Http, url: &str, title: &str) -> Page {
         .await
     {
         Ok(response) => response,
+        Err(e @ FetchError::TooLarge(_)) => return Page::NotAnArticle(e.to_string()),
         Err(e) => {
             tracing::debug!("article fetch failed {url}: {e}");
             return Page::Failed;
         }
     };
+    match response.status {
+        200..=299 => {}
+        429 | 500..=599 => {
+            tracing::debug!("article fetch failed {url}: HTTP {}", response.status);
+            return Page::Failed;
+        }
+        status => return Page::NotAnArticle(format!("HTTP {status}")),
+    }
     if let Some(content_type) = response.content_type.as_deref() {
         if !is_html(content_type) {
             return Page::NotAnArticle(content_type.to_owned());
@@ -506,33 +777,33 @@ pub(crate) async fn fetch_article(http: &Http, url: &str, title: &str) -> Page {
     }
     let html = response.body;
 
-    // Parsing a large page takes a while: off the async runtime.
+    // Parsing a large page takes a while: off the async runtime, with a deadline.
     let title = title.to_owned();
     let feed_url = url.to_owned();
-    let article = tokio::task::spawn_blocking(move || read_page(&feed_url, &html, &title))
-        .await
-        .ok()
-        .flatten();
-
-    article.map_or(Page::Failed, Page::Article)
+    let reading = tokio::task::spawn_blocking(move || read_page(&feed_url, &html, &title));
+    match tokio::time::timeout(READ_TIMEOUT, reading).await {
+        Ok(Ok(Ok(Some(article)))) => Page::Article(article),
+        Ok(Ok(Err(TooComplex))) | Err(_) => Page::NotAnArticle("too complex".to_owned()),
+        Ok(Ok(Ok(None))) | Ok(Err(_)) => Page::Failed,
+    }
 }
 
 /// Everything the bot reads from a page, parsed once. `None` when it has no text.
-fn read_page(feed_url: &str, html: &str, title: &str) -> Option<ArticleFetch> {
-    let doc = Html::parse_document(html);
-    let text = article_body_in(&doc).trim().to_owned();
+fn read_page(feed_url: &str, html: &str, title: &str) -> Result<Option<ArticleFetch>, TooComplex> {
+    let doc = parse_page(html)?;
+    let text = article_body_in(&doc)?;
     if text.is_empty() {
-        return None;
+        return Ok(None);
     }
     let (resolved_link, link_note) = resolve_link_in(feed_url, &doc, &text, title);
-    Some(ArticleFetch {
+    Ok(Some(ArticleFetch {
         resolved_link,
         link_note,
         published_at: published_at_in(&doc, html),
         event: event_location_in(&doc),
         district: district_in(&doc),
         text,
-    })
+    }))
 }
 
 #[cfg(test)]
@@ -655,6 +926,97 @@ mod tests {
 
         assert_eq!(link.as_deref(), Some("https://publisher.test/article/1"));
         assert_eq!(note, None);
+    }
+
+    /// Runs `read_page` on a thread with the stack of a tokio blocking thread (2 MiB) and
+    /// returns how long it took. A stack overflow aborts the whole test binary: that is the
+    /// failure this guards against, a panic would not show it.
+    fn read_on_small_stack(html: String) -> (Duration, bool) {
+        std::thread::Builder::new()
+            .stack_size(2 * 1024 * 1024)
+            .spawn(move || {
+                let started = Instant::now();
+                let read = read_page("https://example.com/a", &html, "Titel");
+                (started.elapsed(), matches!(read, Err(TooComplex)))
+            })
+            .expect("spawn")
+            .join()
+            .expect("read_page returned")
+    }
+
+    #[test]
+    fn deeply_nested_or_huge_pages_return_quickly() {
+        let nested_divs = format!(
+            "<html><body>{}<p>Text</p></body></html>",
+            "<div>".repeat(100_000)
+        );
+        let nested_spans = format!(
+            "<html><body><article>{}Text</article></body></html>",
+            "<span>".repeat(100_000)
+        );
+        let siblings = format!(
+            "<html><body>{}{}{}</body></html>",
+            "<div class=\"wrap\">".repeat(30),
+            "<div>Ein Satz mit einigen Wörtern.</div>".repeat(50_000),
+            "</div>".repeat(30)
+        );
+        for (name, html, too_complex) in [
+            ("100,000 nested div", nested_divs, Some(true)),
+            (
+                "100,000 nested span in an article",
+                nested_spans,
+                Some(true),
+            ),
+            // Ordinary in shape; whether a debug build parses it within the budget depends
+            // on the machine.
+            ("50,000 sibling div under 30 wrappers", siblings, None),
+        ] {
+            let (took, was_too_complex) = read_on_small_stack(html);
+            assert!(took < Duration::from_secs(2), "{name}: {took:?}");
+            if let Some(expected) = too_complex {
+                assert_eq!(was_too_complex, expected, "{name}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_innermost_container_with_the_article_wins_and_teasers_stay_out() {
+        for (page, golden) in [
+            ("pages/wrapper_teasers.html", "article_wrapper_teasers.txt"),
+            ("pages/main_aside.html", "article_main_aside.txt"),
+            ("pages/more_on_topic.html", "article_more_on_topic.txt"),
+        ] {
+            let body = extract_article_body(&crate::testing::fixture(page));
+
+            for furniture in [
+                "Startseite",
+                "Messerangriff",
+                "Fahrraddiebstahl",
+                "Mehr zum Thema",
+                "Wohnungsbrand",
+                "Newsletter",
+            ] {
+                assert!(
+                    !body.contains(furniture),
+                    "{page}: {furniture:?} in {body:?}"
+                );
+            }
+            crate::testing::assert_golden(golden, &body);
+        }
+    }
+
+    #[test]
+    fn blocks_are_separated_and_soft_hyphens_dropped() {
+        let html = "<html><body><article><h1>Brand in Moabit</h1><p>Die Feuerwehr war in \
+                    Charlotten&shy;burg im Einsatz, Stra\u{200B}ße frei.</p></article></body></html>";
+        let body = extract_article_body(html);
+
+        assert!(
+            body.starts_with("Brand in Moabit Die Feuerwehr"),
+            "{body:?}"
+        );
+        assert!(body.contains("Charlottenburg im Einsatz"), "{body:?}");
+        assert!(body.contains("Straße frei."), "{body:?}");
     }
 
     #[test]

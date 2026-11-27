@@ -999,4 +999,110 @@ mod tests {
             (vec![], vec![])
         );
     }
+
+    fn linked(title: &str, url: &str) -> FeedItem {
+        let mut item = report(title, "");
+        item.article_text = None;
+        item.link = Some(url.to_owned());
+        item
+    }
+
+    async fn run_on(http: Http, item: FeedItem) -> ProcessOutcome {
+        process_item(
+            PollCtx::new(http, filter(), None),
+            source(Some(9000.0), None),
+            item,
+            false,
+        )
+        .await
+    }
+
+    fn page_http(status: u16, body: &str) -> Http {
+        Http::recorded(Arc::new(crate::fetch::Recorded::new().route(
+            "https://page.test/",
+            status,
+            body,
+        )))
+    }
+
+    #[tokio::test]
+    async fn a_soft_hyphen_does_not_hide_an_area_term() {
+        let in_title = report("Polizeieinsatz in Charlotten\u{AD}burg", "Ein Einsatz.");
+        let ProcessOutcome::Candidate { item, .. } =
+            run(source(Some(9000.0), None), in_title).await
+        else {
+            panic!("expected a candidate");
+        };
+        assert_eq!(item.location_label.as_deref(), Some("Charlottenburg"));
+
+        let page = "<html><body><article><h1>Polizeieinsatz</h1><p>Bei einem Einsatz in \
+                    Charlotten&shy;burg wurden zwei Bauarbeiter verletzt.</p></article></body></html>";
+        let in_page = linked("Polizeieinsatz", "https://page.test/1");
+        let ProcessOutcome::Candidate { item, .. } = run_on(page_http(200, page), in_page).await
+        else {
+            panic!("expected a candidate");
+        };
+        assert_eq!(item.location_label.as_deref(), Some("Charlottenburg"));
+    }
+
+    #[tokio::test]
+    async fn a_server_error_page_is_retried() {
+        let item = linked("Einsatz", "https://page.test/1");
+
+        let outcome = run_on(
+            page_http(503, "<html><body>Service Unavailable</body></html>"),
+            item,
+        )
+        .await;
+
+        assert!(matches!(outcome, ProcessOutcome::Retry { .. }));
+    }
+
+    #[tokio::test]
+    async fn a_refused_page_is_decided_on_the_feed_text() {
+        let refused = "<html><body><article><p>Zugriff verweigert. Polizeieinsatz in \
+                       Charlottenburg und weitere Meldungen aus der Perleberger Straße.</p>\
+                       </article></body></html>";
+        let item = linked("Einsatz", "https://page.test/1");
+
+        let ProcessOutcome::Candidate { item, .. } = run_on(page_http(403, refused), item).await
+        else {
+            panic!("decided as a candidate on its source default");
+        };
+
+        assert_eq!(item.article_text, None);
+        assert_eq!(item.location_label, None);
+    }
+
+    #[tokio::test]
+    async fn a_page_over_the_cap_is_decided_and_never_fetched_again() {
+        let (db, _dir) = crate::testing::test_db();
+        let rss = r#"<?xml version="1.0"?><rss version="2.0"><channel><title>Feed</title>
+            <item><title>Einsatz am Abend</title><link>https://big.test/page</link>
+            <guid>big-1</guid></item></channel></rss>"#;
+        let recorded = Arc::new(
+            crate::fetch::Recorded::new()
+                .route("https://feed.test/", 200, rss)
+                .route("https://big.test/", 200, &"x".repeat(3 * 1024 * 1024)),
+        );
+        let http = Http::recorded(recorded.clone());
+        let sources = [feed("Big Pages", "https://feed.test/rss")];
+        let ctx = PollCtx::new(http, filter(), None);
+
+        poll_once(&ctx, &db, &sources, None, false).await;
+        poll_once(&ctx, &db, &sources, None, false).await;
+
+        let page_requests = recorded
+            .calls()
+            .iter()
+            .filter(|call| call.contains("big.test"))
+            .count();
+        assert_eq!(page_requests, 1);
+        assert_eq!(db.retry_attempts("big-1").await.unwrap(), 0);
+        assert!(db
+            .seen_guids(vec!["big-1".to_owned()])
+            .await
+            .unwrap()
+            .contains("big-1"));
+    }
 }

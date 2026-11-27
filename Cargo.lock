@@ -2722,6 +2722,7 @@ dependencies = [
  "encoding_rs",
  "feed-rs",
  "futures-util",
+ "html5ever 0.40.1",
  "mxbot-common",
  "reqwest",
  "scraper",

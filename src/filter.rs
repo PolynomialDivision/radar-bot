@@ -6,8 +6,20 @@ use crate::config::FilterConfig;
 use crate::feed::FeedItem;
 use crate::geo::{first_relevant_article_text, EvidenceKind, LocationEvidence};
 
+/// Soft hyphens and zero-width characters: invisible on a page, but they split a word
+/// ("Charlotten&shy;burg") for every comparison.
+pub(crate) fn is_invisible(c: char) -> bool {
+    matches!(
+        c,
+        '\u{00AD}' | '\u{200B}' | '\u{200C}' | '\u{200D}' | '\u{FEFF}'
+    )
+}
+
 pub(crate) fn normalize(s: &str) -> String {
-    s.to_lowercase()
+    s.chars()
+        .filter(|c| !is_invisible(*c))
+        .collect::<String>()
+        .to_lowercase()
         .replace('ß', "ss")
         // street abbreviations: "str." and "str " both normalize to "strasse"
         // so "Examplestr.", "Examplestrasse", "Examplestraße" all match

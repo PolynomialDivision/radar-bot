@@ -74,7 +74,10 @@ pub(crate) fn strip_html(html: &str) -> String {
             _ => {}
         }
     }
-    let out = decode_entities(&out);
+    let out: String = decode_entities(&out)
+        .chars()
+        .filter(|c| !crate::filter::is_invisible(*c))
+        .collect();
     out.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
