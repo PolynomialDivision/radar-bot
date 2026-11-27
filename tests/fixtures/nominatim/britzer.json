@@ -1,0 +1,4 @@
+[{"place_id":3,"osm_type":"way","osm_id":3,"lat":"52.4745","lon":"13.4100","class":"highway","type":"secondary","name":"Britzer Allee",
+  "display_name":"Britzer Allee, YourQuarter, YourDistrict, Yourcity, 10000, Yourcountry",
+  "address":{"road":"Britzer Allee","suburb":"YourQuarter","borough":"YourDistrict","city":"Yourcity","postcode":"10000","country":"Yourcountry","country_code":"xx"},
+  "geojson":{"type":"LineString","coordinates":[[13.3800,52.4745],[13.4205,52.4745],[13.4400,52.4745]]}}]

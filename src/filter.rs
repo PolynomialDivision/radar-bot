@@ -1,8 +1,10 @@
 //! Keyword filtering.
 
-use super::*;
-
 // ── Filtering ─────────────────────────────────────────────────────────────────
+
+use crate::config::FilterConfig;
+use crate::feed::FeedItem;
+use crate::geo::{first_relevant_article_text, EvidenceKind, LocationEvidence};
 
 pub(crate) fn normalize(s: &str) -> String {
     s.to_lowercase()
@@ -209,6 +211,9 @@ pub(crate) fn keyword_check(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::AreaGroup;
+    use crate::config::FilterConfig;
+    use crate::feed::FeedItem;
 
     fn item(title: &str, article: &str) -> FeedItem {
         FeedItem {
@@ -314,5 +319,39 @@ mod tests {
         assert!(rest.starts_with(' '));
         assert_eq!(lead.len() + rest.len(), text.len());
         assert_eq!(split_lead("kurz"), ("kurz", ""));
+    }
+
+    #[test]
+    fn keyword_area_matches_berlin_prefixed_district_name() {
+        let filter = FilterConfig {
+            area: vec![AreaGroup {
+                implied_meters: 1500.0,
+                terms: vec!["Charlottenburg".to_owned()],
+            }],
+            ..Default::default()
+        };
+        let item = FeedItem {
+            guid: "district".to_owned(),
+            title: "Einsatz in Berlin-Charlottenburg".to_owned(),
+            link: None,
+            link_note: None,
+            description: None,
+            article_text: None,
+            source_name: "Test".to_owned(),
+            score: 0,
+            max_score: 0,
+            distance_meters: None,
+            location_label: None,
+            published_at: None,
+            ..Default::default()
+        };
+
+        let hit = keyword_check(&item, &filter, &[]).expect("keyword check should pass");
+
+        assert_eq!(hit.evidence.len(), 1);
+        assert_eq!(hit.evidence[0].meters, 1500.0);
+        assert_eq!(hit.evidence[0].label, "Charlottenburg");
+        assert!(hit.evidence[0].prominent);
+        assert_eq!(hit.matched, vec!["\"Charlottenburg\" (1500m)"]);
     }
 }

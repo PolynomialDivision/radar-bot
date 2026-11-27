@@ -1,0 +1,95 @@
+# Recorded answers for `radar-bot --dry-run --fixtures tests/fixtures config.toml.example` and
+# for the tests: the first route whose `url` is a prefix of the request wins; a request without
+# a route fails like an unreachable host. All places, names and accounts here are invented
+# (the example configuration's placeholders and the tests' stand-in streets).
+
+# Feeds of config.toml.example
+[[route]]
+url = "https://example.com/police/rss.xml"
+file = "feeds/police_title_only.xml"
+content_type = "application/rss+xml"
+
+[[route]]
+url = "https://example.com/news/rss.xml"
+file = "feeds/broadcaster_full_text.xml"
+content_type = "application/rss+xml"
+
+[[route]]
+url = "https://example.com/national/rss.xml"
+file = "feeds/national_atom.xml"
+content_type = "application/atom+xml"
+
+[[route]]
+url = "https://example.com/local/rss.xml"
+file = "feeds/neighbourhood_georss.xml"
+content_type = "application/rss+xml"
+
+[[route]]
+url = "https://news.google.com/rss/search?q="
+file = "feeds/google_news.xml"
+content_type = "application/rss+xml"
+
+# Article pages (the other links have no page and fail)
+[[route]]
+url = "https://example.com/police/1001"
+file = "pages/article_layout.html"
+content_type = "text/html; charset=utf-8"
+
+[[route]]
+url = "https://example.com/local/leserbrief"
+file = "pages/nested_div.html"
+content_type = "text/html; charset=utf-8"
+
+[[route]]
+url = "https://example.com/national/konzert"
+file = "pages/event_jsonld.html"
+content_type = "text/html; charset=utf-8"
+
+# Bluesky
+[[route]]
+url = "https://bsky.social/xrpc/com.atproto.server.createSession"
+method = "POST"
+file = "bluesky/session.json"
+content_type = "application/json"
+
+[[route]]
+url = "https://bsky.social/xrpc/app.bsky.feed.searchPosts"
+file = "bluesky/search.json"
+content_type = "application/json"
+
+# Nominatim: the reference address, its district, two streets, and "nothing" for the rest
+[[route]]
+url = "https://nominatim.openstreetmap.org/search?q=Yourstreet+1"
+file = "nominatim/reference.json"
+content_type = "application/json"
+
+[[route]]
+url = "https://nominatim.openstreetmap.org/reverse?"
+file = "nominatim/reverse.json"
+content_type = "application/json"
+
+[[route]]
+url = "https://nominatim.openstreetmap.org/search?q=Perleberger+Stra%C3%9Fe"
+file = "nominatim/perleberger.json"
+content_type = "application/json"
+
+[[route]]
+url = "https://nominatim.openstreetmap.org/search?q=Britzer+Allee"
+file = "nominatim/britzer.json"
+content_type = "application/json"
+
+[[route]]
+url = "https://nominatim.openstreetmap.org/search?"
+body = "[]"
+content_type = "application/json"
+
+# Warnings (parse tests only; the dry run does not poll warnings)
+[[route]]
+url = "https://warnung.bund.de/api31/dashboard/"
+file = "warnings/nina_dashboard.json"
+content_type = "application/json"
+
+[[route]]
+url = "https://www.dwd.de/DWD/warnungen/warnapp/json/warnings.json"
+file = "warnings/dwd_warnings.json"
+content_type = "application/javascript"

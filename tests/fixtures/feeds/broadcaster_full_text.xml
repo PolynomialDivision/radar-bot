@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0" xmlns:content="http://purl.org/rss/1.0/modules/content/">
+  <channel>
+    <title>Local Public Broadcaster</title>
+    <link>https://example.com/news/</link>
+    <description>News from Yourcity</description>
+    <item>
+      <title>Feuer in Wohnhaus: zwei Verletzte, Straße gesperrt</title>
+      <link>https://example.com/news/feuer-wohnhaus</link>
+      <guid isPermaLink="false">news-feuer-wohnhaus</guid>
+      <pubDate>Fri, 20 Nov 2026 09:00:00 +0100</pubDate>
+      <description>In der Perleberger Straße hat es in der Nacht gebrannt.</description>
+      <content:encoded><![CDATA[<p>In der Perleberger Straße in Yourcity-YourDistrict hat es in der Nacht zu Freitag in einem Wohnhaus gebrannt. Zwei Bewohner wurden mit Rauchvergiftungen in ein Krankenhaus gebracht.</p><p>Die Feuerwehr war mit 40 Kräften im Einsatz und löschte den Brand im zweiten Obergeschoss. Die Straße war bis zum Morgen gesperrt. Die Polizei ermittelt zur Brandursache und schließt Brandstiftung nicht aus.</p><p>Anwohner berichteten, dass sie gegen zwei Uhr Rauch bemerkt und den Notruf gewählt hätten. Das Haus ist vorerst nicht bewohnbar.</p><p>Die Hausverwaltung hat den Mieterinnen und Mietern Ersatzwohnungen angeboten. Nachbarn sammeln Kleidung und Spielzeug für zwei betroffene Familien.</p>]]></content:encoded>
+    </item>
+    <item>
+      <title>Senat beschließt neuen Haushalt</title>
+      <link>https://example.com/news/haushalt</link>
+      <guid isPermaLink="false">news-haushalt</guid>
+      <pubDate>Thu, 19 Nov 2026 17:00:00 +0100</pubDate>
+      <description>Der Senat hat den Doppelhaushalt verabschiedet.</description>
+      <content:encoded><![CDATA[<p>Der Senat von Yourcity hat am Donnerstag den Doppelhaushalt für die kommenden zwei Jahre beschlossen. Gespart werden soll vor allem bei der Verwaltung, die Ausgaben für Schulen und Kitas steigen leicht.</p><p>Die Opposition kritisierte die Pläne als unzureichend. Das Parlament berät den Entwurf im Dezember.</p>]]></content:encoded>
+    </item>
+    <item>
+      <title>Spielstraße in der Yourstreet geplant</title>
+      <link>https://example.com/news/spielstrasse</link>
+      <guid isPermaLink="false">news-spielstrasse</guid>
+      <pubDate>Thu, 19 Nov 2026 12:00:00 +0100</pubDate>
+      <description>Das Bezirksamt will die Yourstreet an Sonntagen sperren.</description>
+      <content:encoded><![CDATA[<p>Das Bezirksamt YourDistrict will die Yourstreet ab dem Frühjahr an Sonntagen für den Autoverkehr sperren und als Spielstraße freigeben. Anwohnerinnen und Anwohner können sich bis Ende Dezember an einer Online-Beteiligung äußern.</p>]]></content:encoded>
+    </item>
+  </channel>
+</rss>

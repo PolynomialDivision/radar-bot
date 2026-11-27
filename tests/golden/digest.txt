@@ -1,0 +1,29 @@
+📡 Digest · Friday, 20 Nov 2026
+
+🔴 Brand in Wohnhaus – zwei Verletzte
+📰 Local Police + Local Public Broadcaster · ⭐ 5/5 · 👥 2 sources
+📍 ~433m · Perleberger Straße, YourQuarter, YourDistrict
+🔗 https://example.com/police/1001
+
+🟠 Verkehrsunfall auf der Britzer Allee
+📰 Local Police · ⭐ 4/5
+📍 ~100m · Britzer Allee, YourQuarter, YourDistrict
+🔗 https://example.com/police/1003
+
+🔴 Konzert in Yourcity: Kiezband spielt im Hinterhof
+📰 National News · ⭐ 5/5
+📍 ~100m · Musterstraße 1 10000 Yourcity
+🔗 https://example.com/national/konzert
+
+🟡 Liveticker: Sperrungen & Umleitungen <heute>
+📰 Local Public Broadcaster · ⭐ 3/5
+📍 ~1.2km
+🔗 https://example.com/news/ticker?id=7&utm_source=rss (rolling source link may no longer show this item)
+
+🟠 Spielstraße in der Yourstreet geplant
+📰 Local Public Broadcaster · ⭐ 4/5
+📍 Yourstreet
+🔗 https://example.com/news/spielstrasse
+
+🟢 Schöne Grüße aus #YourCity
+📰 Bluesky #YourCity · ⭐ 2/5

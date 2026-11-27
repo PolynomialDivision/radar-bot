@@ -1,6 +1,9 @@
-use crate::FeedItem;
 use tokio::time::Duration;
-use tracing::warn;
+use tracing::{debug, warn};
+
+use super::SourceError;
+use crate::feed::FeedItem;
+use crate::fetch::Http;
 
 pub struct RssAdapter {
     pub name: String,
@@ -10,33 +13,54 @@ pub struct RssAdapter {
 }
 
 impl RssAdapter {
-    pub async fn fetch_items(&self, http: &reqwest::Client) -> Vec<FeedItem> {
+    pub(crate) async fn fetch_items(&self, http: &Http) -> Result<Vec<FeedItem>, SourceError> {
         if self.url.trim().is_empty() {
-            warn!("RSS source '{}' has no URL configured: skipping", self.name);
-            return vec![];
+            return Err(SourceError::Malformed("no URL configured".to_owned()));
         }
 
-        let resp = tokio::time::timeout(Duration::from_secs(30), http.get(&self.url).send()).await;
-
-        let xml = match resp {
-            Ok(Ok(r)) => match r.text().await {
-                Ok(t) => t,
-                Err(e) => {
-                    warn!("Failed to read RSS response from '{}': {e}", self.name);
-                    return vec![];
-                }
-            },
-            Ok(Err(e)) => {
+        let (response, unchanged) = http
+            .get_feed(&self.url, Duration::from_secs(30))
+            .await
+            .map_err(|e| {
                 warn!("Failed to fetch RSS '{}': {e}", self.name);
-                return vec![];
+                SourceError::from_fetch(e)
+            })?;
+        if unchanged && response.status == 304 {
+            // Not modified, and nothing kept from before (a restart): no new items.
+            return Ok(Vec::new());
+        }
+        if !response.is_success() {
+            warn!(
+                "RSS '{}' answered HTTP {} ({}), no feed",
+                self.name,
+                response.status,
+                response.content_type()
+            );
+            return Err(SourceError::from_status(response.status));
+        }
+
+        let mut items = match crate::parse_feed_entries(&response.body, &self.name) {
+            Ok(items) if !items.is_empty() => items,
+            Ok(_) => {
+                warn!(
+                    "RSS '{}' has no entries (HTTP {}, {}, {} bytes)",
+                    self.name,
+                    response.status,
+                    response.content_type(),
+                    response.body.len()
+                );
+                return Ok(Vec::new());
             }
-            Err(_) => {
-                warn!("RSS fetch timed out for '{}'", self.name);
-                return vec![];
+            Err(e) => {
+                warn!(
+                    "RSS '{}' is not a feed (HTTP {}, {}): {e}",
+                    self.name,
+                    response.status,
+                    response.content_type()
+                );
+                return Err(SourceError::Malformed(e));
             }
         };
-
-        let mut items = crate::parse_feed(&xml, &self.name);
 
         if let Some(max_age) = self.max_age_hours {
             let cutoff = chrono::Utc::now().timestamp() - (max_age as i64 * 3600);
@@ -45,13 +69,13 @@ impl RssAdapter {
             items.retain(|item| item.published_at.is_none_or(|ts| ts >= cutoff));
             let dropped = before - items.len();
             if dropped > 0 {
-                warn!(
+                debug!(
                     "RSS age filter [{}]: dropped {dropped} item(s) older than {max_age}h",
                     self.name
                 );
             }
         }
 
-        items
+        Ok(items)
     }
 }

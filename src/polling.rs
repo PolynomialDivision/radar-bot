@@ -1,8 +1,29 @@
 //! Polling sources and scoring/queueing new items.
 
-use super::*;
-
 // ── Polling loop ──────────────────────────────────────────────────────────────
+
+use crate::geo::Geocoder;
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+use std::time::Duration;
+
+use mxbot_common::supervise::Alive;
+use tokio::task::JoinSet;
+use tokio::time::sleep;
+use tracing::{info, warn};
+
+use crate::config::{FilterConfig, SourceConfig};
+use crate::extract::article::{fetch_article, Page};
+use crate::feed::FeedItem;
+use crate::fetch::Http;
+use crate::filter::{keyword_check, normalize, ItemText, TermMatch};
+use crate::geo::{
+    best_evidence, find_configured_places, find_nearest_distance, format_distance,
+    haversine_meters, DistanceLookup, EvidenceKind, LocationEvidence, HEARTBEAT_INTERVAL,
+};
+use crate::sources::SourceError;
+use crate::store::Db;
+use crate::{sources, store};
 
 /// After this many polls ending in "retry later" (article page or geocoder
 /// unreachable), an item is decided with the information at hand, with the
@@ -16,20 +37,44 @@ pub(crate) enum ProcessOutcome {
     Retry { item: FeedItem, reason: String },
 }
 
+/// What a poll round and its item tasks work with. Cheap to clone.
+#[derive(Clone)]
+pub(crate) struct PollCtx {
+    pub(crate) http: Http,
+    pub(crate) filter: Arc<FilterConfig>,
+    pub(crate) ref_point: Option<(f64, f64)>,
+    pub(crate) geocoder: Geocoder,
+}
+
+impl PollCtx {
+    /// Street lookups are anchored to `filter.geocode_city`; their cache lives as long as the
+    /// context.
+    pub(crate) fn new(http: Http, filter: FilterConfig, ref_point: Option<(f64, f64)>) -> Self {
+        let geocoder = Geocoder::new(http.clone(), filter.geocode_city.as_deref().unwrap_or(""));
+        PollCtx {
+            http,
+            filter: Arc::new(filter),
+            ref_point,
+            geocoder,
+        }
+    }
+}
+
 /// Process a single feed item: fetch article, keyword-check, geocode, score.
-#[allow(clippy::too_many_arguments)]
 pub(crate) async fn process_item(
-    http: reqwest::Client,
+    ctx: PollCtx,
     source: SourceConfig,
     mut item: FeedItem,
-    filter: Arc<FilterConfig>,
-    ref_point: Option<(f64, f64)>,
-    geocode_city: Arc<str>,
-    geocode_cache: GeocodeCache,
-    limiter: NominatimLimiter,
     final_attempt: bool,
 ) -> ProcessOutcome {
+    let PollCtx {
+        http,
+        filter,
+        ref_point,
+        geocoder,
+    } = ctx;
     let source_name = source.name.clone();
+    item.deliver_always = !source.filter;
 
     // Fetch article body (used for filtering + geocoding street extraction).
     // extract_article_body() isolates <article>/<main> to avoid navigation false-positives.
@@ -39,7 +84,7 @@ pub(crate) async fn process_item(
         if let Some(ref url) = item.link {
             tracing::debug!("fetching article [{}] {:?}", source_name, item.title);
             match fetch_article(&http, url, &item.title).await {
-                Some(article) => {
+                Page::Article(article) => {
                     item.article_text = Some(article.text);
                     // An old article resurfacing in a feed (or a Google News
                     // search) often carries a fresh feed date; trust the older.
@@ -57,7 +102,14 @@ pub(crate) async fn process_item(
                     }
                     item.link_note = article.link_note;
                 }
-                None => {
+                Page::NotAnArticle(content_type) => {
+                    tracing::debug!(
+                        "link is no article page [{}] {:?}: {content_type}",
+                        source_name,
+                        item.title
+                    );
+                }
+                Page::Failed => {
                     article_fetch_failed = true;
                 }
             }
@@ -140,19 +192,8 @@ pub(crate) async fn process_item(
     }
 
     // ── 2. Geocode → actual distance ──────────────────────────────────────────
-    if let Some((ref_lat, ref_lon)) = ref_point {
-        match find_nearest_distance(
-            &http,
-            &item,
-            &text,
-            ref_lat,
-            ref_lon,
-            &geocode_city,
-            &geocode_cache,
-            &limiter,
-        )
-        .await
-        {
+    if let Some(point) = ref_point {
+        match find_nearest_distance(&geocoder, &item, &text, point).await {
             DistanceLookup::Found(found) => {
                 info!(
                     "  📍 [{}] {:?} → {} at {}{}",
@@ -292,31 +333,27 @@ pub(crate) fn located_elsewhere(item: &FeedItem, filter: &FilterConfig) -> Optio
     (!names_own).then(|| format!("title names {other}"))
 }
 
-#[allow(clippy::too_many_arguments)]
+/// One poll round. `decide_now` decides every item in this round, as on its last retry
+/// (`--dry-run`, which has no next round).
 pub(crate) async fn poll_once(
-    _client: &Bot,
-    http: &reqwest::Client,
-    sources: &[SourceConfig],
-    filter: &FilterConfig,
-    ref_point: Option<(f64, f64)>,
+    ctx: &PollCtx,
     db: &Db,
-    geocode_cache: &GeocodeCache,
+    sources: &[SourceConfig],
     bluesky: Option<&sources::BlueskyContext>,
-    test_mode: bool,
+    decide_now: bool,
 ) -> PollSummary {
+    let http = &ctx.http;
     let mut summary = PollSummary {
         sources: sources.len(),
         ..PollSummary::default()
     };
-    let arc_filter = Arc::new(filter.clone());
-    let geocode_city: Arc<str> = Arc::from(filter.geocode_city.as_deref().unwrap_or(""));
-    let limiter: NominatimLimiter = Arc::new(Semaphore::new(1));
 
     // Fetch all feeds concurrently and collect new items, then process them in parallel.
     // Seen-check stays sequential to avoid races; article fetch + geocoding run concurrently.
     let mut pending: Vec<(SourceConfig, FeedItem)> = Vec::new();
     let mut total_by_source: HashMap<String, usize> = HashMap::new();
-    let mut source_tasks: JoinSet<(SourceConfig, Vec<FeedItem>)> = JoinSet::new();
+    let mut source_tasks: JoinSet<(SourceConfig, Result<Vec<FeedItem>, SourceError>)> =
+        JoinSet::new();
     let bluesky_owned = bluesky.cloned();
 
     for source in sources {
@@ -331,8 +368,9 @@ pub(crate) async fn poll_once(
         });
     }
 
+    let now = chrono::Utc::now().timestamp();
     while let Some(res) = source_tasks.join_next().await {
-        let (source, items) = match res {
+        let (source, result) = match res {
             Ok(v) => v,
             Err(e) => {
                 warn!("Source fetch task panicked: {e}");
@@ -340,16 +378,37 @@ pub(crate) async fn poll_once(
                 continue;
             }
         };
+        let items = match result {
+            Ok(items) => items,
+            Err(e) => {
+                warn!("Source '{}' failed: {e}", source.name);
+                if let Err(e) = db
+                    .record_source_round(&source.name, Err(e.to_string()), now)
+                    .await
+                {
+                    warn!("Failed to record the state of '{}': {e:#}", source.name);
+                }
+                continue;
+            }
+        };
         *total_by_source.entry(source.name.clone()).or_default() += items.len();
         summary.fetched += items.len();
 
-        for item in items {
-            let is_new = test_mode || db.is_new(&item.guid).await.unwrap_or(true);
-            if is_new {
-                pending.push((source.clone(), item));
-            }
+        let guids = items.iter().map(|item| item.guid.clone()).collect();
+        let seen = db.seen_guids(guids).await.unwrap_or_default();
+        let new: Vec<FeedItem> = items
+            .into_iter()
+            .filter(|item| !seen.contains(&item.guid))
+            .collect();
+        if let Err(e) = db
+            .record_source_round(&source.name, Ok(new.len()), now)
+            .await
+        {
+            warn!("Failed to record the state of '{}': {e:#}", source.name);
         }
+        pending.extend(new.into_iter().map(|item| (source.clone(), item)));
     }
+    report_source_health(db, sources, now).await;
 
     // Spawn one task per item: article fetches and geocoding run in parallel.
     // Geocoding tasks share the NominatimLimiter so total Nominatim traffic stays ≤ 1 req/s.
@@ -357,21 +416,12 @@ pub(crate) async fn poll_once(
     let n_pending = pending.len();
     summary.new_items = n_pending;
     for (source, item) in pending {
-        let attempts = if test_mode {
-            0
-        } else {
-            db.retry_attempts(&item.guid).await.unwrap_or(0)
-        };
+        let attempts = db.retry_attempts(&item.guid).await.unwrap_or(0);
         tasks.spawn(process_item(
-            http.clone(),
+            ctx.clone(),
             source,
             item,
-            arc_filter.clone(),
-            ref_point,
-            geocode_city.clone(),
-            geocode_cache.clone(),
-            limiter.clone(),
-            attempts >= MAX_RETRY_ATTEMPTS,
+            decide_now || attempts >= MAX_RETRY_ATTEMPTS,
         ));
     }
     if n_pending > 0 {
@@ -381,7 +431,7 @@ pub(crate) async fn poll_once(
     // Heartbeat: log progress every 5s so the bot doesn't appear frozen during geocoding.
     let n_done_shared = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let ticker = {
-        let cache = geocode_cache.clone();
+        let cache = ctx.geocoder.cache.clone();
         let n_done_shared = n_done_shared.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(HEARTBEAT_INTERVAL);
@@ -413,44 +463,36 @@ pub(crate) async fn poll_once(
                 *passed_by_source
                     .entry(item.source_name.clone())
                     .or_default() += 1;
-                if !test_mode {
-                    db.insert_queued(&item).await.ok();
-                }
+                db.insert_queued(&item).await.ok();
             }
             Ok(ProcessOutcome::Candidate { item, reason }) => {
                 *candidate_by_source
                     .entry(item.source_name.clone())
                     .or_default() += 1;
                 *candidate_reasons.entry(reason.clone()).or_default() += 1;
-                if !test_mode {
-                    db.insert_candidate(&item, &reason).await.ok();
-                }
+                db.insert_candidate(&item, &reason).await.ok();
             }
             Ok(ProcessOutcome::Dropped { item, reason }) => {
                 *dropped_by_source
                     .entry(item.source_name.clone())
                     .or_default() += 1;
                 *drop_reasons.entry(reason.clone()).or_default() += 1;
-                if !test_mode {
-                    db.insert_dropped(
-                        &item.guid,
-                        &item.source_name,
-                        &item.title,
-                        item.link.as_deref(),
-                        &reason,
-                    )
-                    .await
-                    .ok();
-                }
+                db.insert_dropped(
+                    &item.guid,
+                    &item.source_name,
+                    &item.title,
+                    item.link.as_deref(),
+                    &reason,
+                )
+                .await
+                .ok();
             }
             Ok(ProcessOutcome::Retry { item, reason }) => {
                 *retried_by_source
                     .entry(item.source_name.clone())
                     .or_default() += 1;
                 *retry_reasons.entry(reason).or_default() += 1;
-                if !test_mode {
-                    db.record_retry(&item.guid).await.ok();
-                }
+                db.record_retry(&item.guid).await.ok();
             }
             Err(e) => warn!("Item task panicked: {e}"),
         }
@@ -469,7 +511,7 @@ pub(crate) async fn poll_once(
         } else {
             info!("Source '{}': {total} in feed, {passed} new", source.name);
         }
-        source_stats.push(db::SourcePollStat {
+        source_stats.push(store::SourcePollStat {
             source_name: source.name.clone(),
             total,
             queued: passed,
@@ -478,10 +520,8 @@ pub(crate) async fn poll_once(
             retry_later: retried,
         });
     }
-    if !test_mode {
-        if let Err(e) = db.record_source_stats(source_stats).await {
-            warn!("Failed to record source stats: {e}");
-        }
+    if let Err(e) = db.record_source_stats(source_stats).await {
+        warn!("Failed to record source stats: {e}");
     }
     for (reason, count) in candidate_reasons {
         info!("Candidate reason: {count} item(s): {reason}");
@@ -493,6 +533,62 @@ pub(crate) async fn poll_once(
         info!("Retry reason: {count} item(s): {reason}");
     }
     summary
+}
+
+/// The configured sources that are failing (with their last error), and those that are silent.
+pub(crate) fn source_verdict(
+    health: &[store::SourceHealth],
+    names: &[String],
+    now: i64,
+) -> (Vec<String>, Vec<String>) {
+    let configured: HashSet<&str> = names.iter().map(String::as_str).collect();
+    let mine = || {
+        health
+            .iter()
+            .filter(|h| configured.contains(h.source_name.as_str()))
+    };
+    let failing = mine()
+        .filter(|h| h.is_failing())
+        .map(|h| {
+            format!(
+                "{} ({})",
+                h.source_name,
+                h.last_error.as_deref().unwrap_or("no error recorded")
+            )
+        })
+        .collect();
+    let silent = mine()
+        .filter(|h| h.is_silent(now))
+        .map(|h| h.source_name.clone())
+        .collect();
+    (failing, silent)
+}
+
+/// After a round: `radar sources` fails while a source has failed
+/// [`store::FAILING_AFTER`] polls in a row, naming it; the gauge `radar_sources_silent`
+/// counts the sources that answer without new items for a month.
+async fn report_source_health(db: &Db, sources: &[SourceConfig], now: i64) {
+    let health = match db.source_health().await {
+        Ok(health) => health,
+        Err(e) => {
+            warn!("Failed to read the source states: {e:#}");
+            return;
+        }
+    };
+    let names: Vec<String> = sources.iter().map(|s| s.name.clone()).collect();
+    let (failing, silent) = source_verdict(&health, &names, now);
+    mxbot_common::status::gauge("radar_sources_silent").set(silent.len() as f64);
+    let alive = mxbot_common::supervise::report("radar sources");
+    if failing.is_empty() {
+        alive.ok();
+    } else {
+        alive.failed(format!(
+            "{} source(s) failing {} polls in a row: {}",
+            failing.len(),
+            store::FAILING_AFTER,
+            failing.join(", ")
+        ));
+    }
 }
 
 /// What a poll round saw, for the status file (the round does not depend on it).
@@ -525,16 +621,11 @@ impl PollSummary {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 pub(crate) async fn poll_loop(
-    client: Bot,
-    http: reqwest::Client,
-    sources: Vec<SourceConfig>,
-    filter: FilterConfig,
-    ref_point: Option<(f64, f64)>,
-    interval_mins: u64,
+    ctx: PollCtx,
     db: Db,
-    geocode_cache: GeocodeCache,
+    sources: Vec<SourceConfig>,
+    interval_mins: u64,
     bluesky: Option<sources::BlueskyContext>,
     alive: Alive,
 ) {
@@ -542,19 +633,9 @@ pub(crate) async fn poll_loop(
     alive.expect_every(interval);
     loop {
         alive.tick();
-        poll_once(
-            &client,
-            &http,
-            &sources,
-            &filter,
-            ref_point,
-            &db,
-            &geocode_cache,
-            bluesky.as_ref(),
-            false,
-        )
-        .await
-        .report(&alive);
+        poll_once(&ctx, &db, &sources, bluesky.as_ref(), false)
+            .await
+            .report(&alive);
         info!("Next poll in {interval_mins}m");
         sleep(interval).await;
     }
@@ -563,6 +644,16 @@ pub(crate) async fn poll_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::AreaGroup;
+    use crate::config::FilterConfig;
+    use crate::config::SourceConfig;
+    use crate::feed::FeedItem;
+    use crate::fetch::Http;
+
+    use crate::store;
+    use crate::store::Db;
+
+    use std::sync::Arc;
 
     #[test]
     fn poll_rounds_are_reported_for_the_status_file() {
@@ -645,14 +736,9 @@ mod tests {
 
     async fn run(source: SourceConfig, item: FeedItem) -> ProcessOutcome {
         process_item(
-            reqwest::Client::new(),
+            PollCtx::new(Http::offline(), filter(), None),
             source,
             item,
-            Arc::new(filter()),
-            None,
-            Arc::from(""),
-            Arc::new(DashMap::new()),
-            Arc::new(Semaphore::new(1)),
             false,
         )
         .await
@@ -734,21 +820,12 @@ mod tests {
         item.venue = Some("Musterstraße 1".to_owned());
 
         // Offline: the venue address is a known geocoder miss.
-        let cache: GeocodeCache = Arc::new(DashMap::new());
-        cache.insert("Musterstraße 1".to_owned(), Vec::new());
+        let ctx = PollCtx::new(Http::offline(), filter(), Some((52.4736, 13.4205)));
+        ctx.geocoder
+            .cache
+            .insert("Musterstraße 1".to_owned(), Vec::new());
 
-        let outcome = process_item(
-            reqwest::Client::new(),
-            source(Some(9000.0), None),
-            item,
-            Arc::new(filter()),
-            Some((52.4736, 13.4205)),
-            Arc::from(""),
-            cache,
-            Arc::new(Semaphore::new(1)),
-            false,
-        )
-        .await;
+        let outcome = process_item(ctx, source(Some(9000.0), None), item, false).await;
 
         let ProcessOutcome::Queued(item) = outcome else {
             panic!("expected queued");
@@ -762,17 +839,12 @@ mod tests {
     async fn unreachable_article_is_decided_after_the_last_retry() {
         let mut item = report("Einsatz", "");
         item.article_text = None;
-        item.link = Some("http://127.0.0.1:9/unreachable".to_owned());
+        item.link = Some("https://unreachable.test/report".to_owned());
         let run = |final_attempt| {
             process_item(
-                reqwest::Client::new(),
+                PollCtx::new(Http::offline(), filter(), None),
                 source(Some(9000.0), None),
                 item.clone(),
-                Arc::new(filter()),
-                None,
-                Arc::from(""),
-                Arc::new(DashMap::new()),
-                Arc::new(Semaphore::new(1)),
                 final_attempt,
             )
         };
@@ -783,8 +855,7 @@ mod tests {
 
     #[tokio::test]
     async fn retry_attempts_are_counted_and_cleared_on_decision() {
-        let path = std::env::temp_dir().join(format!("radar-retry-test-{}.db", std::process::id()));
-        let db = Db::open(&path).unwrap();
+        let (db, _dir) = crate::testing::test_db();
         let item = report("Einsatz", "");
 
         db.record_retry(&item.guid).await.unwrap();
@@ -793,8 +864,139 @@ mod tests {
 
         db.insert_candidate(&item, "test").await.unwrap();
         assert_eq!(db.retry_attempts(&item.guid).await.unwrap(), 0);
+    }
 
-        drop(db);
-        let _ = std::fs::remove_file(path);
+    /// F-01: an unfiltered source is meant to be delivered whatever its distance, but the
+    /// digest drops its queued items below the threshold.
+    #[tokio::test]
+    async fn an_unfiltered_source_is_delivered_whatever_its_score() {
+        let mut local = source(Some(1_500.0), None);
+        local.filter = false;
+        let ProcessOutcome::Queued(item) =
+            run(local, report("Hoffest im Hinterhof", "Mit Kuchen.")).await
+        else {
+            panic!("an unfiltered source's item is queued");
+        };
+        assert_eq!(item.score, 2);
+        let (db, _dir) = crate::testing::test_db();
+        db.insert_queued(&item).await.unwrap();
+
+        let mut filtered = report("Einsatz", "Ein Einsatz.");
+        filtered.guid = "filtered".to_owned();
+        filtered.score = 2;
+        db.insert_queued(&filtered).await.unwrap();
+
+        let taken = db.take_for_digest(3).await.unwrap();
+
+        assert_eq!(taken.len(), 1, "threshold 3 dropped the unfiltered item");
+        assert_eq!(taken[0].guid, item.guid);
+    }
+
+    fn feed(name: &str, url: &str) -> SourceConfig {
+        SourceConfig {
+            name: name.to_owned(),
+            url: Some(url.to_owned()),
+            ..source(Some(9_000.0), None)
+        }
+    }
+
+    fn names(sources: &[SourceConfig]) -> Vec<String> {
+        sources.iter().map(|s| s.name.clone()).collect()
+    }
+
+    async fn rounds(http: &Http, sources: &[SourceConfig], db: &Db, n: usize) {
+        let ctx = PollCtx::new(http.clone(), filter(), None);
+        for _ in 0..n {
+            poll_once(&ctx, db, sources, None, true).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn a_feed_answering_not_modified_is_healthy_and_gives_no_items() {
+        let (db, _dir) = crate::testing::test_db();
+        let http = Http::recorded(Arc::new(crate::fetch::Recorded::new().route(
+            "https://feed.test/",
+            304,
+            "",
+        )));
+        let sources = [feed("Quiet Feed", "https://feed.test/rss")];
+
+        rounds(&http, &sources, &db, 1).await;
+
+        let health = db.source_health().await.unwrap();
+        assert_eq!(health.len(), 1);
+        assert_eq!(health[0].consecutive_failures, 0);
+        assert!(health[0].last_success_at.is_some());
+        assert_eq!(health[0].last_item_at, None);
+    }
+
+    #[tokio::test]
+    async fn six_failed_polls_in_a_row_name_the_source() {
+        let (db, _dir) = crate::testing::test_db();
+        let http = Http::recorded(Arc::new(
+            crate::fetch::Recorded::new()
+                .route("https://gone.test/", 404, "<html>Not Found</html>")
+                .route(
+                    "https://ok.test/",
+                    200,
+                    &crate::testing::fixture("feeds/police_title_only.xml"),
+                ),
+        ));
+        let sources = [
+            feed("Gone Feed", "https://gone.test/rss"),
+            feed("Fine Feed", "https://ok.test/rss"),
+        ];
+        let now = chrono::Utc::now().timestamp();
+
+        rounds(&http, &sources, &db, 5).await;
+        let (failing, _) =
+            source_verdict(&db.source_health().await.unwrap(), &names(&sources), now);
+        assert!(failing.is_empty(), "five are not yet failing: {failing:?}");
+
+        rounds(&http, &sources, &db, 1).await;
+        let health = db.source_health().await.unwrap();
+        let (failing, silent) = source_verdict(&health, &names(&sources), now);
+
+        assert_eq!(failing, vec!["Gone Feed (refused: HTTP 404)"]);
+        assert!(silent.is_empty());
+        let fine = health
+            .iter()
+            .find(|h| h.source_name == "Fine Feed")
+            .unwrap();
+        assert!(fine.last_item_at.is_some());
+    }
+
+    #[test]
+    fn a_source_without_new_items_for_a_month_is_silent() {
+        let now = 100 * 86_400;
+        let health = |last_item_at, failures| store::SourceHealth {
+            source_name: "S".to_owned(),
+            first_polled_at: 0,
+            last_success_at: Some(now),
+            last_item_at,
+            last_error: None,
+            consecutive_failures: failures,
+        };
+        let sources = vec!["S".to_owned()];
+
+        assert_eq!(
+            source_verdict(&[health(Some(now - 31 * 86_400), 0)], &sources, now)
+                .1
+                .len(),
+            1
+        );
+        assert_eq!(
+            source_verdict(&[health(Some(now - 29 * 86_400), 0)], &sources, now)
+                .1
+                .len(),
+            0
+        );
+        assert_eq!(source_verdict(&[health(None, 0)], &sources, now).1.len(), 1);
+        // Failing is reported as failing, not as silent; unknown names are ignored.
+        assert_eq!(source_verdict(&[health(None, 6)], &sources, now).1.len(), 0);
+        assert_eq!(
+            source_verdict(&[health(None, 0)], &[], now),
+            (vec![], vec![])
+        );
     }
 }

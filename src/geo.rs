@@ -1,6 +1,18 @@
 //! Geocoding (Nominatim), distances and street/place evidence.
 
-use super::*;
+use std::collections::HashSet;
+use std::sync::Arc;
+use std::time::Duration;
+
+use dashmap::DashMap;
+use tokio::sync::Semaphore;
+use tokio::time::sleep;
+use tracing::warn;
+
+use crate::config::FilterConfig;
+use crate::feed::FeedItem;
+use crate::fetch::Http;
+use crate::filter::{normalize, split_lead, ItemText};
 
 #[derive(Debug, Clone)]
 pub(crate) struct GeocodeHit {
@@ -558,7 +570,7 @@ pub(crate) fn url_encode(s: &str) -> String {
 /// transient failures (network, timeout, parse). Only `Ok(_)` results should
 /// be cached.
 pub(crate) async fn geocode_location(
-    http: &reqwest::Client,
+    http: &Http,
     query: &str,
     city: &str,
 ) -> Result<Vec<GeocodeHit>, ()> {
@@ -572,45 +584,13 @@ pub(crate) async fn geocode_location(
         "https://nominatim.openstreetmap.org/search?q={q}&format=json&addressdetails=1&limit=5\
          &polygon_geojson=1&polygon_threshold=0.0001"
     );
-    let resp: reqwest::Response = tokio::time::timeout(
-        NOMINATIM_TIMEOUT,
-        http.get(&url).header("Accept-Language", "de").send(),
-    )
-    .await
-    .map_err(|_| ())?
-    .map_err(|_| ())?;
-    let body = tokio::time::timeout(NOMINATIM_TIMEOUT, resp.text())
+    let body = http
+        .get(&url, &[("Accept-Language", "de")], NOMINATIM_TIMEOUT)
         .await
         .map_err(|_| ())?
-        .map_err(|_| ())?;
+        .body;
     let results: serde_json::Value = serde_json::from_str(&body).map_err(|_| ())?;
     Ok(validated_hits(&results, query, city))
-}
-
-/// Bezirk (or Ortsteil when the city has no Bezirke) of `point`.
-pub(crate) async fn reverse_borough(
-    http: &reqwest::Client,
-    (lat, lon): (f64, f64),
-) -> Option<String> {
-    let url = format!(
-        "https://nominatim.openstreetmap.org/reverse?lat={lat}&lon={lon}&format=json&addressdetails=1"
-    );
-    let body = tokio::time::timeout(
-        NOMINATIM_TIMEOUT,
-        http.get(&url).header("Accept-Language", "de").send(),
-    )
-    .await
-    .ok()?
-    .ok()?
-    .text()
-    .await
-    .ok()?;
-    let json: serde_json::Value = serde_json::from_str(&body).ok()?;
-    let address = &json["address"];
-    ["borough", "city_district", "suburb"]
-        .iter()
-        .find_map(|field| address[*field].as_str())
-        .map(str::to_owned)
 }
 
 /// Address fields that name a street-like thing a mention can refer to.
@@ -684,7 +664,7 @@ pub(crate) fn validated_hits(
         .collect()
 }
 
-fn street_without_house_number(candidate: &str) -> &str {
+pub(crate) fn street_without_house_number(candidate: &str) -> &str {
     match candidate.rsplit_once(' ') {
         Some((street, last)) if last.chars().next().is_some_and(|c| c.is_ascii_digit()) => street,
         _ => candidate,
@@ -723,21 +703,43 @@ pub(crate) const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(2);
 /// so the rate never exceeds 1 req/s regardless of how many tasks are waiting.
 pub(crate) type NominatimLimiter = Arc<Semaphore>;
 
+/// Street lookups at Nominatim: anchored to `city`, cached for the bot's lifetime, at most
+/// one request at a time. Cheap to clone.
+#[derive(Clone)]
+pub(crate) struct Geocoder {
+    pub(crate) http: Http,
+    pub(crate) city: Arc<str>,
+    pub(crate) cache: GeocodeCache,
+    pub(crate) limiter: NominatimLimiter,
+}
+
+impl Geocoder {
+    pub(crate) fn new(http: Http, city: &str) -> Self {
+        Geocoder {
+            http,
+            city: Arc::from(city),
+            cache: Arc::new(DashMap::new()),
+            limiter: Arc::new(Semaphore::new(1)),
+        }
+    }
+}
+
 /// Find the most trustworthy geocodable street mention in the item and its
 /// distance to `(ref_lat, ref_lon)`. Transient lookup failures stay separate
 /// from "no geocodable street" so the caller can retry instead of permanently
 /// dropping a potentially relevant item.
-#[allow(clippy::too_many_arguments)]
 pub(crate) async fn find_nearest_distance(
-    http: &reqwest::Client,
+    geocoder: &Geocoder,
     item: &FeedItem,
     text: &ItemText,
-    ref_lat: f64,
-    ref_lon: f64,
-    city: &str,
-    cache: &GeocodeCache,
-    limiter: &NominatimLimiter,
+    (ref_lat, ref_lon): (f64, f64),
 ) -> DistanceLookup {
+    let (http, city, cache, limiter) = (
+        &geocoder.http,
+        &*geocoder.city,
+        &geocoder.cache,
+        &geocoder.limiter,
+    );
     // A declared event venue outranks anything the prose mentions.
     let venue = item
         .venue
@@ -780,7 +782,9 @@ pub(crate) async fn find_nearest_distance(
                     v // cache hit: release permit immediately, no sleep needed
                 } else {
                     let result = geocode_location(http, &candidate, city).await;
-                    sleep(NOMINATIM_INTERVAL).await; // enforce rate limit before releasing permit
+                    if http.is_live() {
+                        sleep(NOMINATIM_INTERVAL).await; // enforce rate limit before releasing permit
+                    }
                     match result {
                         Ok(hits) => {
                             cache.insert(candidate.clone(), hits.clone());
@@ -970,6 +974,9 @@ pub(crate) fn contains_normalized_term(text: &str, term: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::PlaceConfig;
+    use crate::filter::normalize;
+    use crate::filter::ItemText;
     use serde_json::json;
 
     #[test]
@@ -1187,5 +1194,84 @@ mod tests {
             street_distance(&hits, &text("Unfall in Spandau"), None, reference).unwrap();
         assert!(near > 1_000.0, "{near}");
         assert_eq!(hit.suburb.as_deref(), Some("Spandau"));
+    }
+
+    #[test]
+    fn configured_place_distance_matches_alias() {
+        let filter = FilterConfig {
+            places: vec![PlaceConfig {
+                name: "Klausenerplatz".to_owned(),
+                lat: 52.4670,
+                lon: 13.4040,
+                aliases: vec!["RAW Gelände".to_owned(), "RAW".to_owned()],
+            }],
+            ..Default::default()
+        };
+        let item = FeedItem {
+            guid: "place".to_owned(),
+            title: "Feuerwehreinsatz am RAW".to_owned(),
+            link: None,
+            link_note: None,
+            description: None,
+            article_text: None,
+            source_name: "Test".to_owned(),
+            score: 0,
+            max_score: 0,
+            distance_meters: None,
+            location_label: None,
+            published_at: None,
+            ..Default::default()
+        };
+
+        let hits = find_configured_places(&ItemText::of(&item), &filter, Some((52.4670, 13.4040)));
+
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].label, "Klausenerplatz");
+        assert!(hits[0].prominent);
+    }
+
+    #[test]
+    fn configured_place_alias_does_not_match_inside_words() {
+        let filter = FilterConfig {
+            places: vec![PlaceConfig {
+                name: "Klausenerplatz".to_owned(),
+                lat: 52.4670,
+                lon: 13.4040,
+                aliases: vec!["RAW Gelände".to_owned(), "RAW".to_owned()],
+            }],
+            ..Default::default()
+        };
+        let item = FeedItem {
+            guid: "place".to_owned(),
+            title: "The chaotic sprawl of pixels resolved".to_owned(),
+            link: None,
+            link_note: None,
+            description: Some("No local venue is mentioned here.".to_owned()),
+            article_text: None,
+            source_name: "Test".to_owned(),
+            score: 0,
+            max_score: 0,
+            distance_meters: None,
+            location_label: None,
+            published_at: None,
+            ..Default::default()
+        };
+
+        let hits = find_configured_places(&ItemText::of(&item), &filter, Some((52.4670, 13.4040)));
+
+        assert!(hits.is_empty());
+    }
+
+    #[test]
+    fn street_evidence_ignores_boilerplate_after_impressum() {
+        let evidence = extract_street_evidence(
+            "Brand in der Perleberger Straße",
+            None,
+            Some("Weitere Details folgen. Impressum Kontakt Alexanderplatz 1 Datenschutz."),
+        );
+        let candidates: Vec<String> = evidence.into_iter().map(|e| e.candidate).collect();
+
+        assert!(candidates.iter().any(|c| c.contains("Perleberger Straße")));
+        assert!(!candidates.iter().any(|c| c.contains("Alexanderplatz")));
     }
 }

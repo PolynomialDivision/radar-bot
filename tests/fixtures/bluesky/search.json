@@ -1,0 +1,10 @@
+{"posts":[
+ {"uri":"at://did:plc:neighbour0000000000000/app.bsky.feed.post/3kfix00000001","cid":"bafyfixture1",
+  "author":{"did":"did:plc:neighbour0000000000000","handle":"neighbour.example.social","displayName":"Neighbour"},
+  "record":{"$type":"app.bsky.feed.post","text":"Großes Kiezfest am Samstag in der Yourstreet! Ab 14 Uhr mit Flohmarkt und Musik. #YourCity","createdAt":"2026-11-20T10:15:00.000Z","langs":["de"]},
+  "indexedAt":"2026-11-20T10:15:01.000Z"},
+ {"uri":"at://did:plc:visitor00000000000000000/app.bsky.feed.post/3kfix00000002","cid":"bafyfixture2",
+  "author":{"did":"did:plc:visitor00000000000000000","handle":"visitor.example.social"},
+  "record":{"$type":"app.bsky.feed.post","text":"Schöne Grüße aus #YourCity","createdAt":"2026-11-20T09:00:00.000Z","langs":["de"]},
+  "indexedAt":"2026-11-20T09:00:02.000Z"}
+],"hitsTotal":2}

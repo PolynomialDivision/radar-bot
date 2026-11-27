@@ -1,0 +1,10 @@
+[{"id":"mow.DE-XX-EX-W001-20261120-000","payload":{"version":2,"type":"ALERT","id":"mow.DE-XX-EX-W001-20261120-000","hash":"fixturehash",
+  "data":{"headline":"Gefahreninformation: Starke Rauchentwicklung","provider":"MOWAS","severity":"Minor","urgency":"Immediate","msgType":"Update",
+    "sent":"2026-11-20T03:10:00+01:00","effective":"2026-11-20T03:10:00+01:00","expires":"2026-11-20T09:00:00+01:00",
+    "description":"Bei einem Brand in einem Wohnhaus entsteht starker Rauch. Der Rauch zieht in östliche Richtung.",
+    "instruction":"Halten Sie Fenster und Türen geschlossen. Schalten Sie Lüftungen aus.",
+    "area":[{"areaDesc":"Yourcity, YourDistrict"}]}},
+  "i18nTitle":{"de":"Gefahreninformation: Starke Rauchentwicklung"},"sent":"2026-11-20T03:10:00+01:00"},
+ {"id":"dwd.2.49.0.0.276.0.DWD.PVW.1000000000000.fixture","payload":{"version":1,"type":"ALERT","id":"dwd.2.49.0.0.276.0.DWD.PVW.1000000000000.fixture",
+  "data":{"headline":"Amtliche WARNUNG vor FROST","provider":"DWD","severity":"Minor","msgType":"Alert","area":[{"areaDesc":"Yourcity"}]}},
+  "sent":"2026-11-20T10:00:00+01:00"}]

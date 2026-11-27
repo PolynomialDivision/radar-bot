@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom">
+  <title>National News</title>
+  <id>tag:example.com,2026:national</id>
+  <updated>2026-11-20T10:00:00Z</updated>
+  <entry>
+    <title>Bundestag debattiert Rentenreform</title>
+    <id>tag:example.com,2026:national-1</id>
+    <updated>2026-11-20T09:30:00Z</updated>
+    <link rel="alternate" href="https://example.com/national/rente"/>
+    <summary>Die Koalition will das Rentenniveau stabilisieren.</summary>
+  </entry>
+  <entry>
+    <title>Yourcity: Großdemo durch die Innenstadt</title>
+    <id>tag:example.com,2026:national-2</id>
+    <updated>2026-11-20T08:00:00Z</updated>
+    <link rel="alternate" href="https://example.com/national/demo"/>
+    <summary>Tausende werden am Samstag in Yourcity erwartet.</summary>
+  </entry>
+  <entry>
+    <title>Konzert in Yourcity: Kiezband spielt im Hinterhof</title>
+    <id>tag:example.com,2026:national-3</id>
+    <updated>2026-11-19T15:00:00Z</updated>
+    <link rel="alternate" href="https://example.com/national/konzert"/>
+    <summary>Eine Band aus Yourcity spielt am Samstagabend.</summary>
+  </entry>
+</feed>

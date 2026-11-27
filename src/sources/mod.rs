@@ -1,9 +1,53 @@
 pub mod bluesky;
 pub mod rss;
 
-use crate::{FeedItem, SourceConfig};
+use crate::{
+    fetch::{FetchError, Http},
+    FeedItem, SourceConfig,
+};
 use serde::Deserialize;
 use tracing::warn;
+
+// ── Why a source gave nothing ─────────────────────────────────────────────────
+
+/// A poll of a source that did not work.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SourceError {
+    /// Down or overloaded for now: network, timeout, 429, 5xx.
+    Unavailable(String),
+    /// The source refuses the request (401, 403, 404, 410, …): a configuration to fix.
+    Refused(u16),
+    /// The answer is not what the source should send.
+    Malformed(String),
+}
+
+impl SourceError {
+    pub(crate) fn from_status(status: u16) -> Self {
+        match status {
+            429 | 500..=599 => SourceError::Unavailable(format!("HTTP {status}")),
+            _ => SourceError::Refused(status),
+        }
+    }
+
+    pub(crate) fn from_fetch(error: FetchError) -> Self {
+        match error {
+            FetchError::TooLarge(cap) => {
+                SourceError::Malformed(format!("answer larger than {cap} bytes"))
+            }
+            other => SourceError::Unavailable(other.to_string()),
+        }
+    }
+}
+
+impl std::fmt::Display for SourceError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SourceError::Unavailable(why) => write!(f, "unavailable: {why}"),
+            SourceError::Refused(status) => write!(f, "refused: HTTP {status}"),
+            SourceError::Malformed(why) => write!(f, "malformed: {why}"),
+        }
+    }
+}
 
 // ── Source type discriminator ─────────────────────────────────────────────────
 //
@@ -51,7 +95,7 @@ pub enum SourceAdapter {
 }
 
 impl SourceAdapter {
-    pub async fn fetch_items(&self, http: &reqwest::Client) -> Vec<FeedItem> {
+    pub(crate) async fn fetch_items(&self, http: &Http) -> Result<Vec<FeedItem>, SourceError> {
         match self {
             Self::Rss(a) => a.fetch_items(http).await,
             Self::Bluesky(a) => a.fetch_items(http).await,

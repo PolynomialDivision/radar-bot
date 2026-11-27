@@ -1,33 +1,56 @@
-//! Fetching article pages and resolving aggregator links.
+//! Fetching article pages, reading their text and metadata, resolving aggregator links.
+//!
+//! A page is parsed once (`scraper`, an HTML5 parser) and every reading works on that document.
 
-use super::*;
+use std::time::Duration;
 
-// ── Article fetcher ───────────────────────────────────────────────────────────
+use scraper::{node::Node, ElementRef, Html, Selector};
 
-pub(crate) fn tag_blocks<'a>(html: &'a str, tag_name: &str) -> Vec<(&'a str, &'a str)> {
-    let lower = html.to_lowercase();
-    let open_str = format!("<{tag_name}");
-    let close_str = format!("</{tag_name}>");
-    let mut out = Vec::new();
-    let mut offset = 0;
+use crate::feed::parse_feed_date;
+use crate::fetch::{Http, MAX_PAGE_BYTES};
+use crate::filter::normalize;
 
-    while let Some(pos) = lower[offset..].find(&open_str) {
-        let start = offset + pos;
-        let Some(gt_rel) = html[start..].find('>') else {
-            break;
-        };
-        let content_start = start + gt_rel + 1;
-        let Some(close_rel) = lower[content_start..].find(&close_str) else {
-            break;
-        };
-        let content_end = content_start + close_rel;
-        let tag = &html[start..content_start];
-        let inner = &html[content_start..content_end];
-        out.push((tag, inner));
-        offset = content_end + close_str.len();
+// ── Article text ──────────────────────────────────────────────────────────────
+
+/// Elements whose text is page furniture, never the article.
+const NOT_TEXT: &[&str] = &[
+    "script", "style", "nav", "header", "footer", "aside", "noscript", "template",
+];
+
+/// Candidate containers of the article, in the order they are considered.
+const CONTAINERS: &[&str] = &["article", "main", "section", "div"];
+
+fn selector(css: &str) -> Selector {
+    Selector::parse(css).expect("a valid selector")
+}
+
+/// The text of `element` without the text of [`NOT_TEXT`] elements inside it, whitespace
+/// collapsed.
+fn visible_text(element: ElementRef<'_>) -> String {
+    fn walk(element: ElementRef<'_>, out: &mut String) {
+        for child in element.children() {
+            if let Some(child_element) = ElementRef::wrap(child) {
+                if !NOT_TEXT.contains(&child_element.value().name()) {
+                    walk(child_element, out);
+                }
+            } else if let Node::Text(text) = child.value() {
+                out.push_str(text);
+            }
+        }
     }
+    let mut out = String::new();
+    walk(element, &mut out);
+    out.split_whitespace().collect::<Vec<_>>().join(" ")
+}
 
-    out
+/// The opening tag as text (`<div class="article-body">`), for [`article_container_score`].
+fn opening_tag(element: ElementRef<'_>) -> String {
+    let attrs: Vec<String> = element
+        .value()
+        .attrs()
+        .map(|(name, value)| format!("{name}=\"{value}\""))
+        .collect();
+    format!("<{} {}>", element.value().name(), attrs.join(" "))
 }
 
 pub(crate) fn article_container_score(tag: &str, text: &str) -> i32 {
@@ -61,60 +84,34 @@ pub(crate) fn article_container_score(tag: &str, text: &str) -> i32 {
     score + (words / 80).min(8)
 }
 
-/// Remove all `<tag>…</tag>` blocks from html (nav, header, footer, aside, script, style).
-pub(crate) fn remove_blocks(html: &str, tags: &[&str]) -> String {
-    let mut result = html.to_owned();
-    for tag in tags {
-        let open_str = format!("<{tag}");
-        let close_str = format!("</{tag}>");
-        // Keep both original and lowercase in sync so to_lowercase() runs once per removal,
-        // not once per loop iteration over the whole string.
-        let mut lower = result.to_lowercase();
-        loop {
-            match (lower.find(&open_str), lower.find(&close_str)) {
-                (Some(s), Some(e)) if s < e => {
-                    let end = e + close_str.len();
-                    result = format!("{}{}", &result[..s], &result[end..]);
-                    lower = format!("{}{}", &lower[..s], &lower[end..]);
-                }
-                _ => break,
-            }
-        }
-    }
-    result
+/// Extract only the article body from a full HTML page.
+#[cfg(test)]
+pub(crate) fn extract_article_body(html: &str) -> String {
+    article_body_in(&Html::parse_document(html))
 }
 
-/// Extract only the article body from a full HTML page.
-/// Tries semantic containers first, then strips navigation blocks.
-pub(crate) fn extract_article_body(html: &str) -> String {
-    let cleaned = remove_blocks(
-        html,
-        &[
-            "script", "style", "nav", "header", "footer", "aside", "noscript",
-        ],
-    );
-
+/// The best-scoring container's text (semantic containers first, page furniture left out), or
+/// the whole page's text when no container qualifies.
+fn article_body_in(doc: &Html) -> String {
     let mut best: Option<(i32, String)> = None;
-    for tag_name in &["article", "main", "section", "div"] {
-        for (tag, inner) in tag_blocks(&cleaned, tag_name) {
-            let text = strip_html(inner);
-            let text = text.trim();
+    for name in CONTAINERS {
+        for element in doc.select(&selector(name)) {
+            let text = visible_text(element);
             if text.len() < 200 {
                 continue;
             }
-            let score = article_container_score(tag, text);
+            let score = article_container_score(&opening_tag(element), &text);
             if score > 0
                 && best.as_ref().is_none_or(|(best_score, best_text)| {
                     score > *best_score || (score == *best_score && text.len() > best_text.len())
                 })
             {
-                best = Some((score, text.to_owned()));
+                best = Some((score, text));
             }
         }
     }
-
     best.map(|(_, text)| text)
-        .unwrap_or_else(|| strip_html(&cleaned))
+        .unwrap_or_else(|| visible_text(doc.root_element()))
 }
 
 #[derive(Debug, Clone)]
@@ -139,11 +136,21 @@ pub(crate) struct EventLocation {
 /// Where a schema.org `Event` in the page's JSON-LD takes place. Only Event
 /// objects are read: publisher `Organization` blocks carry the newsroom's
 /// own address, which says nothing about the story.
+#[cfg(test)]
 pub(crate) fn page_event_location(html: &str) -> EventLocation {
-    for (tag, body) in tag_blocks(html, "script") {
-        if !attr_value(tag, "type").is_some_and(|t| t.eq_ignore_ascii_case("application/ld+json")) {
+    event_location_in(&Html::parse_document(html))
+}
+
+fn event_location_in(doc: &Html) -> EventLocation {
+    for script in doc.select(&selector("script[type]")) {
+        let is_json_ld = script
+            .value()
+            .attr("type")
+            .is_some_and(|t| t.trim().eq_ignore_ascii_case("application/ld+json"));
+        if !is_json_ld {
             continue;
         }
+        let body: String = script.text().collect();
         let Ok(json) = serde_json::from_str::<serde_json::Value>(body.trim()) else {
             continue;
         };
@@ -211,19 +218,31 @@ fn json_ld_address(address: &serde_json::Value) -> Option<String> {
 
 /// The district a page files its story under: Polizei Berlin reports carry
 /// `<p class="polizeimeldung" title="Ereignisort">Charlottenburg-Wilmersdorf</p>`.
+#[cfg(test)]
 pub(crate) fn page_district(html: &str) -> Option<String> {
-    let lower = html.to_lowercase();
-    let pos = lower.find("title=\"ereignisort\"")?;
-    let start = pos + html[pos..].find('>')? + 1;
-    let end = start + html[start..].find('<')?;
-    let district = decode_entities(html[start..end].trim());
-    (!district.is_empty()).then_some(district)
+    district_in(&Html::parse_document(html))
+}
+
+fn district_in(doc: &Html) -> Option<String> {
+    doc.select(&selector("[title]"))
+        .find(|e| {
+            e.value()
+                .attr("title")
+                .is_some_and(|t| t.eq_ignore_ascii_case("ereignisort"))
+        })
+        .map(|e| e.text().collect::<String>().trim().to_owned())
+        .filter(|district| !district.is_empty())
 }
 
 /// Publish date from the page's metadata: Open Graph / article meta tags or
 /// schema.org JSON-LD `datePublished`. Modification dates are ignored. An
 /// updated old article is still an old event.
+#[cfg(test)]
 pub(crate) fn page_published_at(html: &str) -> Option<i64> {
+    published_at_in(&Html::parse_document(html), html)
+}
+
+fn published_at_in(doc: &Html, html: &str) -> Option<i64> {
     const META_NAMES: &[&str] = &[
         "article:published_time",
         "og:article:published_time",
@@ -235,7 +254,7 @@ pub(crate) fn page_published_at(html: &str) -> Option<i64> {
     ];
     META_NAMES
         .iter()
-        .find_map(|name| meta_property_value(html, name))
+        .find_map(|name| meta_content_in(doc, name))
         .or_else(|| json_ld_date_published(html))
         .and_then(|value| parse_page_date(&value))
 }
@@ -265,73 +284,40 @@ fn parse_page_date(value: &str) -> Option<i64> {
         })
 }
 
-pub(crate) fn attr_value(tag: &str, attr: &str) -> Option<String> {
-    let lower = tag.to_lowercase();
-    let needle = format!("{attr}=");
-    let pos = lower.find(&needle)?;
-    let rest = &tag[pos + needle.len()..];
-    let mut chars = rest.chars();
-    let quote = chars.next()?;
-    if quote != '"' && quote != '\'' {
-        return None;
-    }
-    let value: String = chars.take_while(|c| *c != quote).collect();
-    let value = value.trim();
-    if value.is_empty() {
-        None
-    } else {
-        Some(value.to_owned())
-    }
+/// The `content` of the first `<meta>` whose `property` (or, without one, `name`) is `name`.
+fn meta_content_in(doc: &Html, name: &str) -> Option<String> {
+    doc.select(&selector("meta"))
+        .find(|meta| {
+            let element = meta.value();
+            element
+                .attr("property")
+                .or_else(|| element.attr("name"))
+                .is_some_and(|p| p.trim().eq_ignore_ascii_case(name))
+        })
+        .and_then(|meta| meta.value().attr("content"))
+        .map(str::trim)
+        .filter(|content| !content.is_empty())
+        .map(str::to_owned)
 }
 
-pub(crate) fn link_rel_value(html: &str, rel_name: &str) -> Option<String> {
-    let lower = html.to_lowercase();
-    let mut offset = 0;
-    while let Some(pos) = lower[offset..].find("<link") {
-        let start = offset + pos;
-        let Some(end_rel) = lower[start..].find('>') else {
-            break;
-        };
-        let end = start + end_rel + 1;
-        let tag = &html[start..end];
-        let rel_matches = attr_value(tag, "rel")
-            .map(|rel| {
+/// The page's `<link rel="canonical">`.
+#[cfg(test)]
+pub(crate) fn page_canonical(html: &str) -> Option<String> {
+    canonical_in(&Html::parse_document(html))
+}
+
+fn canonical_in(doc: &Html) -> Option<String> {
+    doc.select(&selector("link[rel][href]"))
+        .find(|link| {
+            link.value().attr("rel").is_some_and(|rel| {
                 rel.split_whitespace()
-                    .any(|part| part.eq_ignore_ascii_case(rel_name))
+                    .any(|r| r.eq_ignore_ascii_case("canonical"))
             })
-            .unwrap_or(false);
-        if rel_matches {
-            if let Some(href) = attr_value(tag, "href") {
-                return Some(href);
-            }
-        }
-        offset = end;
-    }
-    None
-}
-
-pub(crate) fn meta_property_value(html: &str, prop_name: &str) -> Option<String> {
-    let lower = html.to_lowercase();
-    let mut offset = 0;
-    while let Some(pos) = lower[offset..].find("<meta") {
-        let start = offset + pos;
-        let Some(end_rel) = lower[start..].find('>') else {
-            break;
-        };
-        let end = start + end_rel + 1;
-        let tag = &html[start..end];
-        let prop_matches = attr_value(tag, "property")
-            .or_else(|| attr_value(tag, "name"))
-            .map(|prop| prop.eq_ignore_ascii_case(prop_name))
-            .unwrap_or(false);
-        if prop_matches {
-            if let Some(content) = attr_value(tag, "content") {
-                return Some(content);
-            }
-        }
-        offset = end;
-    }
-    None
+        })
+        .and_then(|link| link.value().attr("href"))
+        .map(str::trim)
+        .filter(|href| !href.is_empty())
+        .map(str::to_owned)
 }
 
 pub(crate) fn looks_like_google_url(url: &str) -> bool {
@@ -373,29 +359,14 @@ pub(crate) fn percent_decode(s: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-pub(crate) fn external_href_from_google_html(html: &str) -> Option<String> {
-    let lower = html.to_lowercase();
-    let mut offset = 0;
-    while let Some(pos) = lower[offset..].find("<a") {
-        let start = offset + pos;
-        let Some(end_rel) = lower[start..].find('>') else {
-            break;
-        };
-        let end = start + end_rel + 1;
-        let tag = &html[start..end];
-        if let Some(href) = attr_value(tag, "href") {
-            let href = decode_entities(&href);
-            let candidate = decode_url_parameter(&href, &["url", "q"]).unwrap_or(href);
-            if (candidate.starts_with("http://") || candidate.starts_with("https://"))
-                && !looks_like_google_url(&candidate)
-                && !looks_like_google_url(&candidate)
-            {
-                return Some(candidate);
-            }
-        }
-        offset = end;
-    }
-    None
+fn external_href_in(doc: &Html) -> Option<String> {
+    doc.select(&selector("a[href]")).find_map(|a| {
+        let href = a.value().attr("href")?.trim().to_owned();
+        let candidate = decode_url_parameter(&href, &["url", "q"]).unwrap_or(href);
+        ((candidate.starts_with("http://") || candidate.starts_with("https://"))
+            && !looks_like_google_url(&candidate))
+        .then_some(candidate)
+    })
 }
 
 pub(crate) fn looks_like_rolling_url(url: &str) -> bool {
@@ -460,19 +431,29 @@ pub(crate) fn text_matches_title(text: &str, title: &str) -> bool {
     hits >= 2 || hits * 2 >= words.len()
 }
 
+#[cfg(test)]
 pub(crate) fn resolve_article_link(
     feed_url: &str,
     html: &str,
     article_text: &str,
     title: &str,
 ) -> (Option<String>, Option<String>) {
-    let canonical = link_rel_value(html, "canonical")
-        .or_else(|| meta_property_value(html, "og:url"))
+    resolve_link_in(feed_url, &Html::parse_document(html), article_text, title)
+}
+
+fn resolve_link_in(
+    feed_url: &str,
+    doc: &Html,
+    article_text: &str,
+    title: &str,
+) -> (Option<String>, Option<String>) {
+    let canonical = canonical_in(doc)
+        .or_else(|| meta_content_in(doc, "og:url"))
         .filter(|url| url.starts_with("http://") || url.starts_with("https://"));
 
     let mut link = canonical.unwrap_or_else(|| feed_url.to_owned());
     if looks_like_google_url(&link) || looks_like_google_url(feed_url) {
-        if let Some(external) = external_href_from_google_html(html) {
+        if let Some(external) = external_href_in(doc) {
             link = external;
         }
     }
@@ -492,47 +473,66 @@ pub(crate) fn resolve_article_link(
     (Some(link), note)
 }
 
+/// What fetching an item's link gave.
+pub(crate) enum Page {
+    Article(ArticleFetch),
+    /// The link is no web page (a PDF, a video): the item is decided on its feed text.
+    NotAnArticle(String),
+    /// Unreachable, too large, or no text: tried again next poll.
+    Failed,
+}
+
+/// Whether a content type is a web page.
+fn is_html(content_type: &str) -> bool {
+    content_type.to_ascii_lowercase().contains("html")
+}
+
 /// Fetch a URL and return the article body plus resolved link metadata.
-pub(crate) async fn fetch_article(
-    http: &reqwest::Client,
-    url: &str,
-    title: &str,
-) -> Option<ArticleFetch> {
-    let resp = tokio::time::timeout(Duration::from_secs(10), http.get(url).send())
+pub(crate) async fn fetch_article(http: &Http, url: &str, title: &str) -> Page {
+    let response = match http
+        .get_capped(url, &[], Duration::from_secs(10), MAX_PAGE_BYTES)
         .await
-        .ok()?
-        .ok()?;
+    {
+        Ok(response) => response,
+        Err(e) => {
+            tracing::debug!("article fetch failed {url}: {e}");
+            return Page::Failed;
+        }
+    };
+    if let Some(content_type) = response.content_type.as_deref() {
+        if !is_html(content_type) {
+            return Page::NotAnArticle(content_type.to_owned());
+        }
+    }
+    let html = response.body;
 
-    let html = tokio::time::timeout(Duration::from_secs(10), resp.text())
-        .await
-        .ok()?
-        .ok()?;
-
-    // extract_article_body calls remove_blocks which is CPU-intensive on large HTML pages.
-    // Run it on the blocking thread pool so it doesn't stall the async runtime.
+    // Parsing a large page takes a while: off the async runtime.
     let title = title.to_owned();
     let feed_url = url.to_owned();
-    let text = tokio::task::spawn_blocking(move || {
-        let t = extract_article_body(&html);
-        let t = t.trim().to_owned();
-        if t.is_empty() {
-            None
-        } else {
-            let (resolved_link, link_note) = resolve_article_link(&feed_url, &html, &t, &title);
-            Some(ArticleFetch {
-                text: t,
-                resolved_link,
-                link_note,
-                published_at: page_published_at(&html),
-                event: page_event_location(&html),
-                district: page_district(&html),
-            })
-        }
-    })
-    .await
-    .ok()??;
+    let article = tokio::task::spawn_blocking(move || read_page(&feed_url, &html, &title))
+        .await
+        .ok()
+        .flatten();
 
-    Some(text)
+    article.map_or(Page::Failed, Page::Article)
+}
+
+/// Everything the bot reads from a page, parsed once. `None` when it has no text.
+fn read_page(feed_url: &str, html: &str, title: &str) -> Option<ArticleFetch> {
+    let doc = Html::parse_document(html);
+    let text = article_body_in(&doc).trim().to_owned();
+    if text.is_empty() {
+        return None;
+    }
+    let (resolved_link, link_note) = resolve_link_in(feed_url, &doc, &text, title);
+    Some(ArticleFetch {
+        resolved_link,
+        link_note,
+        published_at: published_at_in(&doc, html),
+        event: event_location_in(&doc),
+        district: district_in(&doc),
+        text,
+    })
 }
 
 #[cfg(test)]
@@ -583,5 +583,98 @@ mod tests {
             Some("Charlottenburg-Wilmersdorf")
         );
         assert_eq!(page_district("<p>kein Tag</p>"), None);
+    }
+
+    #[test]
+    fn article_pages_are_reduced_to_their_text() {
+        for (page, golden) in [
+            ("pages/article_layout.html", "article_layout.txt"),
+            ("pages/nested_div.html", "article_nested_div.txt"),
+            ("pages/event_jsonld.html", "article_event_jsonld.txt"),
+        ] {
+            let body = extract_article_body(&crate::testing::fixture(page));
+
+            for footer in ["Impressum", "Datenschutz", "Start Polizei Presse"] {
+                assert!(!body.contains(footer), "{page}: {footer:?} in {body:?}");
+            }
+            crate::testing::assert_golden(golden, &body);
+        }
+    }
+
+    #[test]
+    fn page_metadata_comes_from_the_fixtures() {
+        let police = crate::testing::fixture("pages/article_layout.html");
+        let event = crate::testing::fixture("pages/event_jsonld.html");
+
+        assert_eq!(page_district(&police).as_deref(), Some("YourDistrict"));
+        assert_eq!(page_published_at(&police), Some(1_795_158_000));
+        assert_eq!(
+            page_canonical(&police).as_deref(),
+            Some("https://example.com/police/1001")
+        );
+        let venue = page_event_location(&event);
+        assert_eq!(venue.coords, Some((52.4745, 13.4205)));
+        assert_eq!(
+            venue.address.as_deref(),
+            Some("Musterstraße 1 10000 Yourcity")
+        );
+    }
+
+    #[test]
+    fn rolling_link_gets_note_when_title_no_longer_matches() {
+        let html = r#"
+            <html><head><link rel="canonical" href="https://example.test/live/ticker" /></head>
+            <body><main>Aktuelle Meldungen zur Verkehrslage ohne den alten Eintrag.</main></body></html>
+        "#;
+        let (link, note) = resolve_article_link(
+            "https://example.test/liveticker",
+            html,
+            "Aktuelle Meldungen zur Verkehrslage ohne den alten Eintrag.",
+            "Brand in der Perleberger Straße",
+        );
+
+        assert_eq!(link.as_deref(), Some("https://example.test/live/ticker"));
+        assert_eq!(
+            note.as_deref(),
+            Some("rolling source link may no longer show this item")
+        );
+    }
+
+    #[test]
+    fn google_news_link_resolves_to_external_publisher_when_available() {
+        let html = r#"
+            <html><head><link rel="canonical" href="https://news.google.com/rss/articles/abc" /></head>
+            <body><a href="https://www.google.com/url?url=https%3A%2F%2Fpublisher.test%2Farticle%2F1">Publisher</a></body></html>
+        "#;
+        let (link, note) = resolve_article_link(
+            "https://news.google.com/rss/articles/abc",
+            html,
+            "Brand in der Perleberger Straße mit Feuerwehreinsatz",
+            "Brand in der Perleberger Straße",
+        );
+
+        assert_eq!(link.as_deref(), Some("https://publisher.test/article/1"));
+        assert_eq!(note, None);
+    }
+
+    #[test]
+    fn article_extraction_prefers_article_like_content_over_navigation() {
+        let html = r#"
+            <html><body>
+                <div class="nav">Start Politik Sport Wetter Navigation Werbung</div>
+                <div class="article-body">
+                    <p>Brand in der Perleberger Straße. Die Feuerwehr war am Abend im Einsatz.</p>
+                    <p>Mehrere Menschen bemerkten Rauch in einem Wohnhaus nahe der Kreuzung.</p>
+                    <p>Die Polizei sperrte den Bereich zeitweise ab und leitete den Verkehr um.</p>
+                    <p>Weitere Details sollen im Laufe des Tages bekannt gegeben werden.</p>
+                </div>
+                <footer>Impressum Datenschutz Kontakt Newsletter</footer>
+            </body></html>
+        "#;
+
+        let body = extract_article_body(html);
+
+        assert!(body.contains("Brand in der Perleberger Straße"));
+        assert!(!body.contains("Impressum Datenschutz"));
     }
 }

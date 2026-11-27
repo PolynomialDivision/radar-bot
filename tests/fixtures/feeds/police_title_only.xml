@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0">
+  <channel>
+    <title>Local Police: press releases</title>
+    <link>https://example.com/police/</link>
+    <description>Press releases of the local police</description>
+    <item>
+      <title>Brand in Wohnhaus – zwei Verletzte</title>
+      <link>https://example.com/police/1001</link>
+      <guid isPermaLink="false">police-1001</guid>
+      <pubDate>Fri, 20 Nov 2026 08:10:00 +0100</pubDate>
+    </item>
+    <item>
+      <title>Mann bei Raub mit Messer verletzt</title>
+      <link>https://example.com/police/1002</link>
+      <guid isPermaLink="false">police-1002</guid>
+      <pubDate>Fri, 20 Nov 2026 07:30:00 +0100</pubDate>
+    </item>
+    <item>
+      <title>Verkehrsunfall auf der Britzer Allee</title>
+      <link>https://example.com/police/1003</link>
+      <guid isPermaLink="false">police-1003</guid>
+      <pubDate>Thu, 19 Nov 2026 22:05:00 +0100</pubDate>
+    </item>
+    <item>
+      <title>Einbruch in Ladengeschäft in Othertown</title>
+      <link>https://example.com/police/1004</link>
+      <guid isPermaLink="false">police-1004</guid>
+      <pubDate>Thu, 19 Nov 2026 18:40:00 +0100</pubDate>
+    </item>
+  </channel>
+</rss>

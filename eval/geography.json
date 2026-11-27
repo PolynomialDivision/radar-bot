@@ -1,0 +1,27 @@
+{
+  "_comment": "Stand-in neighbourhood for eval/corpus.jsonl and its test: invented distances around the tests' reference point. Streets are geocoded from this table instead of Nominatim.",
+  "reference": [52.4736, 13.4205],
+  "city": "Berlin",
+  "home_borough": "Charlottenburg-Wilmersdorf",
+  "areas": [
+    {"implied_meters": 300, "terms": ["Musterstr"]},
+    {"implied_meters": 800, "terms": ["10585"]},
+    {"implied_meters": 1500, "terms": ["Charlottenburg", "Westkreuz"]}
+  ],
+  "places": [
+    {"name": "Klausenerplatz", "lat": 52.4745, "lon": 13.4215, "aliases": ["Klausi"]}
+  ],
+  "elsewhere": ["Kreuzberg", "Neukölln", "Spandau"],
+  "streets": {
+    "Perleberger Straße": [{"suburb": "Charlottenburg", "borough": "Charlottenburg-Wilmersdorf", "path": [[52.4775, 13.4150], [52.4775, 13.4250]]}],
+    "Britzer Allee": [{"suburb": "Charlottenburg", "borough": "Charlottenburg-Wilmersdorf", "path": [[52.4745, 13.3800], [52.4745, 13.4205], [52.4745, 13.4400]]}],
+    "Musterstraße": [{"suburb": "Charlottenburg", "borough": "Charlottenburg-Wilmersdorf", "path": [[52.4738, 13.4200], [52.4738, 13.4215]]}],
+    "Lübecker Straße": [{"suburb": "Charlottenburg", "borough": "Charlottenburg-Wilmersdorf", "path": [[52.4820, 13.4205], [52.4820, 13.4260]]}],
+    "Hauptstraße": [
+      {"suburb": "Charlottenburg", "borough": "Charlottenburg-Wilmersdorf", "path": [[52.4700, 13.4180], [52.4700, 13.4230]]},
+      {"suburb": "Reinickendorf", "borough": "Reinickendorf", "path": [[52.5600, 13.3300], [52.5600, 13.3350]]}
+    ],
+    "Oranienstraße": [{"suburb": "Kreuzberg", "borough": "Kreuzberg", "path": [[52.5000, 13.4150], [52.5000, 13.4250]]}],
+    "Berliner Straße": [{"suburb": "Spandau", "borough": "Spandau", "path": [[52.5350, 13.2000], [52.5350, 13.2050]]}]
+  }
+}

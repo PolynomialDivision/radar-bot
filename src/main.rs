@@ -1,35 +1,49 @@
 mod alerts;
-mod article;
 mod config;
-mod db;
 mod digest;
+mod dry_run;
+#[cfg(test)]
+mod eval;
+mod extract;
 mod feed;
+mod fetch;
 mod filter;
 mod geo;
 mod polling;
+mod profile;
 mod sources;
+mod store;
+#[cfg(test)]
+mod testing;
 mod weather;
 
-use article::*;
-use config::*;
-use digest::*;
-use feed::*;
-use filter::*;
-use geo::*;
-use polling::*;
-
-use dashmap::DashMap;
-use db::Db;
-use std::collections::{HashMap, HashSet};
+use crate::config::derive_warning_region_keywords;
+use crate::config::Config;
+use crate::config::EmergencyConfig;
+use crate::config::FilterConfig;
+use crate::config::ScheduleConfig;
+use crate::config::SourceConfig;
+use crate::config::WeatherConfig;
+use crate::digest::digest_job;
+use crate::digest::digest_loop;
+use crate::polling::poll_loop;
+use crate::polling::source_verdict;
+use crate::polling::PollCtx;
+use fetch::Http;
+// Reached as `crate::…` by the warning and source modules.
+use feed::{parse_feed, parse_feed_date, parse_feed_entries, FeedItem};
+use geo::url_encode;
+use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::sync::Semaphore;
+use store::Db;
 
 use anyhow::Result;
-use chrono::{Local, NaiveTime, Timelike};
+use chrono::{NaiveTime, Timelike};
+use mxbot_common::command::{Commands, Parsed, Spec};
 use mxbot_common::{
     admin::Dispatch,
     clock::Zone,
-    config::{MatrixConfig, SecurityConfig, TimeOfDay},
+    config::TimeOfDay,
     matrix_sdk::{
         deserialized_responses::EncryptionInfo,
         ruma::events::room::message::{
@@ -38,12 +52,11 @@ use mxbot_common::{
         Room, RoomState,
     },
     schedule::{self, Delivered},
-    supervise::{supervise_ticking, Alive},
+    supervise::{self, supervise, supervise_ticking, Alive},
     Bot,
 };
 
-use serde::{Deserialize, Serialize};
-use tokio::{task::JoinSet, time::sleep, time::Duration};
+use tokio::{time::sleep, time::Duration};
 use tracing::{error, info, warn};
 
 // ── Posting ───────────────────────────────────────────────────────────────────
@@ -95,11 +108,42 @@ pub(crate) async fn post_slot(
 
 // ── main ──────────────────────────────────────────────────────────────────────
 
-/// Admin-only `!source-stats [hours]`.
-async fn source_stats_reply(db: &Db, body: &str) -> String {
-    let hours = body
+/// The bot's chat commands (`!admin …` is mxbot-common's).
+const COMMANDS: Commands = Commands::flat(&[Spec::new("source-stats", "📊", "items per source")
+    .usage("[hours]")
+    .admin()]);
+
+/// Admin-only `!source-stats [hours]`: items per source, then the failing and silent ones.
+async fn source_stats_reply(db: &Db, args: &str, source_names: &[String]) -> String {
+    let mut reply = source_counts_reply(db, args).await;
+    match db.source_health().await {
+        Ok(health) => {
+            let (failing, silent) =
+                source_verdict(&health, source_names, chrono::Utc::now().timestamp());
+            if !failing.is_empty() {
+                reply.push_str(&format!(
+                    "\n\n⚠️ Failing {} polls in a row: {}",
+                    store::FAILING_AFTER,
+                    failing.join(", ")
+                ));
+            }
+            if !silent.is_empty() {
+                reply.push_str(&format!(
+                    "\n\n🔇 No new item for 30 days: {}",
+                    silent.join(", ")
+                ));
+            }
+        }
+        Err(e) => warn!("!source-stats: source states failed: {e:#}"),
+    }
+    reply
+}
+
+/// Items per source in the last `args` hours (default 24).
+async fn source_counts_reply(db: &Db, args: &str) -> String {
+    let hours = args
         .split_whitespace()
-        .nth(1)
+        .next()
         .and_then(|s| s.parse::<u32>().ok())
         .unwrap_or(24)
         .clamp(1, 24 * 30);
@@ -130,13 +174,117 @@ async fn source_stats_reply(db: &Db, body: &str) -> String {
     }
 }
 
+/// The command line: `radar-bot [--dry-run [--fixtures DIR] [--db FILE]] [CONFIG.toml]`.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct Args {
+    pub(crate) config: PathBuf,
+    pub(crate) dry_run: bool,
+    pub(crate) fixtures: Option<PathBuf>,
+    pub(crate) db: Option<PathBuf>,
+}
+
+impl Args {
+    pub(crate) fn parse(args: impl IntoIterator<Item = String>) -> Result<Self> {
+        let mut parsed = Args {
+            config: PathBuf::from("config.toml"),
+            dry_run: false,
+            fixtures: None,
+            db: None,
+        };
+        let mut config = None;
+        let mut args = args.into_iter();
+        while let Some(arg) = args.next() {
+            match arg.as_str() {
+                "--dry-run" => parsed.dry_run = true,
+                "--fixtures" | "--db" => {
+                    let value = args
+                        .next()
+                        .ok_or_else(|| anyhow::anyhow!("{arg} needs a path"))?;
+                    if arg == "--fixtures" {
+                        parsed.fixtures = Some(value.into());
+                    } else {
+                        parsed.db = Some(value.into());
+                    }
+                }
+                _ if !arg.starts_with('-') && config.is_none() => {
+                    config = Some(PathBuf::from(arg));
+                }
+                _ => anyhow::bail!(
+                    "unknown argument {arg:?}; usage: radar-bot [--dry-run [--fixtures DIR] [--db FILE]] [CONFIG.toml]"
+                ),
+            }
+        }
+        if !parsed.dry_run && (parsed.fixtures.is_some() || parsed.db.is_some()) {
+            anyhow::bail!("--fixtures and --db only go with --dry-run");
+        }
+        if let Some(config) = config {
+            parsed.config = config;
+        }
+        Ok(parsed)
+    }
+}
+
+/// The HTTP client for sources, article pages and the public APIs.
+pub(crate) fn http_client() -> Result<reqwest::Client> {
+    Ok(reqwest::Client::builder()
+        .user_agent("Mozilla/5.0 (compatible; radar-bot/0.1)")
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .timeout(std::time::Duration::from_secs(60))
+        .build()?)
+}
+
+/// The reference point of `profile` (none: distance scoring off), with its district (Bezirk)
+/// in `filter.home_borough`.
+pub(crate) fn apply_profile(
+    profile: Option<&profile::HomeProfile>,
+    filter: &mut FilterConfig,
+) -> Option<(f64, f64)> {
+    filter.home_borough = profile.and_then(|p| p.borough.clone());
+    if profile.is_some() && filter.home_borough.is_none() {
+        warn!("The reference district is unknown, district hints ignored");
+    }
+    profile.map(profile::HomeProfile::point)
+}
+
+/// The Bluesky credentials and shared session, when configured.
+pub(crate) fn bluesky_context(config: &Config) -> Option<sources::BlueskyContext> {
+    match (&config.bluesky.identifier, &config.bluesky.password) {
+        (Some(identifier), Some(password)) => {
+            info!("Bluesky credentials configured for {identifier}");
+            Some(sources::BlueskyContext {
+                identifier: identifier.clone(),
+                password: password.clone(),
+                session: sources::bluesky::new_shared_session(),
+            })
+        }
+        _ => {
+            let has_bluesky = config
+                .sources
+                .iter()
+                .any(|s| matches!(s.source_type, sources::SourceType::Bluesky));
+            if has_bluesky {
+                warn!("Bluesky source(s) configured but [bluesky] identifier/password missing, searches will fail");
+            }
+            None
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
-    mxbot_common::logging::init("radar_bot");
+    let args = Args::parse(std::env::args().skip(1))?;
+    if args.dry_run {
+        dry_run::init_logging();
+        let config: Config = mxbot_common::config::load_toml(&args.config)?;
+        config.validate()?;
+        return dry_run::run(config, args.fixtures.as_deref(), args.db.as_deref()).await;
+    }
 
-    let test_mode = std::env::args().any(|a| a == "--test");
-    let mut config: Config =
-        mxbot_common::config::load_toml(&mxbot_common::config::config_path_from_args())?;
+    mxbot_common::logging::init("radar_bot");
+    let config: Config = mxbot_common::config::load_toml(&args.config)?;
+    config.validate()?;
+    let source_names: Arc<Vec<String>> =
+        Arc::new(config.sources.iter().map(|s| s.name.clone()).collect());
     // `TZ` (as compose sets it), else Europe/Berlin: the digest and forecast times.
     let zone = Zone::resolve(None)?;
 
@@ -151,6 +299,11 @@ async fn main() -> Result<()> {
         .await?;
 
     let db = Db::open(&store_dir.join("items.db"))?;
+    supervise_ticking(
+        "radar retention",
+        Duration::from_secs(2 * 86_400),
+        |alive| retention_loop(db.clone(), alive),
+    );
 
     bot.client.add_event_handler({
         let bot = bot.clone();
@@ -158,6 +311,7 @@ async fn main() -> Result<()> {
         move |ev: OriginalSyncRoomMessageEvent, room: Room, encryption: Option<EncryptionInfo>| {
             let bot = bot.clone();
             let db = db.clone();
+            let source_names = source_names.clone();
             async move {
                 if ev.sender == bot.user_id || room.state() != RoomState::Joined {
                     return;
@@ -168,16 +322,17 @@ async fn main() -> Result<()> {
                 let MessageType::Text(text) = &ev.content.msgtype else {
                     return;
                 };
-                let body = text.body.trim();
-                if body.starts_with("!source-stats") {
-                    if !bot.is_admin(&ev.sender) {
-                        warn!("!source-stats from non-admin {}, ignored", ev.sender);
-                        return;
+                match COMMANDS.parse_as(&text.body, || bot.is_admin(&ev.sender)) {
+                    Parsed::Run(command) if command.is("source-stats") => {
+                        let reply = source_stats_reply(&db, command.rest, &source_names).await;
+                        room.send(RoomMessageEventContent::text_plain(reply))
+                            .await
+                            .ok();
                     }
-                    let reply = source_stats_reply(&db, body).await;
-                    room.send(RoomMessageEventContent::text_plain(reply))
-                        .await
-                        .ok();
+                    Parsed::Refused(_) => {
+                        warn!("!source-stats from non-admin {}, ignored", ev.sender);
+                    }
+                    _ => {}
                 }
             }
         }
@@ -198,64 +353,9 @@ async fn main() -> Result<()> {
         );
     }
 
-    let geocode_cache: GeocodeCache = Arc::new(DashMap::new());
-    let http = reqwest::Client::builder()
-        .user_agent("Mozilla/5.0 (compatible; radar-bot/0.1)")
-        .connect_timeout(std::time::Duration::from_secs(10))
-        .timeout(std::time::Duration::from_secs(60))
-        .build()?;
-
-    // Resolve reference address to coordinates once at startup.
-    let ref_point: Option<(f64, f64)> = if let Some(ref addr) = config.filter.reference_address {
-        info!("Geocoding reference address: {addr}");
-        match geocode_location(&http, addr, "").await.as_deref() {
-            Ok([hit, ..]) => {
-                info!("Reference point: {:.5}, {:.5}", hit.lat, hit.lon);
-                Some((hit.lat, hit.lon))
-            }
-            Ok([]) | Err(()) => {
-                warn!("Could not geocode reference address '{addr}', distance scoring disabled");
-                None
-            }
-        }
-    } else {
-        warn!("No reference_address configured, distance scoring disabled");
-        None
-    };
-
-    if let Some(point) = ref_point {
-        // Nominatim's usage policy: at most one request per second.
-        sleep(NOMINATIM_INTERVAL).await;
-        config.filter.home_borough = reverse_borough(&http, point).await;
-        match &config.filter.home_borough {
-            Some(borough) => info!("Reference district: {borough}"),
-            None => warn!("Could not resolve the reference district, district hints ignored"),
-        }
-    }
-
-    let bluesky_ctx: Option<sources::BlueskyContext> = match (
-        config.bluesky.identifier,
-        config.bluesky.password,
-    ) {
-        (Some(identifier), Some(password)) => {
-            info!("Bluesky credentials configured for {identifier}");
-            Some(sources::BlueskyContext {
-                identifier,
-                password,
-                session: sources::bluesky::new_shared_session(),
-            })
-        }
-        _ => {
-            let has_bluesky = config
-                .sources
-                .iter()
-                .any(|s| matches!(s.source_type, sources::SourceType::Bluesky));
-            if has_bluesky {
-                warn!("Bluesky source(s) configured but [bluesky] identifier/password missing, searches will fail");
-            }
-            None
-        }
-    };
+    let client = http_client()?;
+    let http = Http::live(client.clone());
+    let bluesky = bluesky_context(&config);
     let dwd_region_keywords = if config.weather.alerts_enabled {
         derive_warning_region_keywords(&config.filter, &config.weather)
     } else {
@@ -268,57 +368,6 @@ async fn main() -> Result<()> {
             "DWD weather warning region keyword(s): {:?}",
             dwd_region_keywords
         );
-    }
-
-    if test_mode {
-        // Run twice: run 1 builds the geocode cache (cold), run 2 should hit it (warm).
-        // test_mode bypasses the DB seen-check (is_new = true always) and does not write
-        // to the DB, so both runs process the same items without affecting state.
-        for run in 1..=2u32 {
-            let cache_before = geocode_cache.len();
-            info!("Test mode: run {run}/2 (geocode cache: {cache_before} entries before)");
-            poll_once(
-                &bot,
-                &http,
-                &config.sources,
-                &config.filter,
-                ref_point,
-                &db,
-                &geocode_cache,
-                bluesky_ctx.as_ref(),
-                true,
-            )
-            .await;
-            let cache_after = geocode_cache.len();
-            info!("Run {run}/2 done, geocode cache: {cache_before} → {cache_after} entries");
-
-            // In test mode poll_once doesn't write to DB; query what would be queued by
-            // re-running take_for_digest on an empty DB (no-op): instead just note it.
-            let items = db
-                .take_for_digest(config.filter.digest_threshold)
-                .await
-                .unwrap_or_default();
-            if !items.is_empty() {
-                let clustered_items = cluster_digest_items(items);
-                let chunks = chunk_digest(&clustered_items);
-                let total = chunks.len();
-                for (i, chunk) in chunks.into_iter().enumerate() {
-                    let header = if total > 1 {
-                        format!("Test digest run {run} ({}/{})", i + 1, total)
-                    } else {
-                        format!("Test digest (run {run}/2)")
-                    };
-                    let (plain, html) = format_digest(&chunk, &header);
-                    post_to_rooms(&bot, &plain, &html).await;
-                    if total > 1 {
-                        sleep(Duration::from_millis(500)).await;
-                    }
-                }
-            } else {
-                info!("Run {run}/2: no items passed the filter");
-            }
-        }
-        return Ok(());
     }
 
     if let Some(job) = digest_job(zone, &config.schedule.digest_times) {
@@ -337,86 +386,209 @@ async fn main() -> Result<()> {
         });
     }
 
-    if config.emergency.enabled {
-        let nina_ags = match ref_point {
-            Some(pt) => alerts::lookup_nina_ags(&http, pt).await,
-            None => {
-                warn!("No reference_address, NINA alerts disabled");
-                None
-            }
-        };
-        // A round takes well under two minutes (every request has a timeout).
-        let within = Duration::from_secs(3 * (config.emergency.poll_interval_secs + 120));
-        supervise_ticking("radar alerts", within, |alive| {
-            alerts::alert_loop(
-                bot.clone(),
-                http.clone(),
-                db.clone(),
-                alerts::AlertConfig {
-                    nina_ags,
-                    ref_point,
-                    dwd_region_keywords,
-                    dwd_lead: Duration::from_secs(config.weather.warning_lead_hours * 3600),
-                    max_distance_km: config.emergency.max_distance_km,
-                    poll_interval_secs: config.emergency.poll_interval_secs,
-                },
-                alive,
-            )
-        });
-    }
-
-    if config.weather.enabled {
-        if let Some(pt) = ref_point {
-            let post_time_str = config
-                .weather
-                .post_time
-                .or_else(|| config.schedule.digest_times.first().cloned())
-                .unwrap_or_else(|| "08:00".to_owned());
-            let post_time = {
-                let mut p = post_time_str.splitn(2, ':');
-                let h: u32 = p.next().and_then(|s| s.parse().ok()).unwrap_or(8);
-                let m: u32 = p.next().and_then(|s| s.parse().ok()).unwrap_or(0);
-                NaiveTime::from_hms_opt(h, m, 0)
-                    .unwrap_or_else(|| NaiveTime::from_hms_opt(8, 0, 0).unwrap())
-            };
-            let post_time = TimeOfDay::new(post_time.hour(), post_time.minute());
-            let job = weather::weather_job(zone, post_time);
-            // A forecast's run: its fetch (15 s), then the post retried for SEND_FOR.
-            let within = job.stall_after(SEND_FOR + Duration::from_secs(5 * 60));
-            supervise_ticking("radar weather", within, |alive| {
-                weather::weather_loop(
-                    bot.clone(),
-                    http.clone(),
-                    db.clone(),
-                    pt,
-                    job,
-                    config.weather.provider,
-                    alive,
-                )
+    let address = config.filter.reference_address.clone();
+    let loops = Loops {
+        bot: bot.clone(),
+        client,
+        http: http.clone(),
+        db: db.clone(),
+        zone,
+        sources: config.sources,
+        filter: config.filter,
+        schedule: config.schedule,
+        weather: config.weather,
+        emergency: config.emergency,
+        dwd_region_keywords,
+        bluesky,
+    };
+    match address {
+        // The loops that measure from the reference point start once it is known.
+        Some(address) => {
+            supervise("radar profile", async move {
+                let alive = supervise::report("radar profile");
+                profile::keep_profile(db, http, address, alive, profile::RETRY, move |profile| {
+                    loops.start(Some(profile))
+                })
+                .await
             });
-        } else {
-            warn!("Weather forecast disabled, no reference_address configured");
+        }
+        None => {
+            warn!("No reference_address configured: distance scoring, weather and NINA disabled");
+            loops.start(None);
         }
     }
 
-    // Spawn poll loop. A round with a cold geocode cache can take several minutes
-    // (Nominatim allows one request per second), so allow ten per round.
-    let within = Duration::from_secs(3 * (config.schedule.poll_interval_minutes + 10) * 60);
-    supervise_ticking("radar poll", within, |alive| {
-        poll_loop(
-            bot.clone(),
-            http,
-            config.sources,
-            config.filter,
-            ref_point,
-            config.schedule.poll_interval_minutes,
-            db,
-            geocode_cache,
-            bluesky_ctx,
-            alive,
-        )
-    });
-
     // Continuous Matrix sync
     bot.run().await
+}
+
+/// Once a day: delete what has outlived its use ([`Db::apply_retention`]).
+async fn retention_loop(db: Db, alive: Alive) {
+    const DAY: Duration = Duration::from_secs(86_400);
+    alive.expect_every(DAY);
+    loop {
+        alive.tick();
+        match db.apply_retention(chrono::Utc::now().timestamp()).await {
+            Ok(n) => {
+                if n > 0 {
+                    info!("Retention: deleted {n} old row(s)");
+                }
+                alive.ok();
+            }
+            Err(e) => {
+                warn!("Retention failed: {e:#}");
+                alive.failed(format!("{e:#}"));
+            }
+        }
+        sleep(DAY).await;
+    }
+}
+
+/// The loops that need the reference point (poll, weather, warnings) and what they run with.
+struct Loops {
+    bot: Bot,
+    client: reqwest::Client,
+    http: Http,
+    db: Db,
+    zone: Zone,
+    sources: Vec<SourceConfig>,
+    filter: FilterConfig,
+    schedule: ScheduleConfig,
+    weather: WeatherConfig,
+    emergency: EmergencyConfig,
+    dwd_region_keywords: Vec<String>,
+    bluesky: Option<sources::BlueskyContext>,
+}
+
+impl Loops {
+    fn start(self, profile: Option<profile::HomeProfile>) {
+        let Loops {
+            bot,
+            client,
+            http,
+            db,
+            zone,
+            sources,
+            mut filter,
+            schedule,
+            weather,
+            emergency,
+            dwd_region_keywords,
+            bluesky,
+        } = self;
+        let ref_point = apply_profile(profile.as_ref(), &mut filter);
+
+        if emergency.enabled {
+            let nina_ags = profile.as_ref().and_then(|p| p.nina_ags.clone());
+            if nina_ags.is_none() {
+                warn!("No NINA region for the reference address, NINA alerts disabled");
+            }
+            // A round takes well under two minutes (every request has a timeout).
+            let within = Duration::from_secs(3 * (emergency.poll_interval_secs + 120));
+            let config = alerts::AlertConfig {
+                nina_ags,
+                ref_point,
+                dwd_region_keywords,
+                dwd_lead: Duration::from_secs(weather.warning_lead_hours * 3600),
+                max_distance_km: emergency.max_distance_km,
+                poll_interval_secs: emergency.poll_interval_secs,
+            };
+            supervise_ticking("radar alerts", within, |alive| {
+                alerts::alert_loop(bot.clone(), client.clone(), db.clone(), config, alive)
+            });
+        }
+
+        if weather.enabled {
+            if let Some(pt) = ref_point {
+                let post_time_str = weather
+                    .post_time
+                    .clone()
+                    .or_else(|| schedule.digest_times.first().cloned())
+                    .unwrap_or_else(|| "08:00".to_owned());
+                let post_time = {
+                    let mut p = post_time_str.splitn(2, ':');
+                    let h: u32 = p.next().and_then(|s| s.parse().ok()).unwrap_or(8);
+                    let m: u32 = p.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+                    NaiveTime::from_hms_opt(h, m, 0)
+                        .unwrap_or_else(|| NaiveTime::from_hms_opt(8, 0, 0).unwrap())
+                };
+                let post_time = TimeOfDay::new(post_time.hour(), post_time.minute());
+                let job = weather::weather_job(zone, post_time);
+                // A forecast's run: its fetch (15 s), then the post retried for SEND_FOR.
+                let within = job.stall_after(SEND_FOR + Duration::from_secs(5 * 60));
+                let provider = weather.provider.clone();
+                supervise_ticking("radar weather", within, |alive| {
+                    weather::weather_loop(
+                        bot.clone(),
+                        client.clone(),
+                        db.clone(),
+                        pt,
+                        job,
+                        provider,
+                        alive,
+                    )
+                });
+            } else {
+                warn!("Weather forecast disabled, no reference point");
+            }
+        }
+
+        // A round with a cold geocode cache can take several minutes (Nominatim allows one
+        // request per second), so allow ten per round.
+        let minutes = schedule.poll_interval_minutes;
+        let within = Duration::from_secs(3 * (minutes + 10) * 60);
+        let ctx = PollCtx::new(http.clone(), filter, ref_point);
+        supervise_ticking("radar poll", within, |alive| {
+            poll_loop(ctx, db.clone(), sources, minutes, bluesky, alive)
+        });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(list: &[&str]) -> Result<Args> {
+        Args::parse(list.iter().map(|s| (*s).to_owned()))
+    }
+
+    #[test]
+    fn the_command_line_takes_a_config_and_the_dry_run_flags_only() {
+        assert_eq!(
+            args(&["/app/config/config.toml"]).unwrap().config,
+            PathBuf::from("/app/config/config.toml")
+        );
+        assert_eq!(args(&[]).unwrap().config, PathBuf::from("config.toml"));
+        let dry = args(&[
+            "--dry-run",
+            "--fixtures",
+            "tests/fixtures",
+            "config.toml.example",
+        ]);
+        assert_eq!(dry.unwrap().config, PathBuf::from("config.toml.example"));
+        let dry = args(&["--dry-run", "--fixtures", "fx", "--db", "copy.db", "c.toml"]).unwrap();
+        assert!(dry.dry_run);
+        assert_eq!(dry.fixtures, Some(PathBuf::from("fx")));
+        assert_eq!(dry.db, Some(PathBuf::from("copy.db")));
+
+        assert!(args(&["--test"]).is_err());
+        assert!(args(&["a.toml", "b.toml"]).is_err());
+        assert!(args(&["--fixtures", "fx"]).is_err());
+        assert!(args(&["--dry-run", "--db"]).is_err());
+    }
+
+    #[test]
+    fn source_stats_is_an_admin_command_with_hours() {
+        let run = COMMANDS.parse_as("!source-stats 48", || true);
+        let Parsed::Run(command) = run else {
+            panic!("{run:?}");
+        };
+        assert!(command.is("source-stats"));
+        assert_eq!(command.rest, "48");
+        assert!(matches!(
+            COMMANDS.parse_as("!source-stats", || false),
+            Parsed::Refused(_)
+        ));
+        assert_eq!(COMMANDS.parse("!weather"), Parsed::NotOurs);
+    }
 }

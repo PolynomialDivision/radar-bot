@@ -4,7 +4,9 @@ use tokio::sync::Mutex;
 use tokio::time::Duration as TokioDuration;
 use tracing::warn;
 
-use crate::FeedItem;
+use super::SourceError;
+use crate::feed::FeedItem;
+use crate::fetch::{FetchError, Http, Response};
 
 fn since_iso8601(hours: u64) -> String {
     let t = chrono::Utc::now() - chrono::Duration::hours(hours as i64);
@@ -41,7 +43,7 @@ pub struct BlueskyAdapter {
 
 impl BlueskyAdapter {
     /// Returns a valid access JWT, refreshing or re-authenticating as needed.
-    async fn ensure_token(&self, http: &reqwest::Client) -> Option<String> {
+    async fn ensure_token(&self, http: &Http) -> Option<String> {
         let mut lock = self.session.lock().await;
 
         if let Some(ref sess) = *lock {
@@ -69,10 +71,9 @@ impl BlueskyAdapter {
         }
     }
 
-    pub async fn fetch_items(&self, http: &reqwest::Client) -> Vec<FeedItem> {
-        let token = match self.ensure_token(http).await {
-            Some(t) => t,
-            None => return vec![],
+    pub(crate) async fn fetch_items(&self, http: &Http) -> Result<Vec<FeedItem>, SourceError> {
+        let Some(token) = self.ensure_token(http).await else {
+            return Err(SourceError::Unavailable("Bluesky login failed".to_owned()));
         };
 
         let url = format!(
@@ -82,51 +83,48 @@ impl BlueskyAdapter {
             crate::url_encode(&since_iso8601(self.max_age_hours)),
         );
 
-        let resp = match tokio::time::timeout(
-            TokioDuration::from_secs(15),
-            http.get(&url)
-                .header("Accept", "application/json")
-                .header("Authorization", format!("Bearer {token}"))
-                .send(),
-        )
-        .await
-        {
-            Ok(Ok(r)) => r,
-            Ok(Err(e)) => {
-                warn!("Bluesky fetch failed [{}]: {e}", self.name);
-                return vec![];
-            }
-            Err(_) => {
-                warn!("Bluesky fetch timed out [{}]", self.name);
-                return vec![];
-            }
-        };
-
-        let body = match resp.text().await {
-            Ok(b) => b,
+        let bearer = format!("Bearer {token}");
+        let headers = [
+            ("Accept", "application/json"),
+            ("Authorization", bearer.as_str()),
+        ];
+        let response = match http.get(&url, &headers, TokioDuration::from_secs(15)).await {
+            Ok(r) => r,
             Err(e) => {
-                warn!("Bluesky response read failed [{}]: {e}", self.name);
-                return vec![];
+                if e == FetchError::Timeout {
+                    warn!("Bluesky fetch timed out [{}]", self.name);
+                } else {
+                    warn!("Bluesky fetch failed [{}]: {e}", self.name);
+                }
+                return Err(SourceError::from_fetch(e));
+            }
+        };
+        // Not JSON with posts: a refusal when the status says so, else a malformed answer.
+        let failed = |why: String| {
+            if response.is_success() {
+                SourceError::Malformed(why)
+            } else {
+                SourceError::from_status(response.status)
             }
         };
 
-        let json: serde_json::Value = match serde_json::from_str(&body) {
+        let json: serde_json::Value = match serde_json::from_str(&response.body) {
             Ok(j) => j,
             Err(e) => {
                 warn!("Bluesky JSON parse failed [{}]: {e}", self.name);
-                return vec![];
+                return Err(failed(e.to_string()));
             }
         };
 
         let Some(posts) = json["posts"].as_array() else {
             warn!(
-                "Bluesky response missing 'posts' array [{}]: {body:.200}",
-                self.name
+                "Bluesky response missing 'posts' array [{}]: {:.200}",
+                self.name, response.body
             );
-            return vec![];
+            return Err(failed("no posts in the answer".to_owned()));
         };
 
-        posts.iter().filter_map(|p| self.normalize(p)).collect()
+        Ok(posts.iter().filter_map(|p| self.normalize(p)).collect())
     }
 
     fn normalize(&self, post: &serde_json::Value) -> Option<FeedItem> {
@@ -173,71 +171,63 @@ impl BlueskyAdapter {
 
 // ── Auth helpers ──────────────────────────────────────────────────────────────
 
-async fn create_session(
-    http: &reqwest::Client,
-    identifier: &str,
-    password: &str,
-) -> Option<BlueskySession> {
+async fn create_session(http: &Http, identifier: &str, password: &str) -> Option<BlueskySession> {
     let body = format!(
         r#"{{"identifier":{},"password":{}}}"#,
         serde_json::to_string(identifier).ok()?,
         serde_json::to_string(password).ok()?,
     );
 
-    let resp = match tokio::time::timeout(
-        TokioDuration::from_secs(15),
-        http.post(format!("{PDS}/com.atproto.server.createSession"))
-            .header("Content-Type", "application/json")
-            .body(body)
-            .send(),
-    )
-    .await
+    let resp = match http
+        .post(
+            &format!("{PDS}/com.atproto.server.createSession"),
+            &[("Content-Type", "application/json")],
+            body,
+            TokioDuration::from_secs(15),
+        )
+        .await
     {
-        Ok(Ok(r)) => r,
-        Ok(Err(e)) => {
-            warn!("Bluesky createSession request failed: {e}");
-            return None;
-        }
-        Err(_) => {
+        Ok(r) => r,
+        Err(FetchError::Timeout) => {
             warn!("Bluesky createSession timed out");
             return None;
         }
-    };
-
-    parse_session_response(resp, "createSession").await
-}
-
-async fn refresh_session(http: &reqwest::Client, refresh_jwt: &str) -> Option<BlueskySession> {
-    let resp = match tokio::time::timeout(
-        TokioDuration::from_secs(15),
-        http.post(format!("{PDS}/com.atproto.server.refreshSession"))
-            .header("Authorization", format!("Bearer {refresh_jwt}"))
-            .send(),
-    )
-    .await
-    {
-        Ok(Ok(r)) => r,
-        Ok(Err(e)) => {
-            warn!("Bluesky refreshSession request failed: {e}");
+        Err(e) => {
+            warn!("Bluesky createSession request failed: {e}");
             return None;
         }
-        Err(_) => {
+    };
+
+    parse_session_response(resp, "createSession")
+}
+
+async fn refresh_session(http: &Http, refresh_jwt: &str) -> Option<BlueskySession> {
+    let bearer = format!("Bearer {refresh_jwt}");
+    let resp = match http
+        .post(
+            &format!("{PDS}/com.atproto.server.refreshSession"),
+            &[("Authorization", bearer.as_str())],
+            String::new(),
+            TokioDuration::from_secs(15),
+        )
+        .await
+    {
+        Ok(r) => r,
+        Err(FetchError::Timeout) => {
             warn!("Bluesky refreshSession timed out");
             return None;
         }
-    };
-
-    parse_session_response(resp, "refreshSession").await
-}
-
-async fn parse_session_response(resp: reqwest::Response, op: &str) -> Option<BlueskySession> {
-    let body = match resp.text().await {
-        Ok(b) => b,
         Err(e) => {
-            warn!("Bluesky {op} response read failed: {e}");
+            warn!("Bluesky refreshSession request failed: {e}");
             return None;
         }
     };
+
+    parse_session_response(resp, "refreshSession")
+}
+
+fn parse_session_response(resp: Response, op: &str) -> Option<BlueskySession> {
+    let body = resp.body;
 
     let json: serde_json::Value = match serde_json::from_str(&body) {
         Ok(j) => j,
@@ -265,4 +255,40 @@ async fn parse_session_response(resp: reqwest::Response, op: &str) -> Option<Blu
         // Bluesky access tokens last ~2h; treat as 90 min to refresh early.
         expires_at: Instant::now() + Duration::from_secs(90 * 60),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn search_posts_become_items() {
+        let adapter = BlueskyAdapter {
+            name: "Bluesky #YourCity".to_owned(),
+            query: "#YourCity".to_owned(),
+            limit: 25,
+            max_age_hours: 24,
+            identifier: String::new(),
+            password: String::new(),
+            session: new_shared_session(),
+        };
+        let json: serde_json::Value =
+            serde_json::from_str(&crate::testing::fixture("bluesky/search.json")).unwrap();
+
+        let items: Vec<FeedItem> = json["posts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|p| adapter.normalize(p))
+            .collect();
+
+        assert_eq!(items.len(), 2);
+        assert_eq!(
+            items[0].link.as_deref(),
+            Some("https://bsky.app/profile/neighbour.example.social/post/3kfix00000001")
+        );
+        assert!(items[0].title.starts_with("Großes Kiezfest am Samstag"));
+        assert_eq!(items[0].article_text, items[0].description);
+        assert_eq!(items[0].published_at, Some(1_795_169_700));
+    }
 }

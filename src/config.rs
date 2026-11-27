@@ -1,10 +1,14 @@
 //! Configuration: `[filter]`, `[schedule]`, `[weather]`, `[emergency]`, sources.
 
-use super::*;
-
 // ── Config ────────────────────────────────────────────────────────────────────
 
+use mxbot_common::config::{MatrixConfig, SecurityConfig, TimeOfDay};
+use serde::Deserialize;
+
+use crate::{sources, weather};
+
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct Config {
     pub(crate) matrix: MatrixConfig,
     #[serde(default)]
@@ -24,12 +28,14 @@ pub(crate) struct Config {
 }
 
 #[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct BlueskyConfig {
     pub(crate) identifier: Option<String>,
     pub(crate) password: Option<String>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct EmergencyConfig {
     #[serde(default = "default_true")]
     pub(crate) enabled: bool,
@@ -61,7 +67,8 @@ pub(crate) fn default_alert_poll_secs() -> u64 {
     120
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct WeatherConfig {
     #[serde(default = "default_true")]
     pub(crate) enabled: bool,
@@ -103,6 +110,7 @@ impl Default for WeatherConfig {
 }
 
 #[derive(Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct SourceConfig {
     /// Display name shown in posted messages.
     pub(crate) name: String,
@@ -140,6 +148,7 @@ pub(crate) struct SourceConfig {
 /// Keyword group with an implied distance. When no street can be geocoded,
 /// the closest matching group's implied_meters is used as the fallback distance.
 #[derive(Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct AreaGroup {
     /// Assumed distance from the reference point in metres (e.g. 300 for your street,
     /// 1500 for your district). Lower = more relevant.
@@ -152,6 +161,7 @@ pub(crate) struct AreaGroup {
 /// that mention stations, squares, venues, or neighbourhood nicknames instead
 /// of street addresses.
 #[derive(Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct PlaceConfig {
     pub(crate) name: String,
     pub(crate) lat: f64,
@@ -169,6 +179,7 @@ pub(crate) struct PlaceConfig {
 ///   - candidate_min_score <= distance_score < digest_threshold → keep briefly
 ///     as a candidate that duplicate clustering can promote later
 #[derive(Deserialize, Default, Clone)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct FilterConfig {
     #[serde(default)]
     pub(crate) required: Vec<String>,
@@ -211,7 +222,7 @@ pub(crate) struct FilterConfig {
 }
 
 pub(crate) fn default_digest_threshold() -> i32 {
-    1
+    2
 }
 pub(crate) fn default_candidate_min_score() -> i32 {
     1
@@ -224,6 +235,7 @@ pub(crate) fn default_candidate_retention_hours() -> u64 {
 }
 
 #[derive(Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct ScheduleConfig {
     /// How often to poll all sources (minutes).
     #[serde(default = "default_poll_interval")]
@@ -251,6 +263,121 @@ pub(crate) fn default_digest_times() -> Vec<String> {
 }
 pub(crate) fn default_true() -> bool {
     true
+}
+
+impl Config {
+    /// What serde cannot check: every source can be polled and has a name of its own, terms
+    /// and places are usable, scores and times are valid. An error names what to fix.
+    pub(crate) fn validate(&self) -> anyhow::Result<()> {
+        use anyhow::{bail, ensure};
+
+        validate_sources(&self.sources)?;
+        let mut names = std::collections::HashSet::new();
+        for source in &self.sources {
+            ensure!(!source.name.trim().is_empty(), "A source has no name");
+            ensure!(
+                names.insert(source.name.trim().to_lowercase()),
+                "Two sources are named {:?}: statistics and health are kept by name",
+                source.name
+            );
+        }
+        let bluesky = self
+            .sources
+            .iter()
+            .any(|s| matches!(s.source_type, sources::SourceType::Bluesky));
+        if bluesky && (self.bluesky.identifier.is_none() || self.bluesky.password.is_none()) {
+            bail!("Bluesky sources need [bluesky] identifier and password");
+        }
+
+        let filter = &self.filter;
+        for (key, score) in [
+            ("digest_threshold", filter.digest_threshold),
+            ("candidate_min_score", filter.candidate_min_score),
+        ] {
+            ensure!(
+                (0..=5).contains(&score),
+                "[filter] {key} = {score}: scores are 0 to 5"
+            );
+        }
+        for (key, terms) in [
+            ("required", &filter.required),
+            ("blocklist", &filter.blocklist),
+            ("elsewhere", &filter.elsewhere),
+        ] {
+            ensure!(
+                terms.iter().all(|t| !t.trim().is_empty()),
+                "[filter] {key} has an empty term"
+            );
+        }
+        for (i, group) in filter.area.iter().enumerate() {
+            ensure!(
+                group.implied_meters.is_finite() && group.implied_meters >= 0.0,
+                "[[filter.area]] #{}: implied_meters must be a distance",
+                i + 1
+            );
+            ensure!(
+                group.terms.iter().all(|t| !t.trim().is_empty()),
+                "[[filter.area]] #{}: an empty term matches everything",
+                i + 1
+            );
+        }
+        for place in &filter.places {
+            ensure!(
+                !place.name.trim().is_empty(),
+                "A [[filter.places]] entry has no name"
+            );
+            ensure!(
+                (-90.0..=90.0).contains(&place.lat) && (-180.0..=180.0).contains(&place.lon),
+                "[[filter.places]] {:?}: lat {} / lon {} is no coordinate",
+                place.name,
+                place.lat,
+                place.lon
+            );
+            ensure!(
+                place.aliases.iter().all(|a| !a.trim().is_empty()),
+                "[[filter.places]] {:?}: an empty alias",
+                place.name
+            );
+        }
+
+        for time in self
+            .schedule
+            .digest_times
+            .iter()
+            .chain(&self.weather.post_time)
+        {
+            time.parse::<TimeOfDay>()
+                .map_err(|e| anyhow::anyhow!("Time {time:?}: {e:#}"))?;
+        }
+        ensure!(
+            self.schedule.poll_interval_minutes > 0,
+            "[schedule] poll_interval_minutes must be at least 1"
+        );
+        ensure!(
+            self.emergency.poll_interval_secs > 0,
+            "[emergency] poll_interval_secs must be at least 1"
+        );
+        Ok(())
+    }
+}
+
+/// Every source can be polled: an RSS feed has a URL, a search has a query.
+pub(crate) fn validate_sources(sources: &[SourceConfig]) -> anyhow::Result<()> {
+    for source in sources {
+        let missing = |field: &Option<String>| field.as_deref().is_none_or(|v| v.trim().is_empty());
+        match source.source_type {
+            sources::SourceType::Rss if missing(&source.url) => {
+                anyhow::bail!("Source {:?}: an RSS source needs a url", source.name)
+            }
+            sources::SourceType::GoogleNews | sources::SourceType::Bluesky
+                if missing(&source.query) =>
+            {
+                anyhow::bail!("Source {:?}: a search source needs a query", source.name)
+            }
+            _ => {}
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn derive_warning_region_keywords(
@@ -282,4 +409,65 @@ pub(crate) fn derive_warning_region_keywords(
         })
         .map(|city| vec![city.to_owned()])
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn example() -> Config {
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("config.toml.example");
+        mxbot_common::config::load_toml(&path).expect("config.toml.example loads")
+    }
+
+    #[test]
+    fn the_example_configuration_loads_and_validates() {
+        let config = example();
+        config.validate().unwrap();
+        assert_eq!(config.filter.digest_threshold, 2);
+        assert!(config.sources.len() >= 5);
+    }
+
+    #[test]
+    fn a_misspelt_key_fails_at_start_with_its_name() {
+        let example = std::fs::read_to_string(
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("config.toml.example"),
+        )
+        .unwrap();
+        let typo = example.replace("digest_threshold = 2", "digest_treshold = 2");
+        assert_ne!(typo, example);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, typo).unwrap();
+
+        let error = mxbot_common::config::load_toml::<Config>(&path)
+            .err()
+            .unwrap();
+
+        assert!(
+            format!("{error:#}").contains("digest_treshold"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn validation_names_what_to_fix() {
+        let invalid = |change: &dyn Fn(&mut Config)| {
+            let mut config = example();
+            change(&mut config);
+            format!("{:#}", config.validate().unwrap_err())
+        };
+
+        let duplicate = invalid(&|c| {
+            let first = c.sources[0].clone();
+            c.sources.push(first);
+        });
+        assert!(duplicate.contains("Two sources are named"), "{duplicate}");
+        assert!(invalid(&|c| c.filter.places[0].lat = 152.0).contains("no coordinate"));
+        assert!(invalid(&|c| c.schedule.digest_times.push("25:00".to_owned())).contains("25:00"));
+        assert!(invalid(&|c| c.filter.digest_threshold = 7).contains("digest_threshold"));
+        assert!(invalid(&|c| c.filter.area[0].terms.push(" ".to_owned())).contains("empty term"));
+        assert!(invalid(&|c| c.bluesky.password = None).contains("[bluesky]"));
+        assert!(invalid(&|c| c.sources[0].url = None).contains("needs a url"));
+    }
 }

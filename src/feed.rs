@@ -1,8 +1,11 @@
 //! Feed items and the RSS/Atom/JSON feed parser.
 
-use super::*;
-
 // ── Feed item ─────────────────────────────────────────────────────────────────
+
+use std::collections::HashMap;
+
+use serde::{Deserialize, Serialize};
+use tracing::warn;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub(crate) struct FeedItem {
@@ -44,6 +47,10 @@ pub(crate) struct FeedItem {
     /// Polizei Berlin report.
     #[serde(default)]
     pub(crate) district: Option<String>,
+    /// From a source without location filter (`filter = false`): delivered whatever its
+    /// score, never dropped by the digest threshold.
+    #[serde(default)]
+    pub(crate) deliver_always: bool,
 }
 
 // ── HTML utilities ────────────────────────────────────────────────────────────
@@ -154,36 +161,43 @@ pub(crate) fn decode_entities(s: &str) -> String {
 
 // ── RSS / Atom / JSON Feed parser ─────────────────────────────────────────────
 
+/// The items of a feed; a feed the parser cannot read is logged and yields none.
 pub(crate) fn parse_feed(xml: &str, source_name: &str) -> Vec<FeedItem> {
-    match feed_rs::parser::parse(xml.as_bytes()) {
-        Ok(feed) => {
-            let coords = feed_item_coords(xml);
-            let items: Vec<FeedItem> = feed
-                .entries
-                .into_iter()
-                .filter_map(|entry| normalize_feed_entry(entry, source_name))
-                .map(|mut item| {
-                    item.coords = coords.get(&item.guid).copied().or_else(|| {
-                        item.link
-                            .as_ref()
-                            .and_then(|link| coords.get(link))
-                            .copied()
-                    });
-                    item
-                })
-                .collect();
-            if !items.is_empty() {
-                return items;
-            }
+    match parse_feed_entries(xml, source_name) {
+        Ok(items) if !items.is_empty() => items,
+        Ok(_) => {
             warn!("Feed parser returned no entries for '{source_name}'");
+            Vec::new()
         }
         Err(e) => {
             warn!("Feed parser failed for '{source_name}': {e}");
+            Vec::new()
         }
     }
-
-    Vec::new()
 }
+
+/// The items of a feed, or why it is not one.
+pub(crate) fn parse_feed_entries(xml: &str, source_name: &str) -> Result<Vec<FeedItem>, String> {
+    let feed = feed_rs::parser::parse(xml.as_bytes()).map_err(|e| e.to_string())?;
+    let coords = feed_item_coords(xml);
+    Ok(feed
+        .entries
+        .into_iter()
+        .filter_map(|entry| normalize_feed_entry(entry, source_name))
+        .map(|mut item| {
+            item.coords = coords.get(&item.guid).copied().or_else(|| {
+                item.link
+                    .as_ref()
+                    .and_then(|link| coords.get(link))
+                    .copied()
+            });
+            item
+        })
+        .collect())
+}
+
+/// Feed text at least this long (characters) is the article itself: its page is not fetched.
+pub(crate) const FULL_TEXT_CHARS: usize = 600;
 
 pub(crate) fn normalize_feed_entry(
     entry: feed_rs::model::Entry,
@@ -230,6 +244,13 @@ pub(crate) fn normalize_feed_entry(
                 .filter(|s| !s.is_empty())
         });
 
+    let article_text = entry
+        .content
+        .as_ref()
+        .and_then(|c| c.body.as_deref())
+        .map(text_to_plain)
+        .filter(|text| text.chars().count() >= FULL_TEXT_CHARS);
+
     let guid = if entry.id.trim().is_empty() {
         link.clone()
             .unwrap_or_else(|| format!("{source_name}::{title}"))
@@ -245,7 +266,7 @@ pub(crate) fn normalize_feed_entry(
         link,
         link_note: None,
         description,
-        article_text: None,
+        article_text,
         source_name: source_name.to_owned(),
         score: 0,
         max_score: 0,
@@ -324,7 +345,22 @@ pub(crate) fn xml_text(xml: &str, tag: &str) -> Option<String> {
 fn xml_attr_of(xml: &str, tag: &str, attr: &str) -> Option<String> {
     let start = xml.find(&format!("<{tag} "))?;
     let end = start + xml[start..].find('>')?;
-    attr_value(&xml[start..=end], attr).map(|v| decode_entities(&v))
+    tag_attribute(&xml[start..=end], attr).map(|v| decode_entities(&v))
+}
+
+/// The quoted value of `attr` in the opening tag `tag`, trimmed; `None` when empty.
+fn tag_attribute(tag: &str, attr: &str) -> Option<String> {
+    let lower = tag.to_lowercase();
+    let needle = format!("{attr}=");
+    let pos = lower.find(&needle)?;
+    let rest = &tag[pos + needle.len()..];
+    let mut chars = rest.chars();
+    let quote = chars.next()?;
+    if quote != '"' && quote != '\'' {
+        return None;
+    }
+    let value: String = chars.take_while(|c| *c != quote).collect();
+    Some(value.trim().to_owned()).filter(|v| !v.is_empty())
 }
 
 pub(crate) fn preferred_entry_link(entry: &feed_rs::model::Entry) -> Option<String> {
@@ -425,345 +461,6 @@ mod feed_tests {
     }
 
     #[test]
-    fn digest_includes_location_with_distance() {
-        let item = DigestItem {
-            guids: vec!["1".to_owned()],
-            source_name: "Local".to_owned(),
-            source_count: 1,
-            title: "Street closed".to_owned(),
-            link: None,
-            link_note: None,
-            score: 4,
-            max_score: 5,
-            distance_meters: Some(350.0),
-            location_label: Some("Rixdorfer Platz".to_owned()),
-        };
-
-        let (plain, html) = format_digest(&[item], "Test");
-
-        assert!(plain.contains("~350m · Rixdorfer Platz"));
-        assert!(html.contains("~350m · Rixdorfer Platz"));
-    }
-
-    #[test]
-    fn clustering_collapses_multi_source_same_incident_and_boosts_score() {
-        let a = db::DbItem {
-            guid: "a".to_owned(),
-            source_name: "Source A".to_owned(),
-            title: "Brand in der Perleberger Straße".to_owned(),
-            link: Some("https://a.test/1".to_owned()),
-            link_note: None,
-            score: 3,
-            max_score: 5,
-            distance_meters: Some(700.0),
-            location_label: Some("Perleberger Straße".to_owned()),
-        };
-        let b = db::DbItem {
-            guid: "b".to_owned(),
-            source_name: "Source B".to_owned(),
-            title: "Feuerwehreinsatz Perleberger Straße nach Brand".to_owned(),
-            link: Some("https://b.test/2".to_owned()),
-            link_note: None,
-            score: 3,
-            max_score: 5,
-            distance_meters: Some(730.0),
-            location_label: Some("Perleberger Straße".to_owned()),
-        };
-
-        let clustered = cluster_digest_items(vec![a, b]);
-
-        assert_eq!(clustered.len(), 1);
-        assert_eq!(clustered[0].guids, vec!["a", "b"]);
-        assert_eq!(clustered[0].source_count, 2);
-        assert_eq!(clustered[0].score, 4);
-        assert!(clustered[0].source_name.contains("Source A"));
-        assert!(clustered[0].source_name.contains("Source B"));
-    }
-
-    #[test]
-    fn clustering_collapses_translated_same_source_event_announcement() {
-        let a = db::DbItem {
-            guid: "de".to_owned(),
-            source_name: "Bluesky Perleberger".to_owned(),
-            title: "💥Ankündigung! Montag 06.07.2026💥".to_owned(),
-            link: Some("https://bsky.app/profile/example/post/de".to_owned()),
-            link_note: None,
-            score: 3,
-            max_score: 5,
-            distance_meters: Some(559.0),
-            location_label: Some("Perleberger 94".to_owned()),
-        };
-        let b = db::DbItem {
-            guid: "en".to_owned(),
-            source_name: "Bluesky Perleberger".to_owned(),
-            title: "💥Announcement! Monday 06.07.2026💥".to_owned(),
-            link: Some("https://bsky.app/profile/example/post/en".to_owned()),
-            link_note: None,
-            score: 3,
-            max_score: 5,
-            distance_meters: Some(559.0),
-            location_label: Some("Perleberger 94".to_owned()),
-        };
-
-        let clustered = cluster_digest_items(vec![a, b]);
-
-        assert_eq!(clustered.len(), 1);
-        assert_eq!(clustered[0].guids, vec!["de", "en"]);
-        assert_eq!(clustered[0].source_count, 1);
-    }
-
-    #[test]
-    fn clustering_keeps_same_source_event_without_shared_date_separate() {
-        let a = db::DbItem {
-            guid: "a".to_owned(),
-            source_name: "Bluesky Perleberger".to_owned(),
-            title: "Ankündigung! Montag 06.07.2026".to_owned(),
-            link: Some("https://bsky.app/profile/example/post/a".to_owned()),
-            link_note: None,
-            score: 3,
-            max_score: 5,
-            distance_meters: Some(559.0),
-            location_label: Some("Perleberger 94".to_owned()),
-        };
-        let b = db::DbItem {
-            guid: "b".to_owned(),
-            source_name: "Bluesky Perleberger".to_owned(),
-            title: "Announcement! Monday 13.07.2026".to_owned(),
-            link: Some("https://bsky.app/profile/example/post/b".to_owned()),
-            link_note: None,
-            score: 3,
-            max_score: 5,
-            distance_meters: Some(559.0),
-            location_label: Some("Perleberger 94".to_owned()),
-        };
-
-        let clustered = cluster_digest_items(vec![a, b]);
-
-        assert_eq!(clustered.len(), 2);
-    }
-
-    #[tokio::test]
-    async fn candidate_clustering_promotes_multi_source_weak_items() {
-        let path = std::env::temp_dir().join(format!(
-            "radar-bot-candidate-test-{}-{}.db",
-            std::process::id(),
-            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
-        ));
-        let db = Db::open(&path).expect("open temp db");
-
-        let a = FeedItem {
-            guid: "candidate-a".to_owned(),
-            title: "Brand in der Perleberger Straße".to_owned(),
-            link: Some("https://a.test/1".to_owned()),
-            link_note: None,
-            description: None,
-            article_text: None,
-            source_name: "Source A".to_owned(),
-            score: 2,
-            max_score: 5,
-            distance_meters: Some(1500.0),
-            location_label: Some("Perleberger Straße".to_owned()),
-            published_at: None,
-            ..Default::default()
-        };
-        let mut b = a.clone();
-        b.guid = "candidate-b".to_owned();
-        b.source_name = "Source B".to_owned();
-        b.title = "Feuerwehreinsatz Perleberger Straße nach Brand".to_owned();
-        b.link = Some("https://b.test/2".to_owned());
-
-        db.insert_candidate(&a, "score 2 below digest threshold 3")
-            .await
-            .expect("insert candidate a");
-        db.insert_candidate(&b, "score 2 below digest threshold 3")
-            .await
-            .expect("insert candidate b");
-
-        let promoted = promote_candidate_clusters(&db, 3, 2, 24)
-            .await
-            .expect("promote candidates");
-        let items = db.take_for_digest(3).await.expect("take digest");
-
-        assert_eq!(promoted, 2);
-        assert_eq!(items.len(), 2);
-        assert!(items.iter().all(|item| item.score >= 3));
-
-        drop(db);
-        let _ = std::fs::remove_file(path);
-    }
-
-    #[test]
-    fn rolling_link_gets_note_when_title_no_longer_matches() {
-        let html = r#"
-            <html><head><link rel="canonical" href="https://example.test/live/ticker" /></head>
-            <body><main>Aktuelle Meldungen zur Verkehrslage ohne den alten Eintrag.</main></body></html>
-        "#;
-        let (link, note) = resolve_article_link(
-            "https://example.test/liveticker",
-            html,
-            "Aktuelle Meldungen zur Verkehrslage ohne den alten Eintrag.",
-            "Brand in der Perleberger Straße",
-        );
-
-        assert_eq!(link.as_deref(), Some("https://example.test/live/ticker"));
-        assert_eq!(
-            note.as_deref(),
-            Some("rolling source link may no longer show this item")
-        );
-    }
-
-    #[test]
-    fn google_news_link_resolves_to_external_publisher_when_available() {
-        let html = r#"
-            <html><head><link rel="canonical" href="https://news.google.com/rss/articles/abc" /></head>
-            <body><a href="https://www.google.com/url?url=https%3A%2F%2Fpublisher.test%2Farticle%2F1">Publisher</a></body></html>
-        "#;
-        let (link, note) = resolve_article_link(
-            "https://news.google.com/rss/articles/abc",
-            html,
-            "Brand in der Perleberger Straße mit Feuerwehreinsatz",
-            "Brand in der Perleberger Straße",
-        );
-
-        assert_eq!(link.as_deref(), Some("https://publisher.test/article/1"));
-        assert_eq!(note, None);
-    }
-
-    #[test]
-    fn article_extraction_prefers_article_like_content_over_navigation() {
-        let html = r#"
-            <html><body>
-                <div class="nav">Start Politik Sport Wetter Navigation Werbung</div>
-                <div class="article-body">
-                    <p>Brand in der Perleberger Straße. Die Feuerwehr war am Abend im Einsatz.</p>
-                    <p>Mehrere Menschen bemerkten Rauch in einem Wohnhaus nahe der Kreuzung.</p>
-                    <p>Die Polizei sperrte den Bereich zeitweise ab und leitete den Verkehr um.</p>
-                    <p>Weitere Details sollen im Laufe des Tages bekannt gegeben werden.</p>
-                </div>
-                <footer>Impressum Datenschutz Kontakt Newsletter</footer>
-            </body></html>
-        "#;
-
-        let body = extract_article_body(html);
-
-        assert!(body.contains("Brand in der Perleberger Straße"));
-        assert!(!body.contains("Impressum Datenschutz"));
-    }
-
-    #[test]
-    fn configured_place_distance_matches_alias() {
-        let filter = FilterConfig {
-            places: vec![PlaceConfig {
-                name: "Klausenerplatz".to_owned(),
-                lat: 52.4670,
-                lon: 13.4040,
-                aliases: vec!["RAW Gelände".to_owned(), "RAW".to_owned()],
-            }],
-            ..Default::default()
-        };
-        let item = FeedItem {
-            guid: "place".to_owned(),
-            title: "Feuerwehreinsatz am RAW".to_owned(),
-            link: None,
-            link_note: None,
-            description: None,
-            article_text: None,
-            source_name: "Test".to_owned(),
-            score: 0,
-            max_score: 0,
-            distance_meters: None,
-            location_label: None,
-            published_at: None,
-            ..Default::default()
-        };
-
-        let hits = find_configured_places(&ItemText::of(&item), &filter, Some((52.4670, 13.4040)));
-
-        assert_eq!(hits.len(), 1);
-        assert_eq!(hits[0].label, "Klausenerplatz");
-        assert!(hits[0].prominent);
-    }
-
-    #[test]
-    fn configured_place_alias_does_not_match_inside_words() {
-        let filter = FilterConfig {
-            places: vec![PlaceConfig {
-                name: "Klausenerplatz".to_owned(),
-                lat: 52.4670,
-                lon: 13.4040,
-                aliases: vec!["RAW Gelände".to_owned(), "RAW".to_owned()],
-            }],
-            ..Default::default()
-        };
-        let item = FeedItem {
-            guid: "place".to_owned(),
-            title: "The chaotic sprawl of pixels resolved".to_owned(),
-            link: None,
-            link_note: None,
-            description: Some("No local venue is mentioned here.".to_owned()),
-            article_text: None,
-            source_name: "Test".to_owned(),
-            score: 0,
-            max_score: 0,
-            distance_meters: None,
-            location_label: None,
-            published_at: None,
-            ..Default::default()
-        };
-
-        let hits = find_configured_places(&ItemText::of(&item), &filter, Some((52.4670, 13.4040)));
-
-        assert!(hits.is_empty());
-    }
-
-    #[test]
-    fn keyword_area_matches_berlin_prefixed_district_name() {
-        let filter = FilterConfig {
-            area: vec![AreaGroup {
-                implied_meters: 1500.0,
-                terms: vec!["Charlottenburg".to_owned()],
-            }],
-            ..Default::default()
-        };
-        let item = FeedItem {
-            guid: "district".to_owned(),
-            title: "Einsatz in Berlin-Charlottenburg".to_owned(),
-            link: None,
-            link_note: None,
-            description: None,
-            article_text: None,
-            source_name: "Test".to_owned(),
-            score: 0,
-            max_score: 0,
-            distance_meters: None,
-            location_label: None,
-            published_at: None,
-            ..Default::default()
-        };
-
-        let hit = keyword_check(&item, &filter, &[]).expect("keyword check should pass");
-
-        assert_eq!(hit.evidence.len(), 1);
-        assert_eq!(hit.evidence[0].meters, 1500.0);
-        assert_eq!(hit.evidence[0].label, "Charlottenburg");
-        assert!(hit.evidence[0].prominent);
-        assert_eq!(hit.matched, vec!["\"Charlottenburg\" (1500m)"]);
-    }
-
-    #[test]
-    fn street_evidence_ignores_boilerplate_after_impressum() {
-        let evidence = extract_street_evidence(
-            "Brand in der Perleberger Straße",
-            None,
-            Some("Weitere Details folgen. Impressum Kontakt Alexanderplatz 1 Datenschutz."),
-        );
-        let candidates: Vec<String> = evidence.into_iter().map(|e| e.candidate).collect();
-
-        assert!(candidates.iter().any(|c| c.contains("Perleberger Straße")));
-        assert!(!candidates.iter().any(|c| c.contains("Alexanderplatz")));
-    }
-
-    #[test]
     fn georss_and_w3c_geo_coordinates_are_attached_to_items() {
         let xml = r#"<?xml version="1.0"?>
 <rss version="2.0" xmlns:georss="http://www.georss.org/georss" xmlns:geo="http://www.w3.org/2003/01/geo/wgs84_pos#">
@@ -781,5 +478,53 @@ mod feed_tests {
         assert_eq!(items[0].coords, Some((52.4736, 13.4205)));
         assert_eq!(items[1].coords, Some((52.50, 13.40)));
         assert_eq!(items[2].coords, None);
+    }
+
+    #[test]
+    fn the_feed_fixtures_parse_as_today() {
+        let feed = |path: &str, name: &str| parse_feed(&crate::testing::fixture(path), name);
+
+        let police = feed("feeds/police_title_only.xml", "Local Police");
+        assert_eq!(police.len(), 4);
+        assert!(police.iter().all(|i| i.description.is_none()));
+        assert_eq!(police[0].guid, "police-1001");
+
+        let broadcaster = feed(
+            "feeds/broadcaster_full_text.xml",
+            "Local Public Broadcaster",
+        );
+        assert_eq!(broadcaster.len(), 3);
+        // The teaser stays the description; full text of 600 characters or more is the
+        // article (its page is not fetched), shorter text is not.
+        assert_eq!(
+            broadcaster[0].description.as_deref(),
+            Some("In der Perleberger Straße hat es in der Nacht gebrannt.")
+        );
+        assert!(broadcaster[0]
+            .article_text
+            .as_deref()
+            .is_some_and(|t| t.starts_with("In der Perleberger Straße in Yourcity-YourDistrict")));
+        assert!(broadcaster[1..].iter().all(|i| i.article_text.is_none()));
+
+        let national = feed("feeds/national_atom.xml", "National News");
+        assert_eq!(national.len(), 3);
+        assert_eq!(
+            national[2].link.as_deref(),
+            Some("https://example.com/national/konzert")
+        );
+
+        let local = feed("feeds/neighbourhood_georss.xml", "Neighbourhood Blog");
+        let coords: Vec<_> = local.iter().map(|i| i.coords).collect();
+        assert_eq!(
+            coords,
+            vec![Some((52.4740, 13.4210)), Some((52.4800, 13.4300)), None]
+        );
+
+        let google = feed("feeds/google_news.xml", "Google News");
+        assert_eq!(google.len(), 2);
+        assert!(google[0]
+            .link
+            .as_deref()
+            .is_some_and(|l| l.starts_with("https://news.google.com/rss/articles/")));
     }
 }

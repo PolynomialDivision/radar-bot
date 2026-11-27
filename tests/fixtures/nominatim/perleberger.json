@@ -1,0 +1,4 @@
+[{"place_id":2,"osm_type":"way","osm_id":2,"lat":"52.4775","lon":"13.4200","class":"highway","type":"residential","name":"Perleberger Straße",
+  "display_name":"Perleberger Straße, YourQuarter, YourDistrict, Yourcity, 10000, Yourcountry",
+  "address":{"road":"Perleberger Straße","suburb":"YourQuarter","borough":"YourDistrict","city":"Yourcity","postcode":"10000","country":"Yourcountry","country_code":"xx"},
+  "geojson":{"type":"LineString","coordinates":[[13.4150,52.4775],[13.4200,52.4775],[13.4250,52.4775]]}}]
